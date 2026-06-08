@@ -175,6 +175,11 @@ fun DashboardScreen(
         // No signal → hide the curve: a graph implies a live trend, and its last point is the same
         // stale value we're refusing to show. The history list/stats below stay (clearly past data).
         if (!signalStale) item { ChartCard(history, c1, onOpenHistory, events) }
+        // Faint hairline (very transparent black) between the graph and the PARLER/ANALYSE buttons,
+        // with ~10dp breathing room each side. Only when the graph is shown.
+        if (!signalStale) item {
+            HorizontalDivider(thickness = 1.dp, color = Color.Black.copy(alpha = 0.04f), modifier = Modifier.padding(vertical = 10.dp))
+        }
         item {
             AnalysisCard(
                 aiText = aiText,

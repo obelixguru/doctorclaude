@@ -89,9 +89,8 @@ Deno.serve(async (req: Request) => {
       .map((r: any) => ({ t: new Date(r.ts).getTime(), v: Number(r.value_mgdl) }))
       .filter((r: any) => Number.isFinite(r.t) && r.v > 0);
 
-    // Only EATEN meals (planned ones aren't food yet). Keep the ones with a real carb count for the
-    // spike math; the count of all eaten meals still drives "meals/day".
-    const eaten: MealRow[] = (mealsRaw ?? [])
+    // Only EATEN meals (planned ones aren't food yet).
+    const eatenAll: MealRow[] = (mealsRaw ?? [])
       .filter((m: any) => m && m.planned !== true && m.ts)
       .map((m: any) => ({
         ts: new Date(m.ts).getTime(),
@@ -100,6 +99,13 @@ Deno.serve(async (req: Request) => {
         speed: mealCarbSpeed(m.description),
       }))
       .filter((m: MealRow) => Number.isFinite(m.ts));
+
+    // Split HYPO RESCUES (sugar taken to FIX a low) OUT of the food analysis. A rescue is medical, not a
+    // food choice — counting it as "fast sugar eaten" or in carbs/day would make the diet report scold
+    // the child for treating a hypo (the user's point: rescue sugar ≠ pleasure sugar). Reported separately
+    // as `rescuesCount`; everything below uses `eaten` = real food only.
+    const rescuesCount = eatenAll.filter((m) => isRescue(m.desc)).length;
+    const eaten: MealRow[] = eatenAll.filter((m) => !isRescue(m.desc));
 
     const mealsCount = eaten.length;
     // Span in days actually covered by the data (so "carbs/day" isn't diluted by empty days).
@@ -131,7 +137,7 @@ Deno.serve(async (req: Request) => {
     // Not enough logged food to say anything useful — ask for more, don't invent.
     if (mealsCount < 4) {
       return json({
-        isError: false, enough: false, days, mealsCount, avgCarbsPerDay,
+        isError: false, enough: false, days, mealsCount, rescuesCount, avgCarbsPerDay,
         fast: speed.fast, slow: speed.slow, fatty: speed.fatty, normal: speed.normal,
         avgSpike, topSpikers, alerts: [], goodPoints: [], tip: "",
         summary: lang === "es"
@@ -147,11 +153,19 @@ Deno.serve(async (req: Request) => {
       ? `DATOS (${spanDays} día(s), ${mealsCount} comidas): ~${avgCarbsPerDay} g de carbohidratos/día; reparto rápidas ${speed.fast} / lentas ${speed.slow} / grasas ${speed.fatty} / normales ${speed.normal}; subida media tras comer ${avgSpike} mg/dL; ${postMealLows} hipo(s) tras comer.${topSpikers.length ? ` Las que más subieron: ${topSpikers.map((t) => `${t.desc} (+${t.spike})`).join(", ")}.` : ""}${calmFoods.length ? ` Bien toleradas: ${calmFoods.join(", ")}.` : ""}`
       : `DONNÉES (${spanDays} jour(s), ${mealsCount} repas) : ~${avgCarbsPerDay} g de glucides/jour ; répartition rapides ${speed.fast} / lents ${speed.slow} / gras ${speed.fatty} / normaux ${speed.normal} ; montée moyenne après repas ${avgSpike} mg/dL ; ${postMealLows} hypo(s) après repas.${topSpikers.length ? ` Ceux qui ont le plus fait monter : ${topSpikers.map((t) => `${t.desc} (+${t.spike})`).join(", ")}.` : ""}${calmFoods.length ? ` Bien tolérés : ${calmFoods.join(", ")}.` : ""}`;
 
+    // Rescues are excluded from the food mix above; mention them separately so the model can note hypo
+    // management if relevant, WITHOUT ever calling rescue sugar "fast sugar eaten".
+    const rescueNote = rescuesCount
+      ? (lang === "es"
+          ? ` ${rescuesCount} resucre(s) (azúcar para corregir una hipo) — no cuentan como alimentación.`
+          : ` ${rescuesCount} resucrage(s) (sucre pour corriger une hypo) — non comptés dans l'alimentation.`)
+      : "";
+
     const prompt = [
       lang === "es"
         ? "Eres Doctor Claude, un coach de nutrición para una persona con diabetes tipo 1. Analiza SOLO la ALIMENTACIÓN (no des dosis de insulina)."
         : "Tu es Doctor Claude, un coach nutrition pour une personne avec un diabète de type 1. Analyse UNIQUEMENT l'ALIMENTATION (ne donne aucune dose d'insuline).",
-      dataLine,
+      dataLine + rescueNote,
       speedTip ? (lang === "es" ? `Pista de timing (úsala si encaja): ${speedTip}` : `Piste de timing (utilise-la si pertinent) : ${speedTip}`) : "",
       lang === "es"
         ? `Escribe en español sencillo y cálido (quizá sea un niño). Basa TODO en los datos de arriba — nunca inventes alimentos ni cifras. NO escribas ninguna dosis de insulina ni de azúcar.`
@@ -181,14 +195,14 @@ Deno.serve(async (req: Request) => {
       summary = llmErrorMessage(kind, lang, !!byokGeminiKey);
       if (speedTip) alerts = [speedTip];
       return json({
-        isError: true, errorKind: kind, enough: true, days: spanDays, mealsCount, avgCarbsPerDay,
+        isError: true, errorKind: kind, enough: true, days: spanDays, mealsCount, rescuesCount, avgCarbsPerDay,
         fast: speed.fast, slow: speed.slow, fatty: speed.fatty, normal: speed.normal,
         avgSpike, topSpikers, summary, alerts, goodPoints, tip,
       });
     }
 
     return json({
-      isError: false, enough: true, days: spanDays, mealsCount, avgCarbsPerDay,
+      isError: false, enough: true, days: spanDays, mealsCount, rescuesCount, avgCarbsPerDay,
       fast: speed.fast, slow: speed.slow, fatty: speed.fatty, normal: speed.normal,
       avgSpike, topSpikers, summary, alerts, goodPoints, tip,
     });

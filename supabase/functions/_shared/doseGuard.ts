@@ -511,6 +511,9 @@ const SLOW_CARB_WORDS = [
   "complet", "intégral", "integral", "complète", "completo", "whole grain", "wholemeal", "wholewheat",
   "riz complet", "riz brun", "arroz integral", "brown rice",
   "patate douce", "boniato", "batata", "sweet potato",
+  // Plain potato is a STARCH (féculent) — the user expects it counted as a slow/complex carb, not left
+  // uncategorised ("aucun sucre lent" while potatoes were eaten). (Mashed "purée" stays fast = high GI.)
+  "pomme de terre", "pommes de terre", "patate", "patates", "patata", "patatas", "papas", "potato",
   "boulgour", "bulgur", "épeautre", "spelt", "orge", "barley", "cebada", "sarrasin", "buckwheat",
 ];
 
