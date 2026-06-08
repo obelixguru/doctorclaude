@@ -1,0 +1,29 @@
+# Android / Gradle build output
+.gradle/
+build/
+app/build/
+captures/
+.cxx/
+
+# Local SDK path + signing
+/local.properties
+*.apk
+*.aab
+*.keystore
+*.jks
+
+# IDE
+.idea/
+*.iml
+.DS_Store
+Thumbs.db
+
+# Local ops notes / secrets (no secret VALUES are committed, but keep account emails & config private —
+# this repo is intended to go open-source eventually)
+supabase/SECRETS.md
+supabase/.temp/
+.env
+.env.*
+
+# Logs
+*.log
