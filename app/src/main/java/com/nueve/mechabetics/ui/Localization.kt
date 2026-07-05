@@ -299,7 +299,7 @@ val StringsFr = Strings(
     statHigh = "% HAUT",
     statLow = "% BAS",
     periodLast24h = "DERNIÈRES 24 H",
-    periodOverDays = "SUR LES %d DERNIERS JOURS",
+    periodOverDays = "%d DERNIERS JOURS",
     periodOnDay = "LE %s",
     periodFromTo = "DU %1\$s AU %2\$s",
     deviation = "ÉCART",
@@ -554,7 +554,7 @@ val StringsEs = Strings(
     statHigh = "% ALTO",
     statLow = "% BAJO",
     periodLast24h = "ÚLTIMAS 24 H",
-    periodOverDays = "EN LOS ÚLTIMOS %d DÍAS",
+    periodOverDays = "ÚLTIMOS %d DÍAS",
     periodOnDay = "EL %s",
     periodFromTo = "DEL %1\$s AL %2\$s",
     deviation = "DESVÍO",
@@ -802,3 +802,81 @@ val StringsEs = Strings(
 fun stringsFor(lang: Lang): Strings = if (lang == Lang.ES) StringsEs else StringsFr
 
 val LocalStrings = compositionLocalOf { StringsFr }
+
+/**
+ * Background/standby-monitoring strings, kept in a SEPARATE small holder on purpose: the main
+ * [Strings] data class sits right at the Dalvik invoke-range ceiling (a constructor invocation is
+ * limited to 256 registers = ~255 args), so adding fields to it makes the whole class fail ART
+ * verification at load (VerifyError in <clinit>). New string groups go here, not into [Strings].
+ */
+data class BgStrings(
+    val bgTitle: String,
+    val bgBody: String,
+    val bgCardSub: String,
+    val bgButton: String,
+    val bgLater: String,
+    val bgActive: String,
+    // Carte « analyse périmée » sur l'accueil (>20 min). %s = heure de l'ancienne analyse.
+    val analysisStaleTitle: String,
+    val analysisStaleBody: String,
+    // Bannière globale « réseau perdu » (pas de Wi-Fi ni de données mobiles).
+    val networkLost: String,
+    // HbA1c sur la page Profil : champ « dernier labo » + estimation maison (GMI) calculée
+    // depuis la glycémie moyenne. %1$d = moyenne mg/dL, %2$d = nb de jours de mesures.
+    val hba1cField: String,
+    val gmiTitle: String,
+    val gmiExplain: String,
+    val gmiAccumulating: String,
+    val gmiPending: String,
+    // « Quand ? » : 3e puce jour pour planifier une dose/un repas DANS LE FUTUR.
+    val whenTomorrow: String,
+    // Étiquette d'une dose d'insuline datée dans le futur (pas encore faite — exclue de l'IOB).
+    val dosePlanned: String,
+    // Carte rouge quand le capteur a dépassé ses 14 jours (remplace le NO SIGNAL générique).
+    val sensorExpiredTitle: String,
+    val sensorExpiredSub: String,
+)
+
+private val BgStringsFr = BgStrings(
+    bgTitle = "Suivi en veille",
+    bgBody = "Pour que la glycémie continue d'être lue et que l'alarme sonne même écran éteint, autorise Doctor Claude à fonctionner en arrière-plan. Sans ça, le téléphone (surtout Samsung) met l'app en veille et le suivi ne reprend qu'au déverrouillage.",
+    bgCardSub = "Le téléphone peut suspendre l'app en veille. Autorise l'arrière-plan pour un suivi continu, écran éteint.",
+    bgButton = "Autoriser l'arrière-plan",
+    bgLater = "Plus tard",
+    bgActive = "✓ Autorisé — la glycémie est suivie même écran éteint.",
+    analysisStaleTitle = "ANALYSE À RAFRAÎCHIR",
+    analysisStaleBody = "Ce bilan date de %s — la glycémie a bougé depuis. Appuie pour une nouvelle analyse.",
+    networkLost = "Réseau perdu — sans Wi-Fi ni données mobiles, Doctor Claude est limité : pas de nouvelle glycémie, ni analyse ni sauvegarde. Tout reprend dès que la connexion revient.",
+    hba1cField = "HbA1c — dernier labo (%)",
+    gmiTitle = "HbA1c ESTIMÉE (GMI)",
+    gmiExplain = "Estimée à partir de ta glycémie moyenne (%1\$d mg/dL sur %2\$d jours) — c'est l'indicateur « GMI » qu'affiche aussi LibreLink. Elle complète ton analyse de labo, sans la remplacer.",
+    gmiAccumulating = "Doctor Claude l'estimera après environ 14 jours de mesures (%1\$d j pour l'instant). En dessous, le chiffre ne serait pas fiable — on préfère ne rien afficher de trompeur.",
+    gmiPending = "Doctor Claude estimera ton HbA1c (GMI) après quelques jours de mesures.",
+    whenTomorrow = "Demain",
+    dosePlanned = "Prévue",
+    sensorExpiredTitle = "CAPTEUR EXPIRÉ",
+    sensorExpiredSub = "Le capteur a atteint ses 14 jours — pose un nouveau capteur (compte ~1 h de démarrage). En attendant, mesure au doigt avant toute décision.",
+)
+
+private val BgStringsEs = BgStrings(
+    bgTitle = "Vigilancia en reposo",
+    bgBody = "Para que la glucosa se siga leyendo y la alarma suene aunque la pantalla esté apagada, permite que Doctor Claude funcione en segundo plano. Sin esto, el teléfono (sobre todo Samsung) suspende la app y el seguimiento solo se reanuda al desbloquear.",
+    bgCardSub = "El teléfono puede suspender la app en reposo. Permite el segundo plano para un seguimiento continuo con la pantalla apagada.",
+    bgButton = "Permitir segundo plano",
+    bgLater = "Más tarde",
+    bgActive = "✓ Permitido — la glucosa se vigila incluso con la pantalla apagada.",
+    analysisStaleTitle = "ANÁLISIS A ACTUALIZAR",
+    analysisStaleBody = "Este informe es de las %s — la glucosa ha cambiado. Toca para un análisis nuevo.",
+    networkLost = "Sin conexión — sin Wi-Fi ni datos móviles, Doctor Claude está limitado: sin glucosa nueva, ni análisis ni guardado. Todo se reanuda en cuanto vuelva la conexión.",
+    hba1cField = "HbA1c — último análisis (%)",
+    gmiTitle = "HbA1c ESTIMADA (GMI)",
+    gmiExplain = "Estimada a partir de tu glucosa media (%1\$d mg/dL en %2\$d días) — es el indicador « GMI » que muestra también LibreLink. Complementa tu análisis de laboratorio, sin sustituirlo.",
+    gmiAccumulating = "Doctor Claude la estimará tras unos 14 días de mediciones (%1\$d días por ahora). Con menos, el número no sería fiable — preferimos no mostrar nada engañoso.",
+    gmiPending = "Doctor Claude estimará tu HbA1c (GMI) tras unos días de mediciones.",
+    whenTomorrow = "Mañana",
+    dosePlanned = "Prevista",
+    sensorExpiredTitle = "SENSOR CADUCADO",
+    sensorExpiredSub = "El sensor llegó a sus 14 días — pon un sensor nuevo (cuenta ~1 h de arranque). Mientras tanto, mide en el dedo antes de cualquier decisión.",
+)
+
+fun bgStringsFor(lang: Lang): BgStrings = if (lang == Lang.ES) BgStringsEs else BgStringsFr

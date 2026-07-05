@@ -18,11 +18,13 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Logout
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Warning
+import androidx.compose.material.icons.outlined.Autorenew
 import androidx.compose.material.icons.outlined.Close
 import androidx.compose.material.icons.outlined.History
 import androidx.compose.material.icons.outlined.Mic
@@ -60,6 +62,7 @@ import com.nueve.mechabetics.data.Trend
 import com.nueve.mechabetics.data.PredictKind
 import com.nueve.mechabetics.data.Prediction
 import com.nueve.mechabetics.ai.ServiceHealth
+import com.nueve.mechabetics.NetworkMonitor
 import com.nueve.mechabetics.ui.theme.*
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -102,9 +105,13 @@ fun DashboardScreen(
     serverAvg: Int? = null,
     serverTir: Int? = null,
     serverHigh: Int? = null,
-    serverLow: Int? = null
+    serverLow: Int? = null,
+    // End of the sensor's 14-day life (LibreLinkUp), null when unknown. Past it, the NO SIGNAL card
+    // becomes CAPTEUR EXPIRÉ — same red stop-state, but naming the real cause and the real fix.
+    sensorEndMs: Long? = null
 ) {
     val s = LocalStrings.current
+    val bgS = bgStringsFor(lang)
     // A ticking clock so "signal lost" / NO SIGNAL appears on its own as the data ages, even when no
     // new reading arrives to trigger a recomposition (a frozen sensor emits no state change at all).
     var now by remember { mutableStateOf(System.currentTimeMillis()) }
@@ -112,6 +119,9 @@ fun DashboardScreen(
     // Single source of truth for "the live value is too old to trust" — same 5-min window the alarm
     // uses, so the big number disappears at the exact moment the alarms go quiet.
     val signalStale = lastUpdateMs > 0L && now - lastUpdateMs > GlucoseAlert.FRESHNESS_WINDOW_MS
+    // Expired sensor = the EXPLAINED variant of the stale state (it only matters once the data is
+    // actually stale — a sensor in its last minutes still streaming stays a normal live screen).
+    val sensorExpired = signalStale && sensorEndMs != null && now > sensorEndMs
     // On NO SIGNAL we don't KNOW the status, so the whole home goes NEUTRAL (grey) instead of
     // green/orange/red — only the NO SIGNAL card itself stays red (CurrentReadingCard). A stale
     // "all green" screen used to imply everything was fine while we had no live value at all.
@@ -163,18 +173,26 @@ fun DashboardScreen(
             }
         }
         item { DeviceStatusRow(lastUpdateMs, signalStale) }
-        item { CurrentReadingCard(current, lastUpdateMs, now, c1, c2, serverAvg, onOpenHistory) }
-        // "DERNIÈRES 24 H" now labels the 24 h graph (moved here, just above it). The % time-in-range
-        // bar moved to History › Général (under that tab's chart) to keep the homepage uncluttered.
-        if (!signalStale) item {
-            Text(
-                s.statsPeriod, color = InkDim, fontSize = 10.sp, fontWeight = FontWeight.Bold,
-                letterSpacing = 1.5.sp, modifier = Modifier.padding(start = 4.dp, top = 4.dp)
-            )
-        }
+        item { CurrentReadingCard(current, lastUpdateMs, now, c1, c2, serverAvg, onOpenHistory, sensorExpired, bgS.sensorExpiredTitle, bgS.sensorExpiredSub) }
+        // "DERNIÈRES 24 H" labels the 24 h graph just above it. Label + chart share ONE item (a
+        // Column) so the gap between them is a tight 9 dp via the label's bottom padding — not the
+        // list's 16 dp item spacing. The % time-in-range bar moved to History › Général to keep the
+        // homepage uncluttered.
         // No signal → hide the curve: a graph implies a live trend, and its last point is the same
         // stale value we're refusing to show. The history list/stats below stay (clearly past data).
-        if (!signalStale) item { ChartCard(history, c1, onOpenHistory, events) }
+        // Graph slot is ALWAYS present (label + card). Fresh → the curve; stale → a same-size
+        // "courbe masquée" card instead of the curve VANISHING (a collapsing graph read as "the graph
+        // broke / c'est vide"). The big NO SIGNAL card above already explains why the value is hidden.
+        item {
+            Column {
+                Text(
+                    s.statsPeriod, color = InkDim, fontSize = 10.sp, fontWeight = FontWeight.Bold,
+                    letterSpacing = 1.5.sp, modifier = Modifier.padding(start = 4.dp, top = 4.dp, bottom = 9.dp)
+                )
+                if (signalStale) StaleChartCard()
+                else ChartCard(history, c1, onOpenHistory, events)
+            }
+        }
         // Faint hairline (very transparent black) between the graph and the PARLER/ANALYSE buttons,
         // with ~10dp breathing room each side. Only when the graph is shown.
         if (!signalStale) item {
@@ -184,6 +202,8 @@ fun DashboardScreen(
             AnalysisCard(
                 aiText = aiText,
                 aiAt = aiAt,
+                now = now,
+                lang = lang,
                 aiLoading = aiLoading,
                 enabled = history.size >= 3,
                 accent = c1,
@@ -484,7 +504,11 @@ private fun ErrorBanner(error: String?) {
 fun ServiceHealthBanner() {
     val s = LocalStrings.current
     val health by ServiceHealth.state.collectAsState()
+    val online by NetworkMonitor.online.collectAsState()
     val msg = when {
+        // No phone network → the NetworkBanner already explains the root cause (and that glucose is
+        // ALSO frozen, unlike the reassurance below). Don't stack a second "service unreachable".
+        !online -> null
         !health.reachable -> s.serviceDownReach
         health.ai == ServiceHealth.Ai.OUT_OF_CREDITS -> s.serviceDownCredits
         health.ai == ServiceHealth.Ai.RATE_LIMITED -> s.serviceDownRate
@@ -512,6 +536,38 @@ fun ServiceHealthBanner() {
             ) {
                 Icon(Icons.Filled.Warning, contentDescription = null, tint = color.strong, modifier = Modifier.size(18.dp))
                 Text(msg.orEmpty(), color = color.strong2, fontSize = 12.sp, lineHeight = 16.sp, fontWeight = FontWeight.Medium)
+            }
+        }
+    }
+}
+
+/** GLOBAL "phone is offline" banner, shown on EVERY tab. Doctor Claude is online-only (glucose from
+ *  the LibreLinkUp cloud, coach / history / saves from our backend), so with no Wi-Fi or mobile data
+ *  we say the app is limited until the connection returns instead of silently freezing on the last
+ *  value. Reads the real device connectivity ([NetworkMonitor]); takes priority over the backend
+ *  health banner, which suppresses itself while offline (no network is the root cause). */
+@Composable
+fun NetworkBanner(lang: Lang) {
+    val online by NetworkMonitor.online.collectAsState()
+    AnimatedVisibility(
+        visible = !online,
+        enter = fadeIn() + expandVertically(),
+        exit = fadeOut() + shrinkVertically()
+    ) {
+        val color = GlucoseStatus.DANGER
+        Surface(
+            color = color.wash,
+            shape = RoundedCornerShape(10.dp),
+            border = BorderStroke(1.dp, color.strong),
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 6.dp)
+        ) {
+            Row(
+                modifier = Modifier.padding(12.dp),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalAlignment = Alignment.Top
+            ) {
+                Icon(Icons.Filled.Warning, contentDescription = null, tint = color.strong, modifier = Modifier.size(18.dp))
+                Text(bgStringsFor(lang).networkLost, color = color.strong2, fontSize = 12.sp, lineHeight = 16.sp, fontWeight = FontWeight.Medium)
             }
         }
     }
@@ -572,7 +628,7 @@ private fun readDeviceStatus(context: Context): Triple<Int, Boolean, Boolean> {
 }
 
 @Composable
-private fun CurrentReadingCard(reading: GlucoseReading?, lastUpdateMs: Long, now: Long, c1: Color, c2: Color, serverAvg: Int? = null, onClick: () -> Unit = {}) {
+private fun CurrentReadingCard(reading: GlucoseReading?, lastUpdateMs: Long, now: Long, c1: Color, c2: Color, serverAvg: Int? = null, onClick: () -> Unit = {}, sensorExpired: Boolean = false, expiredTitle: String = "", expiredSub: String = "") {
     val s = LocalStrings.current
     val ageMs = if (lastUpdateMs > 0) now - lastUpdateMs else -1L
     val staleMin = if (ageMs >= 0) (ageMs / 60000L).toInt() else -1
@@ -605,17 +661,19 @@ private fun CurrentReadingCard(reading: GlucoseReading?, lastUpdateMs: Long, now
                 Icon(Icons.Filled.Warning, contentDescription = null, tint = OnColor, modifier = Modifier.size(34.dp))
                 Spacer(Modifier.height(10.dp))
                 Text(
-                    s.noSignal,
+                    // An EXPIRED sensor is WHY the signal is gone — name the cause and the fix
+                    // (new sensor) instead of the generic NO SIGNAL reconnect guidance.
+                    if (sensorExpired && expiredTitle.isNotBlank()) expiredTitle else s.noSignal,
                     color = OnColor,
-                    fontSize = 40.sp,
+                    fontSize = if (sensorExpired) 30.sp else 40.sp,
                     fontWeight = FontWeight.Black,
                     letterSpacing = 1.sp,
-                    lineHeight = 44.sp,
+                    lineHeight = if (sensorExpired) 36.sp else 44.sp,
                     textAlign = TextAlign.Center
                 )
                 Spacer(Modifier.height(12.dp))
                 Text(
-                    s.noSignalSub,
+                    if (sensorExpired && expiredSub.isNotBlank()) expiredSub else s.noSignalSub,
                     color = OnColor.copy(alpha = 0.95f),
                     fontSize = 13.sp,
                     fontWeight = FontWeight.Medium,
@@ -684,6 +742,29 @@ private fun CurrentReadingCard(reading: GlucoseReading?, lastUpdateMs: Long, now
     }
 }
 
+/** Same-size stand-in shown in the graph's place during signal loss, so the curve doesn't just
+ *  vanish (which collapsed the layout and read as "the graph is broken / empty"). */
+@Composable
+private fun StaleChartCard() {
+    val s = LocalStrings.current
+    Surface(
+        color = SignalLostTop.copy(alpha = 0.08f),
+        shape = RoundedCornerShape(16.dp),
+        border = BorderStroke(1.dp, SignalLostTop.copy(alpha = 0.45f)),
+        modifier = Modifier.fillMaxWidth().height(210.dp)
+    ) {
+        Column(
+            Modifier.fillMaxSize(),
+            verticalArrangement = Arrangement.Center,
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
+            Icon(Icons.Filled.Warning, contentDescription = null, tint = SignalLostTop, modifier = Modifier.size(28.dp))
+            Spacer(Modifier.height(8.dp))
+            Text(s.graphHidden, color = InkMuted, fontSize = 12.sp, textAlign = TextAlign.Center, modifier = Modifier.padding(horizontal = 24.dp))
+        }
+    }
+}
+
 @Composable
 private fun ChartCard(history: List<GlucoseReading>, line: Color, onClick: () -> Unit = {}, events: List<GraphEvent> = emptyList()) {
     val s = LocalStrings.current
@@ -724,14 +805,14 @@ internal fun TimeInRangeBar(low: Int?, target: Int?, high: Int?) {
         if (target == null) {
             // Server 24h stats still loading.
             Box(
-                Modifier.fillMaxWidth().height(26.dp).clip(RoundedCornerShape(13.dp)).background(BorderLight),
+                Modifier.fillMaxWidth().height(14.dp).clip(RoundedCornerShape(7.dp)).background(BorderLight),
                 contentAlignment = Alignment.Center
             ) { Text("…", color = InkDim, fontSize = 13.sp) }
         } else {
             val lo = (low ?: 0).coerceAtLeast(0)
             val hi = (high ?: 0).coerceAtLeast(0)
             val tg = target.coerceAtLeast(0)
-            Row(modifier = Modifier.fillMaxWidth().height(26.dp).clip(RoundedCornerShape(13.dp))) {
+            Row(modifier = Modifier.fillMaxWidth().height(14.dp).clip(RoundedCornerShape(7.dp))) {
                 if (lo > 0) Box(Modifier.weight(lo.toFloat()).fillMaxHeight().background(red))
                 if (tg > 0) Box(Modifier.weight(tg.toFloat()).fillMaxHeight().background(green))
                 if (hi > 0) Box(Modifier.weight(hi.toFloat()).fillMaxHeight().background(red))
@@ -757,10 +838,16 @@ private fun TirLegend(label: String, pct: Int, color: Color) {
     }
 }
 
+// Une analyse n'est lue à voix haute et affichée que tant qu'elle reflète la glycémie récente.
+// Passé ce délai, la glycémie a bougé : on retire le bilan périmé et on invite à en refaire un.
+private const val ANALYSIS_TTL_MS = 20 * 60_000L
+
 @Composable
 private fun AnalysisCard(
     aiText: String,
     aiAt: Long = 0L,
+    now: Long = 0L,
+    lang: Lang = Lang.FR,
     aiLoading: Boolean,
     enabled: Boolean,
     accent: Color,
@@ -773,6 +860,9 @@ private fun AnalysisCard(
     isSpeaking: Boolean = false
 ) {
     val s = LocalStrings.current
+    // L'analyse est-elle trop vieille (>20 min) pour rester à l'écran ? `now` tique toutes les 30 s,
+    // donc la carte bascule toute seule vers l'invite « refaire une analyse » sans nouvelle lecture.
+    val expired = aiAt > 0L && now > 0L && now - aiAt > ANALYSIS_TTL_MS
     Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
         // PARLER (voix/micro) + ANALYSE côte à côte sur une seule ligne.
         Row(horizontalArrangement = Arrangement.spacedBy(12.dp), modifier = Modifier.fillMaxWidth()) {
@@ -816,7 +906,7 @@ private fun AnalysisCard(
                 else Text(s.analyze, fontWeight = FontWeight.Black, letterSpacing = 0.5.sp, maxLines = 1)
             }
         }
-        if (aiText.isNotEmpty()) {
+        if (aiText.isNotEmpty() && !expired) {
             Surface(
                 color = CardWhite,
                 shape = RoundedCornerShape(14.dp),
@@ -848,6 +938,36 @@ private fun AnalysisCard(
                     Text(aiText, color = InkPrimary, fontSize = 15.sp, lineHeight = 22.sp)
                     Spacer(Modifier.height(10.dp))
                     DoseDisclaimer()
+                }
+            }
+        } else if (expired) {
+            // Analyse périmée (>20 min) : la glycémie a bougé, on ne montre plus le vieux bilan mais une
+            // invite visuelle, claire et tappable — toute la carte relance une analyse fraîche.
+            val bg = bgStringsFor(lang)
+            val staleTime = SimpleDateFormat("HH:mm", Locale.getDefault()).format(Date(aiAt))
+            Surface(
+                color = accent.copy(alpha = 0.07f),
+                shape = RoundedCornerShape(14.dp),
+                border = BorderStroke(1.dp, accent.copy(alpha = 0.35f)),
+                modifier = Modifier.fillMaxWidth().clickable(enabled = enabled && !aiLoading) { onAnalyze() }
+            ) {
+                Row(
+                    modifier = Modifier.padding(16.dp).fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(14.dp)
+                ) {
+                    Box(
+                        modifier = Modifier.size(42.dp).clip(CircleShape).background(accent.copy(alpha = 0.14f)),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        if (aiLoading) CircularProgressIndicator(modifier = Modifier.size(22.dp), color = accent, strokeWidth = 2.dp)
+                        else Icon(Icons.Outlined.Autorenew, contentDescription = null, tint = accent, modifier = Modifier.size(24.dp))
+                    }
+                    Column(Modifier.weight(1f)) {
+                        Text(bg.analysisStaleTitle, color = accent, fontSize = 11.sp, fontWeight = FontWeight.Black, letterSpacing = 1.5.sp)
+                        Spacer(Modifier.height(4.dp))
+                        Text(String.format(bg.analysisStaleBody, staleTime), color = InkMuted, fontSize = 13.sp, lineHeight = 18.sp)
+                    }
                 }
             }
         }

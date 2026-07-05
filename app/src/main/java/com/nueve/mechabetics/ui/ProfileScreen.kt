@@ -37,6 +37,7 @@ import com.nueve.mechabetics.data.HealthSnapshot
 import com.nueve.mechabetics.data.MealReminderReceiver
 import com.nueve.mechabetics.ui.theme.*
 import kotlinx.coroutines.launch
+import kotlin.math.roundToInt
 import org.json.JSONObject
 
 /** Donation link (Ko-fi → routes to the maintainer's PayPal). */
@@ -60,9 +61,13 @@ fun ProfileScreen(
     onAiSettingsChange: () -> Unit = {},
     onClearLocalData: () -> Unit = {},
     onOpenNotifications: () -> Unit = {},
+    patients: List<PatientChoice> = emptyList(),
+    onSwitchPatient: (String) -> Unit = {},
+    onRefreshPatients: () -> Unit = {},
     header: @Composable () -> Unit = {}
 ) {
     val s = LocalStrings.current
+    val bg = bgStringsFor(lang)
     val scope = rememberCoroutineScope()
     val context = LocalContext.current
     var toRemove by remember { mutableStateOf<String?>(null) }
@@ -79,6 +84,9 @@ fun ProfileScreen(
     ) { scope.launch { healthSnap = health.snapshot() } }
     // Only read Health Connect when the user has it switched ON.
     LaunchedEffect(healthOn) { healthSnap = if (healthOn) health.snapshot() else null }
+    // Re-read the followed-patients list when the Profile tab opens, so a patient added AFTER login
+    // (a parent linking a second person to the same LibreLinkUp account) shows up in the switcher.
+    LaunchedEffect(Unit) { onRefreshPatients() }
 
     var nickname by remember { mutableStateOf("") }
     var age by remember { mutableStateOf("") }
@@ -92,6 +100,9 @@ fun ProfileScreen(
     var correction by remember { mutableStateOf("") }
     var target by remember { mutableStateOf("") }
     var notes by remember { mutableStateOf("") }
+    var hba1c by remember { mutableStateOf("") }
+    var gmi by remember { mutableStateOf<ProfileService.Gmi?>(null) }
+    var gmiLoaded by remember { mutableStateOf(false) }
     var saving by remember { mutableStateOf(false) }
     var message by remember { mutableStateOf("") }
     var reminders by remember { mutableStateOf(store.mealRemindersEnabled) }
@@ -99,7 +110,10 @@ fun ProfileScreen(
 
     LaunchedEffect(patientId) {
         if (patientId != null) {
-            val p = service.load(patientId) ?: return@LaunchedEffect
+            val loaded = service.loadFull(patientId)
+            gmi = loaded.gmi
+            gmiLoaded = true
+            val p = loaded.profile ?: return@LaunchedEffect
             if (!p.isNull("nickname")) nickname = p.optString("nickname")
             if (!p.isNull("age")) age = p.optInt("age").toString()
             if (!p.isNull("weight_kg")) weight = trimNum(p.optDouble("weight_kg"))
@@ -121,6 +135,7 @@ fun ProfileScreen(
             if (!p.isNull("correction_factor")) correction = p.optInt("correction_factor").toString()
             if (!p.isNull("target_mgdl")) target = p.optInt("target_mgdl").toString()
             if (!p.isNull("notes")) notes = p.optString("notes")
+            if (!p.isNull("hba1c")) hba1c = trimNum(p.optDouble("hba1c"))
         }
     }
 
@@ -146,6 +161,8 @@ fun ProfileScreen(
                 putOpt("carb_ratio", carbRatio.toIntOrNull())
                 putOpt("correction_factor", correction.toIntOrNull())
                 putOpt("target_mgdl", target.toIntOrNull())
+                // Lab HbA1c (%) — accepts "6,4" or "6.4". Server merges it like the rest.
+                putOpt("hba1c", hba1c.replace(',', '.').toDoubleOrNull())
                 putOpt("notes", notes.ifBlank { null })
                 put("lang", lang.code.lowercase())
             }
@@ -172,59 +189,131 @@ fun ProfileScreen(
                 modifier = Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(horizontal = 16.dp, vertical = 8.dp),
                 verticalArrangement = Arrangement.spacedBy(12.dp)
             ) {
-            // --- Multi-profils : comptes LibreLinkUp mémorisés ---
-            Surface(
-                color = CardWhite,
-                shape = RoundedCornerShape(14.dp),
-                border = BorderStroke(1.dp, BorderLight),
-                modifier = Modifier.fillMaxWidth()
-            ) {
-                Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    Text(s.accountsTitle, color = InkPrimary, fontSize = 13.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.sp)
-                    Text(s.accountsSub, color = InkMuted, fontSize = 11.sp, lineHeight = 15.sp)
-                    profiles.forEach { p ->
-                        Surface(
-                            color = if (p.active) AccentGreen.copy(alpha = 0.08f) else CardWhite,
-                            shape = RoundedCornerShape(10.dp),
-                            border = BorderStroke(1.dp, if (p.active) AccentGreen else BorderLight),
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .then(if (!p.active) Modifier.clickable { onSwitchProfile(p.email) } else Modifier)
-                        ) {
-                            Row(
-                                modifier = Modifier.padding(start = 12.dp, end = 4.dp, top = 8.dp, bottom = 8.dp),
-                                verticalAlignment = Alignment.CenterVertically
+            // --- Comptes LibreLinkUp mémorisés ---
+            // Cette carte ne sert qu'à BASCULER entre plusieurs LOGINS LibreLinkUp différents. Avec un
+            // seul compte elle faisait doublon avec « Patients de ce compte » et affichait le nom du
+            // patient actif (qui changeait à chaque bascule → embrouillait). On ne l'affiche donc que
+            // s'il y a >1 compte, libellée par l'EMAIL (identité stable du login) ; sinon, un simple
+            // bouton « Ajouter un compte ».
+            if (profiles.size > 1) {
+                Surface(
+                    color = CardWhite,
+                    shape = RoundedCornerShape(14.dp),
+                    border = BorderStroke(1.dp, BorderLight),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Text(s.accountsTitle, color = InkPrimary, fontSize = 13.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.sp)
+                        Text(s.accountsSub, color = InkMuted, fontSize = 11.sp, lineHeight = 15.sp)
+                        profiles.forEach { p ->
+                            Surface(
+                                color = if (p.active) AccentGreen.copy(alpha = 0.08f) else CardWhite,
+                                shape = RoundedCornerShape(10.dp),
+                                border = BorderStroke(1.dp, if (p.active) AccentGreen else BorderLight),
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .then(if (!p.active) Modifier.clickable { onSwitchProfile(p.email) } else Modifier)
                             ) {
-                                Icon(
-                                    if (p.active) Icons.Filled.Check else Icons.Outlined.Person,
-                                    contentDescription = null,
-                                    tint = if (p.active) AccentGreen else InkMuted,
-                                    modifier = Modifier.size(20.dp)
-                                )
-                                Spacer(Modifier.width(10.dp))
-                                Column(Modifier.weight(1f)) {
-                                    Text(p.label, color = InkPrimary, fontSize = 14.sp, fontWeight = FontWeight.Bold)
-                                    Text(
-                                        if (p.active) s.accountActive else p.email,
-                                        color = if (p.active) AccentGreen else InkMuted,
-                                        fontSize = 11.sp
+                                Row(
+                                    modifier = Modifier.padding(start = 12.dp, end = 4.dp, top = 8.dp, bottom = 8.dp),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Icon(
+                                        if (p.active) Icons.Filled.Check else Icons.Outlined.Person,
+                                        contentDescription = null,
+                                        tint = if (p.active) AccentGreen else InkMuted,
+                                        modifier = Modifier.size(20.dp)
                                     )
-                                }
-                                IconButton(onClick = { toRemove = p.email }) {
-                                    Icon(Icons.Outlined.Delete, contentDescription = s.foodDelete, tint = InkMuted, modifier = Modifier.size(18.dp))
+                                    Spacer(Modifier.width(10.dp))
+                                    Column(Modifier.weight(1f)) {
+                                        // Login identity = the EMAIL (stable). The PERSON is chosen in the
+                                        // "Patients de ce compte" card, not here — so switching a patient
+                                        // no longer looks like it changes the account.
+                                        Text(p.email, color = InkPrimary, fontSize = 14.sp, fontWeight = FontWeight.Bold)
+                                        if (p.active) Text(s.accountActive, color = AccentGreen, fontSize = 11.sp)
+                                    }
+                                    IconButton(onClick = { toRemove = p.email }) {
+                                        Icon(Icons.Outlined.Delete, contentDescription = s.foodDelete, tint = InkMuted, modifier = Modifier.size(18.dp))
+                                    }
                                 }
                             }
                         }
+                        OutlinedButton(
+                            onClick = onAddProfile,
+                            modifier = Modifier.fillMaxWidth(),
+                            shape = RoundedCornerShape(10.dp),
+                            border = BorderStroke(1.dp, AccentGreen)
+                        ) {
+                            Icon(Icons.Outlined.Add, contentDescription = null, tint = AccentGreen, modifier = Modifier.size(18.dp))
+                            Spacer(Modifier.width(8.dp))
+                            Text(s.addAccount, color = AccentGreen, fontWeight = FontWeight.Bold, fontSize = 13.sp, letterSpacing = 0.5.sp)
+                        }
                     }
-                    OutlinedButton(
-                        onClick = onAddProfile,
-                        modifier = Modifier.fillMaxWidth(),
-                        shape = RoundedCornerShape(10.dp),
-                        border = BorderStroke(1.dp, AccentGreen)
-                    ) {
-                        Icon(Icons.Outlined.Add, contentDescription = null, tint = AccentGreen, modifier = Modifier.size(18.dp))
-                        Spacer(Modifier.width(8.dp))
-                        Text(s.addAccount, color = AccentGreen, fontWeight = FontWeight.Bold, fontSize = 13.sp, letterSpacing = 0.5.sp)
+                }
+            } else {
+                // Un seul compte : pas de carte « comptes » (doublon avec les patients) — juste la
+                // possibilité d'en ajouter un autre (ex. un 2e compte LibreLinkUp suiveur).
+                OutlinedButton(
+                    onClick = onAddProfile,
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(10.dp),
+                    border = BorderStroke(1.dp, AccentGreen)
+                ) {
+                    Icon(Icons.Outlined.Add, contentDescription = null, tint = AccentGreen, modifier = Modifier.size(18.dp))
+                    Spacer(Modifier.width(8.dp))
+                    Text(s.addAccount, color = AccentGreen, fontWeight = FontWeight.Bold, fontSize = 13.sp, letterSpacing = 0.5.sp)
+                }
+            }
+
+            // --- Patients de ce compte : basculer entre plusieurs personnes suivies par le MÊME
+            //     compte LibreLinkUp (ex. un parent qui suit deux diabétiques). Masqué s'il n'y en
+            //     a qu'un. Les données sont isolées par patient côté serveur (subject = sha256(id)).
+            if (patients.size > 1) {
+                val es = lang.code.equals("es", ignoreCase = true)
+                Surface(
+                    color = CardWhite,
+                    shape = RoundedCornerShape(14.dp),
+                    border = BorderStroke(1.dp, BorderLight),
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Text(
+                            if (es) "PACIENTES DE ESTA CUENTA" else "PATIENTS DE CE COMPTE",
+                            color = InkPrimary, fontSize = 13.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.sp
+                        )
+                        Text(
+                            if (es) "Cambie entre las personas seguidas por esta cuenta LibreLinkUp. Los datos de cada persona están separados."
+                            else "Basculez entre les personnes suivies par ce compte LibreLinkUp. Les données de chaque personne sont séparées.",
+                            color = InkMuted, fontSize = 11.sp, lineHeight = 15.sp
+                        )
+                        patients.forEach { p ->
+                            Surface(
+                                color = if (p.active) AccentGreen.copy(alpha = 0.08f) else CardWhite,
+                                shape = RoundedCornerShape(10.dp),
+                                border = BorderStroke(1.dp, if (p.active) AccentGreen else BorderLight),
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .then(if (!p.active) Modifier.clickable { onSwitchPatient(p.patientId) } else Modifier)
+                            ) {
+                                Row(
+                                    modifier = Modifier.padding(start = 12.dp, end = 12.dp, top = 10.dp, bottom = 10.dp),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Icon(
+                                        if (p.active) Icons.Filled.Check else Icons.Outlined.Person,
+                                        contentDescription = null,
+                                        tint = if (p.active) AccentGreen else InkMuted,
+                                        modifier = Modifier.size(20.dp)
+                                    )
+                                    Spacer(Modifier.width(10.dp))
+                                    Text(p.label, color = InkPrimary, fontSize = 14.sp, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
+                                    if (p.active) Text(
+                                        if (es) "Activo" else "Actif",
+                                        color = AccentGreen, fontSize = 11.sp, fontWeight = FontWeight.Bold
+                                    )
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -237,6 +326,33 @@ fun ProfileScreen(
                 Box(Modifier.weight(1f)) { Field(s.fieldWeight, weight, number = true) { weight = it } }
             }
             Field(s.fieldDxYears, dxYears, number = true) { dxYears = it }
+            // HbA1c: the lab value the user types, plus Doctor Claude's own estimate (GMI) computed
+            // from the CGM mean — the same indicator LibreLink shows. The estimate appears once enough
+            // readings exist; under ~14 days it's shown as indicative.
+            Field(bg.hba1cField, hba1c, decimal = true) { hba1c = it }
+            val g = gmi
+            when {
+                // Enough data (>=14 days) → the actual estimate, big and green.
+                g != null && g.ready -> {
+                    Surface(color = CardWhite, shape = RoundedCornerShape(14.dp), border = BorderStroke(1.dp, BorderLight), modifier = Modifier.fillMaxWidth()) {
+                        Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                            Text(bg.gmiTitle, color = InkPrimary, fontSize = 13.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.sp)
+                            Text(formatPct(g.pct), color = AccentGreen, fontSize = 30.sp, fontWeight = FontWeight.Black)
+                            Text(
+                                bg.gmiExplain.format(g.meanMgdl, g.days.roundToInt().coerceAtLeast(1)),
+                                color = InkMuted, fontSize = 11.sp, lineHeight = 15.sp
+                            )
+                        }
+                    }
+                }
+                // Some data but < 14 days → say how far along, NEVER a misleading number.
+                g != null -> Text(
+                    bg.gmiAccumulating.format(g.days.roundToInt().coerceAtLeast(1)),
+                    color = InkDim, fontSize = 11.sp, lineHeight = 15.sp
+                )
+                // No readings yet.
+                gmiLoaded -> Text(bg.gmiPending, color = InkDim, fontSize = 11.sp, lineHeight = 15.sp)
+            }
             Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                 Box(Modifier.weight(2f)) { Field(s.fieldRapidName, rapidName) { rapidName = it } }
                 Box(Modifier.weight(1f)) { Field(s.fieldRapidUnits, rapidUnits, number = true) { rapidUnits = it } }
@@ -536,15 +652,23 @@ private fun SwitchCard(label: String, sub: String, checked: Boolean, onChange: (
 
 private fun trimNum(d: Double): String = if (d == d.toLong().toDouble()) d.toLong().toString() else d.toString()
 
+/** Estimated-HbA1c percentage, one decimal, comma separator (e.g. "7,1 %"). */
+private fun formatPct(p: Double): String =
+    String.format(java.util.Locale.US, "%.1f", p).replace('.', ',') + " %"
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun Field(label: String, value: String, number: Boolean = false, singleLine: Boolean = true, onChange: (String) -> Unit) {
+private fun Field(label: String, value: String, number: Boolean = false, decimal: Boolean = false, singleLine: Boolean = true, onChange: (String) -> Unit) {
     OutlinedTextField(
         value = value,
         onValueChange = onChange,
         label = { Text(label, color = InkMuted, fontSize = 12.sp) },
         singleLine = singleLine,
-        keyboardOptions = if (number) KeyboardOptions(keyboardType = KeyboardType.Number) else KeyboardOptions.Default,
+        keyboardOptions = when {
+            decimal -> KeyboardOptions(keyboardType = KeyboardType.Decimal)
+            number -> KeyboardOptions(keyboardType = KeyboardType.Number)
+            else -> KeyboardOptions.Default
+        },
         modifier = Modifier.fillMaxWidth(),
         colors = OutlinedTextFieldDefaults.colors(
             focusedTextColor = InkPrimary, unfocusedTextColor = InkPrimary,

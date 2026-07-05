@@ -218,7 +218,12 @@ class LibreLinkUpClient(private val store: CredentialsStore) {
                 // freshly scanned). Fall back to the most recent graph point so the
                 // dashboard still shows a current value instead of "--".
                 val current = liveCurrent ?: history.lastOrNull()
-                LibreResult.Success(GraphSnapshot(current, history))
+                // connection.sensor.a = the sensor's activation time (epoch SECONDS); a Libre
+                // sensor lives 14 days. Past that, readings stop — surfaced as CAPTEUR EXPIRÉ.
+                val sensorEndMs = connection?.optJSONObject("sensor")
+                    ?.optLong("a", 0L)?.takeIf { it > 0L }
+                    ?.let { it * 1000L + 14L * 24 * 3600 * 1000 }
+                LibreResult.Success(GraphSnapshot(current, history, sensorEndMs))
             }
         } catch (e: Exception) {
             LibreResult.Error("Erreur graph: ${e.message}")

@@ -10,6 +10,7 @@ import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.IBinder
+import android.os.PowerManager
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import com.nueve.mechabetics.data.AlarmEngine
@@ -38,10 +39,13 @@ import kotlinx.coroutines.launch
  * snooze/escalation bookkeeping (in CredentialsStore) so the handover is seamless. It reuses the
  * exact same [GlucoseAlert.evaluate] + [AlarmEngine.decide] the UI uses, so the two never disagree.
  *
- * NOTE (needs real-device tuning): a foreground service keeps the process alive and polling, which
- * already survives backgrounding / app-swipe / short screen-off. Deep-Doze hardening (exact-alarm
- * wake-ups or a wakelock) is a deliberate follow-up — it must be validated on the real Galaxy A32,
- * whose Samsung power management the emulator does not reproduce.
+ * Deep-Doze hardening (the "it only scans when I unlock the phone" fix): a foreground service alone
+ * keeps the PROCESS alive but not the CPU, so the moment the device deep-sleeps the [delay]-based
+ * poll loop is frozen and glucose stops refreshing until the screen comes back on. Three things keep
+ * it polling through standby: (1) a partial [PowerManager.WakeLock] held here keeps the CPU awake so
+ * the 60 s loop keeps firing screen-off; (2) the user whitelisting the app from battery optimization
+ * ([PowerExemption]) stops Samsung One UI from freezing/killing it and unblocks network in Doze;
+ * (3) [MonitorWatchdogReceiver] re-asserts + re-polls every ~10 min in case the OS killed it anyway.
  */
 class MonitorService : Service() {
 
@@ -50,6 +54,7 @@ class MonitorService : Service() {
     private lateinit var store: CredentialsStore
     private var pollJob: Job? = null
     private var watchJob: Job? = null
+    private var wakeLock: PowerManager.WakeLock? = null
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -69,10 +74,22 @@ class MonitorService : Service() {
         // Re-assert foreground (Android may redeliver) and (re)start the loops if not already running.
         startForegroundCompat(buildOngoing(repo.state.value.current?.valueMgDl))
         ensureRunning()
+        // A watchdog wake (Doze) asks for a refresh RIGHT NOW so a 10 min tick doesn't have to wait a
+        // full poll cycle for fresh data after the device thaws.
+        if (intent?.action == ACTION_POKE) {
+            scope.launch {
+                try { if (repo.state.value.isLoggedIn) repo.refresh() }
+                catch (e: Exception) { Log.e(TAG, "poke refresh failed", e) }
+            }
+        }
         return START_STICKY
     }
 
     private fun ensureRunning() {
+        // Keep the CPU awake so the poll loop's delay() keeps firing screen-off, and arm the Doze
+        // watchdog. Both are idempotent (no-op if already held / scheduled).
+        acquireWakeLock()
+        MonitorWatchdogReceiver.schedule(this)
         if (pollJob?.isActive != true) {
             pollJob = scope.launch {
                 try { repo.startPolling() } catch (e: Exception) { Log.e(TAG, "polling stopped", e) }
@@ -116,6 +133,29 @@ class MonitorService : Service() {
                 AlarmService.start(this, title, body, eff.volumePct, eff.vibrate)
             }
         }
+    }
+
+    /** Hold the CPU awake so the 60 s poll loop's delay() keeps firing with the screen off. Without
+     *  this the coroutine is frozen the instant the device deep-sleeps and glucose stops refreshing
+     *  until the screen is unlocked — the reported "only scans when I open it" bug. Battery cost is
+     *  the accepted trade-off for a continuous glucose monitor (and is mitigated by the radio only
+     *  waking ~once a minute). Released on stop/destroy. */
+    private fun acquireWakeLock() {
+        if (wakeLock?.isHeld == true) return
+        try {
+            val pm = getSystemService(PowerManager::class.java)
+            wakeLock = pm?.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, WAKELOCK_TAG)?.apply {
+                setReferenceCounted(false)
+                acquire()
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "wakelock acquire failed", e)
+        }
+    }
+
+    private fun releaseWakeLock() {
+        try { if (wakeLock?.isHeld == true) wakeLock?.release() } catch (_: Exception) {}
+        wakeLock = null
     }
 
     private fun startForegroundCompat(n: Notification) {
@@ -165,12 +205,16 @@ class MonitorService : Service() {
     private fun stopEverything() {
         pollJob?.cancel(); pollJob = null
         watchJob?.cancel(); watchJob = null
+        MonitorWatchdogReceiver.cancel(this)
+        releaseWakeLock()
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) stopForeground(STOP_FOREGROUND_REMOVE)
         else @Suppress("DEPRECATION") stopForeground(true)
         stopSelf()
     }
 
     override fun onDestroy() {
+        // Always free the wakelock even if we're killed without an explicit stop.
+        releaseWakeLock()
         scope.cancel()
         super.onDestroy()
     }
@@ -179,7 +223,9 @@ class MonitorService : Service() {
         private const val TAG = "MonitorService"
         private const val CHANNEL_ID = "mechabetics_monitor"
         private const val NOTIF_ID = 4202
+        private const val WAKELOCK_TAG = "mechabetics:monitor"
         const val ACTION_STOP = "com.nueve.mechabetics.MONITOR_STOP"
+        const val ACTION_POKE = "com.nueve.mechabetics.MONITOR_POKE"
 
         /** Set by MainActivity (onStart/onStop). While true the UI owns the ring; while false the
          *  service rings. Shared so only ONE of them sounds at a time. */
@@ -194,6 +240,20 @@ class MonitorService : Service() {
                 else context.startService(i)
             } catch (e: Exception) {
                 Log.e(TAG, "start failed", e)
+            }
+        }
+
+        /** Watchdog wake: (re)start monitoring AND fetch immediately. Starts the service as a
+         *  foreground service so it's allowed to run; if a background-FGS-start is blocked (app not
+         *  yet battery-exempt on Android 12+) the exception is swallowed — the next foreground or the
+         *  battery-exemption grant recovers it. */
+        fun poke(context: Context) {
+            val i = Intent(context, MonitorService::class.java).setAction(ACTION_POKE)
+            try {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) context.startForegroundService(i)
+                else context.startService(i)
+            } catch (e: Exception) {
+                Log.e(TAG, "poke failed", e)
             }
         }
 

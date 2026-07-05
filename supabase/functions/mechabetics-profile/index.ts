@@ -35,6 +35,40 @@ const yearsSince = (d: unknown): number | null => {
   return Number.isFinite(t) ? (Date.now() - t) / (365.25 * 864e5) : null;
 };
 
+// Self-computed ESTIMATED HbA1c = GMI (Glucose Management Indicator) — the same indicator the
+// LibreLink/LibreView app shows. GMI(%) = 3.31 + 0.02392 * mean glucose (mg/dL) (Bergenstal 2018).
+// The mean is aggregated in the DB (mechabetics_gmi RPC) over up to 90 days of stored CGM readings.
+// Best-effort: any error never blocks the profile load. The number is only RETURNED once it is
+// trustworthy — the GMI is clinically meaningful only over >=14 days of CGM data (ADA/ATTD
+// consensus). Below that we send `ready:false` and NO percentage: a 4-day "7.1%" sitting next to a
+// 3-month lab "6.4%" would mislead. We also require real coverage across the span (~1 reading / 10
+// min on average) so a 14-day span riddled with gaps can't masquerade as ready.
+const GMI_MIN_DAYS = 14;
+const GMI_MIN_PER_DAY = 144;
+async function computeGmi(
+  subject: string,
+): Promise<{ ready: boolean; pct?: number; mean_mgdl?: number; days: number; readings: number } | null> {
+  try {
+    const { data } = await db.rpc("mechabetics_gmi", { p_subject: subject, p_days: 90 });
+    const n = Number(data?.n) || 0;
+    if (n <= 0) return null; // no readings at all → client shows a neutral "coming soon" line
+    const days = Math.round(Number(data?.days) || 0);
+    const mean = Number(data?.mean_mgdl);
+    const ready = days >= GMI_MIN_DAYS && n >= days * GMI_MIN_PER_DAY && Number.isFinite(mean) && mean > 0;
+    // Not enough yet → report how far along, but never a (misleading) number.
+    if (!ready) return { ready: false, days, readings: n };
+    return {
+      ready: true,
+      pct: Math.round((3.31 + 0.02392 * mean) * 10) / 10,
+      mean_mgdl: Math.round(mean),
+      days,
+      readings: n,
+    };
+  } catch (_) {
+    return null;
+  }
+}
+
 // Estime ratio glucidique / facteur de correction / cible depuis les bases.
 function estimateRatios(p: any): { carb_ratio: number; correction_factor: number; target_mgdl: number } | null {
   const rapid = num(p.rapid_units_per_day) ?? 0;
@@ -72,7 +106,7 @@ Deno.serve(async (req: Request) => {
 
     if (body.action !== "save") {
       const { data } = await db.from("mechabetics_profiles").select("*").eq("subject", subject).maybeSingle();
-      return json({ profile: data ?? null });
+      return json({ profile: data ?? null, gmi: await computeGmi(subject) });
     }
 
     const provided = body.profile ?? {};
@@ -128,6 +162,8 @@ Deno.serve(async (req: Request) => {
       correction_factor: corrN ?? est?.correction_factor ?? null,
       target_mgdl: targetN != null ? Math.round(targetN) : (est?.target_mgdl ?? (hasDoctorRatios ? defaultTarget : null)),
       ratios_estimated: !hasDoctorRatios,
+      // Last lab HbA1c the user typed (%). Merged like the rest: absent in a partial save → keep stored.
+      hba1c: num(pick("hba1c")),
       lang: pick("lang") ?? null,
       notes: pick("notes") ?? null,
       updated_at: new Date().toISOString(),

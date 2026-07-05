@@ -44,7 +44,13 @@ class GlucoseRepository(
         val patientName: String = "",
         val patientId: String? = null,
         val error: String? = null,
-        val lastUpdateMs: Long = 0
+        val lastUpdateMs: Long = 0,
+        // End of the sensor's 14-day life (from LibreLinkUp), null when unknown. now > sensorEndMs
+        // → CAPTEUR EXPIRÉ (the cause of a lost signal) on the dashboard + flagged to the AI.
+        val sensorEndMs: Long? = null,
+        // Every patient this LibreLinkUp account follows. Usually one, but a parent account can follow
+        // several — the Profile tab uses this to offer a patient switcher. Populated on login/refresh.
+        val connections: List<PatientConnection> = emptyList()
     )
 
     fun bootstrap() {
@@ -134,6 +140,49 @@ class GlucoseRepository(
         return _state.value.isLoggedIn
     }
 
+    /** Re-read the list of patients this account follows (for the Profile switcher), without touching
+     *  the active patient/data. Best-effort: a failure keeps whatever list we already have. */
+    suspend fun refreshConnections() {
+        if (store.token == null) return
+        when (val conns = client.listConnections()) {
+            is LibreResult.Success -> _state.value = _state.value.copy(connections = conns.data)
+            is LibreResult.Error -> { /* keep the current list */ }
+        }
+    }
+
+    /**
+     * Switch the active PATIENT inside the CURRENT LibreLinkUp account (one follower account can
+     * follow several people). Data is already isolated per patient server-side (subject =
+     * sha256(patientId)), so this only re-points the active id, wipes the previous person's shown
+     * data, resets the (global) alarm episode so a stale HIGH/LOW can't bleed across people, and
+     * refreshes. The token re-claim + per-patient caches are keyed on patientId elsewhere and follow
+     * automatically. No-op if it's already the active patient.
+     */
+    suspend fun switchPatient(pid: String, name: String): Boolean {
+        if (pid.isBlank() || pid == store.patientId) return false
+        store.patientId = pid
+        // Alarm bookkeeping is global (one ongoing episode), so drop it — otherwise a "fired HIGH"
+        // remembered for the previous patient could suppress or mis-fire the new patient's alarm.
+        store.firedAlert = null
+        store.ackAlert = null
+        store.lastAlarmMs = 0L
+        store.lastAlarmValue = 0
+        val seed = localDb?.recent(pid).orEmpty()
+        _state.value = _state.value.copy(
+            isLoggedIn = true,
+            isLoading = true,
+            error = null,
+            patientId = pid,
+            patientName = name,
+            current = null,
+            history = seed
+        )
+        // No need to rewrite the saved account here — refresh() persists the (account, patient, name)
+        // via upsertActiveAccount, and the choice also survives relaunch through store.patientId.
+        refresh()
+        return _state.value.isLoggedIn
+    }
+
     /**
      * Log in a NEW account while already signed into another. On failure, restore the
      * previously-active profile so the app stays consistent.
@@ -191,6 +240,8 @@ class GlucoseRepository(
                         )
                         return
                     }
+                    // Remember EVERY followed patient so the Profile tab can offer a switcher.
+                    _state.value = _state.value.copy(connections = conns.data)
                     store.patientId = first.patientId
                     patientId = first.patientId
                     patientName = "${first.firstName} ${first.lastName}".trim()
@@ -220,6 +271,9 @@ class GlucoseRepository(
                     // Show WHEN the reading was actually measured (not the poll time), so a
                     // stale sensor shows an old time instead of looking "just updated".
                     lastUpdateMs = cur?.timestampMs ?: System.currentTimeMillis(),
+                    // Keep the last known expiry when a poll omits the sensor block (it's a fixed
+                    // property of the worn sensor, not per-reading data).
+                    sensorEndMs = snapshot.sensorEndMs ?: _state.value.sensorEndMs,
                     error = null
                 )
                 // Persist this account (token/patient/name) so it stays in the profile switcher.

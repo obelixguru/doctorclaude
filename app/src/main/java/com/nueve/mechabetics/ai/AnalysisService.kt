@@ -60,6 +60,10 @@ class AnalysisService(private val context: Context) {
     @Volatile var useNativeVoice: Boolean = true
     /** Hosted mode on? Sent to the server so it knows it may use its own (paid) LLM key. */
     @Volatile var hostedMode: Boolean = false
+    /** Sensor past its 14-day life (set by MainActivity from LibreLinkUp's activation time). Sent
+     *  with every AI call so a lost signal is explained by its real cause: replace the sensor —
+     *  not "move the phone closer / re-scan", which can't revive a finished sensor. */
+    @Volatile var sensorExpired: Boolean = false
 
     // True while a coach/answer voice is ACTUALLY playing — premium MediaPlayer audio OR the
     // on-device TTS — so the dashboard's speaker button can flip to a STOP icon and the tap cuts it.
@@ -76,6 +80,7 @@ class AnalysisService(private val context: Context) {
     private fun JSONObject.putAiFlags() {
         put("premiumVoice", premiumVoice)
         put("hosted", hostedMode)
+        if (sensorExpired) put("sensorExpired", true)
         byokKey?.takeIf { it.isNotBlank() }?.let { put("geminiKey", it) }
     }
 

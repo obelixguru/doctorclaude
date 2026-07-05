@@ -63,6 +63,25 @@ fun cleanGlucoseSeries(
     return out
 }
 
+/**
+ * Live "is the glucose rising right now?" from the recent ~20-min slope — mirrors the server's
+ * rising-trend gate used for the meal nudge. Lets the dashboard decide the nudge WITHOUT a server
+ * round-trip and, crucially, re-evaluate it on every reading so it never goes stale (the old sticky
+ * server flag lingered after the rise ended). False on a too-short or stale series (never nudge off
+ * a frozen curve). `slope > 0.3` ≈ rising by more than ~6 mg/dL over the 20-min window.
+ */
+fun glucoseRisingNow(history: List<GlucoseReading>): Boolean {
+    val pts = cleanGlucoseSeries(history)
+    if (pts.size < 2) return false
+    val last = pts.last()
+    if (System.currentTimeMillis() - last.timestampMs > GlucoseAlert.FRESHNESS_WINDOW_MS) return false
+    val windowStart = last.timestampMs - 20 * 60_000L
+    val first = pts.firstOrNull { it.timestampMs >= windowStart } ?: pts.first()
+    val mins = (last.timestampMs - first.timestampMs) / 60_000.0
+    val slope = if (mins > 0) (last.valueMgDl - first.valueMgDl) / mins else 0.0
+    return slope > 0.3
+}
+
 object Predictor {
     const val LOW = 70
     const val HIGH = 180

@@ -55,15 +55,28 @@ Deno.serve(async (req: Request) => {
     const lang = body.lang === "es" ? "es" : "fr";
     const since = new Date(Date.now() - days * 24 * 3600 * 1000).toISOString();
 
-    const { data: rows } = await db.from("mechabetics_readings")
-      .select("ts, value_mgdl").eq("subject", subject).gte("ts", since)
-      .order("ts", { ascending: true }).limit(5000);
+    // Fetch ALL readings in the window, NEWEST first, PAGING past PostgREST's ~1000-row response cap.
+    // A single `.order(asc).limit(5000)` is silently clamped to 1000 rows by the server, and because
+    // it was ASCENDING that kept only the OLDEST 1000 — so as the table grew, the most recent days
+    // (today, yesterday) vanished from the graph and per-day chips, which read on-screen as a flat
+    // line / "the data gets mixed up the further in time you go". Descending + range() pages keep the
+    // recent data even if we ever hit the page cap; cleanSeries then dedupes to one point per 5 min.
+    const nowMs = Date.now();
+    const PAGE = 1000;
+    const MAX_PAGES = 20; // ~20k raw rows ≈ 4 weeks at the current cadence; recent days are page 0.
+    const raw: { ts: number; value: number }[] = [];
+    for (let page = 0; page < MAX_PAGES; page++) {
+      const from = page * PAGE;
+      const { data, error } = await db.from("mechabetics_readings")
+        .select("ts, value_mgdl").eq("subject", subject).gte("ts", since)
+        .order("ts", { ascending: false }).range(from, from + PAGE - 1);
+      if (error || !data || data.length === 0) break;
+      for (const r of data) raw.push({ ts: new Date(r.ts).getTime(), value: Number(r.value_mgdl) });
+      if (data.length < PAGE) break;
+    }
     // Drop any FUTURE-dated reading (a bad-timezone artefact) so the history never shows a point
     // ahead of "now". cleanSeries then dedupes to one point per 5 min.
-    const nowMs = Date.now();
-    const readings = cleanSeries((rows ?? [])
-      .map((r: any) => ({ ts: new Date(r.ts).getTime(), value: Number(r.value_mgdl) }))
-      .filter((r) => Number.isFinite(r.ts) && r.ts <= nowMs + 120000));
+    const readings = cleanSeries(raw.filter((r) => Number.isFinite(r.ts) && r.ts <= nowMs + 120000));
 
     // Only the CURRENT language's analyses (plus legacy rows with no lang) — the bilingual prefetch
     // stores both an FR and an ES copy of each report, so without this filter the ANALYSES tab would

@@ -18,7 +18,11 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import com.nueve.mechabetics.AlarmService
+import com.nueve.mechabetics.PowerExemption
 import com.nueve.mechabetics.data.CredentialsStore
 import com.nueve.mechabetics.ui.theme.*
 import java.util.Locale
@@ -55,6 +59,26 @@ fun NotificationSettingsScreen(
         }
         NotificationSettingsContent(store, lang, Modifier.weight(1f))
     }
+}
+
+/**
+ * One-time prompt nudging the user to whitelist the app from battery optimization, so monitoring
+ * keeps polling + alarming with the screen off (the "scan even in standby" requirement). Shown once
+ * from [com.nueve.mechabetics.MainActivity]; the Notifications page keeps a permanent toggle.
+ */
+@Composable
+fun BatteryExemptionDialog(lang: Lang, onAllow: () -> Unit, onLater: () -> Unit) {
+    val bg = bgStringsFor(lang)
+    AlertDialog(
+        onDismissRequest = onLater,
+        title = { Text(bg.bgTitle, fontWeight = FontWeight.Bold) },
+        text = { Text(bg.bgBody, fontSize = 13.sp, lineHeight = 18.sp) },
+        confirmButton = {
+            TextButton(onClick = onAllow) { Text(bg.bgButton, color = AccentGreen, fontWeight = FontWeight.Bold) }
+        },
+        dismissButton = { TextButton(onClick = onLater) { Text(bg.bgLater, color = InkMuted) } },
+        containerColor = CardWhite
+    )
 }
 
 /** The notifications & alarms settings content (no header) — reused as a tab inside Profile. */
@@ -96,6 +120,34 @@ fun NotificationSettingsContent(store: CredentialsStore, lang: Lang, modifier: M
             .padding(horizontal = 16.dp, vertical = 4.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
+            // ── Background / standby monitoring (Doze exemption) ── the reliability keystone ──
+            // Re-read on every screen resume so it flips to "✓ activé" the moment the user comes
+            // back from the system dialog without having to leave + reopen the page.
+            val bg = bgStringsFor(lang)
+            var batteryExempt by remember { mutableStateOf(PowerExemption.isExempt(context)) }
+            val lifecycleOwner = LocalLifecycleOwner.current
+            DisposableEffect(lifecycleOwner) {
+                val obs = LifecycleEventObserver { _, e ->
+                    if (e == Lifecycle.Event.ON_RESUME) batteryExempt = PowerExemption.isExempt(context)
+                }
+                lifecycleOwner.lifecycle.addObserver(obs)
+                onDispose { lifecycleOwner.lifecycle.removeObserver(obs) }
+            }
+            SettingsCard {
+                SectionTitle(bg.bgTitle)
+                if (batteryExempt) {
+                    Text(bg.bgActive, color = AccentGreen, fontSize = 12.sp, fontWeight = FontWeight.Bold, lineHeight = 16.sp)
+                } else {
+                    Text(bg.bgCardSub, color = InkMuted, fontSize = 11.sp, lineHeight = 15.sp)
+                    OutlinedButton(
+                        onClick = { PowerExemption.request(context) },
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(10.dp),
+                        border = BorderStroke(1.dp, AccentGreen)
+                    ) { Text(bg.bgButton, color = AccentGreen, fontWeight = FontWeight.Bold, fontSize = 13.sp) }
+                }
+            }
+
             // ── Sound mode + volume + test ──────────────────────────────────────────────
             SettingsCard {
                 SectionTitle(s.notifModeTitle)

@@ -254,6 +254,16 @@ export function carbsCubesPhrase(carbsG: number | null | undefined, lang: string
   return lang === "es" ? `≈ ${n} terrón(es) de azúcar` : `≈ ${n} sucre(s)`;
 }
 
+/** Shared carb-COUNTING guidance for every estimator (meals / ask / scan) so they all count the same
+ *  way. Fixes the user's report that estimates were off: protein/fat foods (sausages, meat, cheese,
+ *  egg) were being given carbs, and an explicit quantity ("1/5 baguette", "2 saucisses") was ignored
+ *  in favour of a vague "standard portion". Carbs = DIGESTIBLE carbohydrate only. */
+export function carbEstimationRules(lang: string): string {
+  return lang === "es"
+    ? `CONTEO DE CARBOHIDRATOS (con cuidado): cuenta SOLO los carbohidratos digeribles, para EXACTAMENTE el alimento y la CANTIDAD descritos (respeta «1/5 de baguette» = un quinto de una baguette, «2 salchichas» = dos). Suma cada componente del plato. La PROTEÍNA y la GRASA casi no tienen carbohidratos: carne, salchicha, embutido, jamón, pollo, pescado, huevo, queso, mantequilla, aceite, nata → ≈ 0 g (cuenta solo el acompañamiento con carbohidratos: pan, patata, arroz, pasta, fruta, azúcar, salsa dulce). Un alimento SIN carbohidratos (salchicha sola, filete, jamón, huevo, queso) → "carbsG" cercano a 0 (0-2 g): NUNCA inventes carbohidratos para «rellenar» — 2 salchichas ≈ 0-2 g, NO 15. Las verduras (tomate, ensalada, calabacín…) son muy bajas (~2-3 g por ración). REFERENCIAS (porciones comunes, calíbrate con ellas): 1 terrón de azúcar = 4 g; 1 pain au chocolat/napolitana ≈ 30 g; 1 cruasán ≈ 25 g; 1 baguette entera ≈ 130 g (1/5 ≈ 26 g); 1 rebanada de pan de molde ≈ 15 g; 1 manzana ≈ 15-20 g; 1 plátano ≈ 25 g; 1 yogur natural ≈ 5 g (azucarado ≈ 15-20 g); 1 lata de refresco 33 cl ≈ 35 g; 1 vaso de zumo 20 cl ≈ 20 g; 1 ración de pasta/arroz cocidos (200 g) ≈ 50 g; 1 menú hamburguesa+patatas+refresco ≈ 90-110 g; 1 salchicha ≈ 0-2 g. Sé realista, ni sistemáticamente alto ni bajo.`
+    : `COMPTAGE DES GLUCIDES (soigneusement) : compte UNIQUEMENT les glucides digestibles, pour EXACTEMENT l'aliment et la QUANTITÉ décrits (respecte « 1/5 de baguette » = un cinquième d'une baguette, « 2 saucisses » = deux). Additionne chaque composant du plat. La PROTÉINE et le GRAS n'ont quasi pas de glucides : viande, saucisse, charcuterie, jambon, poulet, poisson, œuf, fromage, beurre, huile, crème → ≈ 0 g (ne compte que l'accompagnement glucidique : pain, pomme de terre, riz, pâtes, fruit, sucre, sauce sucrée). Un aliment SANS glucides (saucisse seule, steak, jambon, œuf, fromage) → "carbsG" proche de 0 (0-2 g) : n'invente JAMAIS des glucides pour « remplir » — 2 saucisses ≈ 0-2 g, PAS 15. Les légumes (tomate, salade, courgette…) sont très bas (~2-3 g par portion). REPÈRES (portions courantes, sers-t'en pour te calibrer) : 1 morceau de sucre = 4 g ; 1 pain au chocolat ≈ 30 g ; 1 croissant ≈ 25 g ; 1 baguette entière ≈ 130 g (1/5 ≈ 26 g) ; 1 tranche de pain de mie ≈ 15 g ; 1 pomme ≈ 15-20 g ; 1 banane ≈ 25 g ; 1 yaourt nature ≈ 5 g (sucré ≈ 15-20 g) ; 1 canette de soda 33 cl ≈ 35 g ; 1 verre de jus 20 cl ≈ 20 g ; 1 portion de pâtes/riz cuits (200 g) ≈ 50 g ; 1 menu burger+frites+soda ≈ 90-110 g ; 1 saucisse ≈ 0-2 g. Sois réaliste, ni systématiquement haut ni bas.`;
+}
+
 const FATTY_MEAL_WORDS = [
   "mcdo", "mcdonald", "burger", "hamburger", "cheeseburger", "royal", "big mac", "whopper",
   "pizza", "frite", "fries", "kebab", "nugget", "tacos", "fromage", "cheese", "gras", "friture",
@@ -339,6 +349,30 @@ export function activeIob(
   return Math.max(0, iob);
 }
 
+/** Code-owned phrase for how much insulin is still working — three HONEST tiers. "presque épuisée"
+ *  used to cover BOTH a real tail (0 < IOB < 0.1 u) and a long-finished dose (IOB = 0), so the
+ *  report said "almost done" while the Insuline tab showed 0. Zero now says plainly nothing acts. */
+export function iobStatusPhrase(iobUnits: number | null | undefined, lang: string): string {
+  const iob = iobUnits || 0;
+  const es = lang === "es";
+  if (iob >= 0.1) {
+    const u = fmtUnits(Math.round(iob * 10) / 10);
+    return es ? `≈ ${u} u aún activa` : `≈ ${u} u encore active`;
+  }
+  if (iob > 0) return es ? "casi agotada (menos de 0,1 u)" : "presque épuisée (moins de 0,1 u)";
+  return es ? "terminada — ya no actúa" : "terminée — n'agit plus";
+}
+
+/** Model-facing AUTHORITATIVE insulin-on-board line for the coach/ask prompts. The model used to
+ *  see only the raw dose list ("4 u il y a 290 min") and estimated the decay ITSELF — writing
+ *  "insuline presque terminée" while the computed IOB (and the Insuline tab) said 0. */
+export function iobSystemLine(iobUnits: number | null | undefined, lang: string): string {
+  const phrase = iobStatusPhrase(iobUnits, lang);
+  return lang === "es"
+    ? `INSULINA AÚN ACTIVA (calculada por el sistema): ${phrase}. Usa SOLO este dato cuando hables de insulina activa; NUNCA estimes tú cuánta queda de una dosis.`
+    : `INSULINE ENCORE ACTIVE (calculée par le système) : ${phrase}. Appuie-toi UNIQUEMENT sur cette valeur quand tu parles d'insuline active ; n'estime JAMAIS toi-même ce qui reste d'une dose.`;
+}
+
 /**
  * The final, code-owned action line combining a meal bolus (covering carbs) with the guard's
  * correction. Hypo dominates (sugar first, never bolus a low). When data is stale a meal bolus
@@ -349,6 +383,7 @@ export function combinedActionLine(
   mealUnits: number,
   lang: string,
   profile: GuardProfile | null,
+  mealPlanned = false,
 ): string {
   const rapid = profile?.rapidInsulin || (lang === "es" ? "insulina rápida" : "insuline rapide");
   // Sugar / no-ratios / sugar-already-taken: a meal bolus must NOT be stacked on top, so return the
@@ -365,6 +400,23 @@ export function combinedActionLine(
   }
 
   const stale = guard.reason === "stale_data";
+
+  // A PLANNED (not-yet-eaten) meal must NOT be pre-bolused hours early — injecting its bolus NOW
+  // with no carbs on board is a straight path to a hypo. The meal part is therefore timed "when you
+  // eat", and it is NEVER summed with the correction (they happen at different moments).
+  if (mealPlanned && meal > 0) {
+    if (lang === "es") {
+      if (corr > 0) return `ahora: ${fmtUnits(corr)} u de ${rapid} de corrección; al comer: ${fmtUnits(meal)} u para la comida prevista.`;
+      let l = `${fmtUnits(meal)} u de ${rapid} EN EL MOMENTO de comer, para cubrir la comida prevista (no antes de empezar).`;
+      if (stale) l += ` Recontrola la glucosa antes de cualquier corrección.`;
+      return l;
+    }
+    if (corr > 0) return `maintenant : ${fmtUnits(corr)} u de ${rapid} en correction ; au moment de manger : ${fmtUnits(meal)} u pour le repas prévu.`;
+    let l = `${fmtUnits(meal)} u de ${rapid} AU MOMENT de manger, pour couvrir le repas prévu (pas avant de commencer).`;
+    if (stale) l += ` Recontrôle la glycémie avant toute correction.`;
+    return l;
+  }
+
   if (lang === "es") {
     let line = (meal > 0 && corr === 0)
       ? `${fmtUnits(total)} u de ${rapid} para la comida`
@@ -379,6 +431,31 @@ export function combinedActionLine(
   if (meal > 0 && corr > 0) line += ` (${fmtUnits(meal)} u pour le repas + ${fmtUnits(corr)} u de correction)`;
   if (stale && meal > 0) line += ` ; recontrôle la glycémie avant toute correction`;
   return line + ".";
+}
+
+/** Code-owned note for an ANNOUNCED future meal whose carbs are only ESTIMATED (no firm bolus
+ *  number allowed): says plainly that the meal WILL need rapid insulin at eating time, and whether a
+ *  recent dose is already on record (the user's ask: "je vais manger un McDo" → if no insulin was
+ *  saved, the AI must SAY to take insulin). Pairs with combinedActionLine's mealPlanned branch,
+ *  which handles the firm-units case. */
+export function plannedMealNote(
+  carbsG: number | null | undefined,
+  hasRecentRapidDose: boolean,
+  lang: string,
+): string {
+  const es = lang === "es";
+  const carbs = carbsG && carbsG > 0 ? carbsG : null;
+  const head = es
+    ? (carbs ? `Comida prevista (~${carbs} g de carbohidratos): habrá que cubrirla con tu insulina rápida EN EL MOMENTO de comer` : `Comida prevista: habrá que cubrirla con tu insulina rápida EN EL MOMENTO de comer`)
+    : (carbs ? `Repas prévu (~${carbs} g de glucides) : il faudra le couvrir avec ton insuline rapide AU MOMENT de manger` : `Repas prévu : il faudra le couvrir avec ton insuline rapide AU MOMENT de manger`);
+  const tail = hasRecentRapidDose
+    ? (es
+      ? ` — ya hay una dosis reciente registrada: comprueba que cubra bien esta comida.`
+      : ` — une dose récente est déjà enregistrée : vérifie qu'elle couvre bien ce repas.`)
+    : (es
+      ? ` — ninguna insulina registrada para esta comida. Registra la comida y tu dosis en ese momento para la dosis exacta.`
+      : ` — aucune insuline enregistrée pour ce repas. Logge le repas et ta dose à ce moment-là pour la dose exacte.`);
+  return head + tail;
 }
 
 // ---- Proactive prediction (SUGGESTION only — the dose guard still owns every number) ---------
@@ -536,10 +613,16 @@ export function mealCarbSpeed(desc?: string | null): CarbSpeed {
  *  the food: a fast sugar wants a pre-bolus and its quick spike is normal (don't chase it); slow and
  *  fatty meals rise late, so recheck later. Callers must SKIP it during a hypo rescue (guard "sugar")
  *  — telling someone treating a low to "pre-bolus next time" is contradictory. */
-export function carbSpeedAdvice(speed: CarbSpeed, lang: string): string {
+export function carbSpeedAdvice(speed: CarbSpeed, lang: string, planned = false): string {
   const es = lang === "es";
   switch (speed) {
     case "fast":
+      // For an ANNOUNCED (future) meal the pre-bolus advice applies to THIS meal, not "next time".
+      if (planned) {
+        return es
+          ? "Azúcar rápido (zumo, dulces, pan blanco…): la glucosa subirá MUY RÁPIDO (pico ~15-45 min). Si no hay hipo, poner la insulina un poco ANTES de empezar a comer (pre-bolo ~15 min) frena el pico."
+          : "Sucre rapide (jus, bonbons, pain blanc…) : la glycémie va monter TRÈS VITE (pic ~15-45 min). S'il n'y a pas d'hypo, faire l'insuline un peu AVANT de commencer à manger (pré-bolus ~15 min) limite le pic.";
+      }
       return es
         ? "Azúcar rápido (zumo, dulces, pan blanco…): la glucosa sube MUY RÁPIDO (pico ~15-45 min). Una subida rápida tras esta comida es NORMAL, no la sobre-corrijas enseguida; la próxima vez, si no hay hipo, poner la insulina un poco ANTES de comer (pre-bolo ~15 min) frena el pico."
         : "Sucre rapide (jus, bonbons, pain blanc…) : la glycémie monte TRÈS VITE (pic ~15-45 min). Une montée rapide après ce repas est NORMALE, ne la sur-corrige pas tout de suite ; la prochaine fois, s'il n'y a pas d'hypo, faire l'insuline un peu AVANT de manger (pré-bolus ~15 min) limite le pic.";
@@ -548,10 +631,189 @@ export function carbSpeedAdvice(speed: CarbSpeed, lang: string): string {
         ? "Carbohidratos lentos (pasta, legumbres, integral…): la glucosa sube DESPACIO y TARDE; el pico puede llegar 2-3 h después. No esperes una subida inmediata — vigila y recontrola más tarde."
         : "Glucides lents (pâtes, légumineuses, complet…) : la glycémie monte LENTEMENT et TARD ; le pic peut arriver 2-3 h après. N'attends pas une montée immédiate — surveille et recontrôle plus tard.";
     case "fatty":
+      // Planned fatty meal → the split-bolus parts are "when you eat" + later, never "now".
+      if (planned) {
+        return es
+          ? "Comida grasa (digestión lenta): la glucosa suele subir con RETRASO. Piensa en un bolo dividido — una parte al comer, otra 1-2 h después — y recontrola 2-3 h más tarde."
+          : "Repas gras (digestion lente) : la glycémie monte souvent en RETARD. Pense à un bolus étalé — une partie au moment de manger, une partie 1-2 h après — et recontrôle 2-3 h plus tard.";
+      }
       return fattyMealAdvice(lang);
     default:
       return "";
   }
+}
+
+// ---- Uncovered-meal awareness (Carbs-On-Board) --------------------------------------------------
+// The dose guard corrects on (glucose − target)/ISF − IOB. It subtracts INSULIN on board (anti-
+// stacking) but has NO term for the CARBS still on board. So when a meal is logged but never bolused,
+// a later CORRECTION is systematically too small: it dips at the insulin's peak, then the still-
+// digesting carbs push the glucose back up — it plateaus ABOVE target instead of reaching it. The real
+// case: 30 g chicken + potatoes (slow carbs) logged with NO bolus → 119→202 over 2 h; a 1 u correction
+// only reached ~168, then drifted back to ~190 and sat there with a 120 target. This surfaces that the
+// meal wasn't covered so a correction alone won't hold. Description-based speed (mealCarbSpeed) sets how
+// long the carbs keep acting. No schema change — retroactive on every meal already logged.
+
+// How long a meal's carbs keep meaningfully raising glucose (so an uncovered meal is still the cause).
+export const COB_WINDOW_FAST_MIN = 120;   // simple sugars: mostly absorbed within ~2 h
+export const COB_WINDOW_NORMAL_MIN = 180; // mixed meal
+export const COB_WINDOW_SLOW_MIN = 240;   // pasta/legumes/whole-grain/fatty: long, late tail
+// A meal smaller than this is a snack / hypo rescue, not a meal that needed a bolus → never warned.
+export const UNCOVERED_MEAL_MIN_CARBS = 15;
+// A rapid dose within ±this of the meal counts toward covering it (handles pre-bolus / slightly-late bolus)…
+export const MEAL_COVER_WINDOW_MIN = 45;
+// …if it carries at least this fraction of the meal's expected bolus.
+export const MEAL_COVER_FRACTION = 0.5;
+
+function cobWindowMin(speed: CarbSpeed): number {
+  if (speed === "fast") return COB_WINDOW_FAST_MIN;
+  if (speed === "slow" || speed === "fatty") return COB_WINDOW_SLOW_MIN;
+  return COB_WINDOW_NORMAL_MIN;
+}
+
+export interface UncoveredMeal {
+  description: string | null;
+  carbsG: number;
+  speed: CarbSpeed;
+  minutesAgo: number;
+}
+
+type MealRow = { ts: string | number; carbs_g?: number | null; carbsG?: number | null; description?: string | null; planned?: boolean };
+type DoseRow = { ts: string | number; units: number; kind?: string | null };
+
+/** The most recent EATEN meal that (a) was substantial (≥ UNCOVERED_MEAL_MIN_CARBS g), (b) is still
+ *  within its carb-speed digestion window, and (c) was NOT covered by a rapid dose near its time.
+ *  Returns null when there's no such meal. ts may be ISO or epoch ms; carbs read from carbs_g/carbsG. */
+export function findUncoveredMeal(
+  meals: MealRow[],
+  doses: DoseRow[],
+  nowMs: number,
+  profile: GuardProfile | null,
+): UncoveredMeal | null {
+  const cr = profile?.carbRatio && profile.carbRatio > 0 ? profile.carbRatio : null;
+  let best: UncoveredMeal | null = null;
+  for (const m of meals || []) {
+    if (!m || m.planned === true) continue;
+    const carbs = Number(m.carbs_g ?? m.carbsG ?? 0);
+    if (!Number.isFinite(carbs) || carbs < UNCOVERED_MEAL_MIN_CARBS) continue;
+    const mt = typeof m.ts === "number" ? m.ts : new Date(m.ts).getTime();
+    if (!Number.isFinite(mt)) continue;
+    const minsAgo = (nowMs - mt) / 60000;
+    if (minsAgo < 0) continue; // not eaten yet
+    const speed = mealCarbSpeed(m.description);
+    if (minsAgo > cobWindowMin(speed)) continue; // carbs already absorbed → no longer the cause
+    const need = cr ? carbs / cr : 0; // expected meal bolus (0 when no ratio → any nearby dose covers)
+    const covered = (doses || []).some((d) => {
+      if (!d || d.kind === "basal") return false;
+      const dt = typeof d.ts === "number" ? d.ts : new Date(d.ts).getTime();
+      if (!Number.isFinite(dt)) return false;
+      if (Math.abs(dt - mt) > MEAL_COVER_WINDOW_MIN * 60000) return false;
+      return need <= 0 || Number(d.units) >= need * MEAL_COVER_FRACTION;
+    });
+    if (covered) continue;
+    if (!best || minsAgo < best.minutesAgo) {
+      best = { description: m.description ?? null, carbsG: Math.round(carbs), speed, minutesAgo: Math.round(minsAgo) };
+    }
+  }
+  return best;
+}
+
+/** Code-owned WARNING appended to a CORRECTION when a recent meal went unbolused and its carbs are
+ *  still digesting: a correction alone dips then rebounds / plateaus above target. Speed-aware (slow &
+ *  fatty carbs peak late → also nudge to cover at meal-time / split the bolus). Empty when there's no
+ *  uncovered meal. No dose numbers; ⚠️ prefix stripped by callers for the spoken voice (like
+ *  hypoIobWarning). Answers the user's "the target is 120 but it stays at 175 after hours". */
+export function uncoveredMealWarning(
+  meals: MealRow[],
+  doses: DoseRow[],
+  nowMs: number,
+  profile: GuardProfile | null,
+  lang: string,
+): string {
+  const m = findUncoveredMeal(meals, doses, nowMs, profile);
+  if (!m) return "";
+  const es = lang === "es";
+  const cubes = carbsCubes(m.carbsG);
+  const desc = (m.description || (es ? "una comida" : "un repas")).trim();
+  const cubesPhrase = cubes ? (es ? `, ≈ ${cubes} terrón(es)` : `, ≈ ${cubes} sucre(s)`) : "";
+  const target = profile?.targetMgdl && profile.targetMgdl > 0 ? profile.targetMgdl : null;
+  const late = m.speed === "slow" || m.speed === "fatty";
+
+  if (es) {
+    let s = `⚠️ La comida «${desc}» (~${m.carbsG} g${cubesPhrase}) no se cubrió con un bolo`;
+    s += late
+      ? `, y son carbohidratos lentos que aún están subiendo y tarde. `
+      : `, y esos carbohidratos siguen haciendo subir la glucosa. `;
+    s += `Una corrección sola baja un poco y luego vuelve a subir o se estanca por encima del objetivo${target ? ` (${target})` : ""} — por eso no termina de bajar. `;
+    s += late
+      ? `Recontrola en ~2 h; la próxima vez cubre este tipo de comida al comer (un bolo dividido limita el pico tardío).`
+      : `Recontrola en ~2 h; la próxima vez pon el bolo de la comida al comer.`;
+    return s;
+  }
+  let s = `⚠️ Le repas «${desc}» (~${m.carbsG} g${cubesPhrase}) n'a pas été couvert par un bolus`;
+  s += late
+    ? `, et ce sont des glucides lents qui montent encore et tard. `
+    : `, et ces glucides font encore monter la glycémie. `;
+  s += `Une correction seule baisse un peu puis ça remonte ou plafonne au-dessus de la cible${target ? ` (${target})` : ""} — c'est pour ça qu'elle ne redescend pas complètement. `;
+  s += late
+    ? `Recontrôle dans ~2 h ; la prochaine fois, couvre ce type de repas au moment de manger (un bolus étalé limite le pic tardif).`
+    : `Recontrôle dans ~2 h ; la prochaine fois, fais le bolus du repas au moment de manger.`;
+  return s;
+}
+
+/**
+ * Code-owned ACTION for when glucose is IN RANGE (70-180): there's no correction to make, but the
+ * analysis should still give a concrete next step (a blank "Action" read as "the coach stopped giving
+ * advice" — the user's report). All WITHOUT a dose number (the parent owns the meal-bolus amount).
+ * Priority:
+ *   1. a meal logged in the last ~45 min that ISN'T covered by a bolus → cover it. This is the exact
+ *      case the user hit: logged "2 saucisses" at 84 mg/dL and the analysis said nothing about
+ *      covering it. When the glucose is ALSO low-and-falling, the food will lift it, so the line says
+ *      to eat + cover + keep sugar handy (never "bolus now" alone on a falling low).
+ *   2. drifting toward the low end (70-89, falling) → keep sugar nearby + watch.
+ *   3. drifting up (161-180, rising) → get ready to correct once past 180.
+ *   4. otherwise → in range, nothing to correct, keep monitoring.
+ */
+export function inRangeActionLine(
+  meals: MealRow[],
+  doses: DoseRow[],
+  readings: { ts: number; value: number }[],
+  nowMs: number,
+  profile: GuardProfile | null,
+  lang: string,
+): string {
+  const es = lang === "es";
+  const uncovered = findUncoveredMeal(meals, doses, nowMs, profile);
+  const recentMeal = uncovered && uncovered.minutesAgo <= 45 ? uncovered : null;
+  const pred = predictiveAdvice(readings, nowMs);
+  const falling = pred.kind === "watch_fall";
+  const rising = pred.kind === "watch_rise" || pred.kind === "high_soon";
+
+  if (recentMeal) {
+    const desc = (recentMeal.description || (es ? "este alimento" : "ce repas")).trim();
+    const cubes = carbsCubes(recentMeal.carbsG);
+    const cubesP = cubes ? (es ? `, ≈ ${cubes} terrón(es)` : `, ≈ ${cubes} sucre(s)`) : "";
+    if (falling) {
+      return es
+        ? `vas a comer «${desc}» (~${recentMeal.carbsG} g${cubesP}) y la glucosa está baja y bajando: empieza a comer, cúbrelo con tu bolo de comida habitual y ten azúcar a mano por si baja antes de subir.`
+        : `tu vas manger «${desc}» (~${recentMeal.carbsG} g${cubesP}) et la glycémie est basse et descend : commence à manger, couvre-le avec ton bolus repas habituel et garde du sucre à portée au cas où ça baisse avant de remonter.`;
+    }
+    return es
+      ? `comida «${desc}» (~${recentMeal.carbsG} g${cubesP}) aún sin cubrir — piensa en tu bolo de comida habitual y recontrola después.`
+      : `repas «${desc}» (~${recentMeal.carbsG} g${cubesP}) pas encore couvert — pense à ton bolus repas habituel, et recontrôle après.`;
+  }
+  if (falling) {
+    return es
+      ? `la glucosa baja; ten azúcar a mano y vigila. No hace falta tomarlo mientras no estés por debajo de 70.`
+      : `la glycémie descend ; garde du sucre à portée et surveille. Pas besoin d'en prendre tant que tu n'es pas sous 70.`;
+  }
+  if (rising) {
+    return es
+      ? `la glucosa sube; vigila y prepárate para corregir si pasas de 180.`
+      : `la glycémie monte ; surveille et prépare-toi à corriger si tu dépasses 180.`;
+  }
+  return es
+    ? `en objetivo (70-180), nada que corregir — sigue vigilando.`
+    : `dans la cible (70-180), rien à corriger — continue de surveiller.`;
 }
 
 // Starchy staples are NOT sweet but are HIGH-CARB (starch → glucose), so they raise BG like sugar.

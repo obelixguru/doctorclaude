@@ -8,6 +8,8 @@ import {
   minutesSinceLastRescue,
   activeIob,
   insulinActionMinutes,
+  iobStatusPhrase,
+  iobSystemLine,
   combinedActionLine,
   situationHint,
   stripInsulinNumbers,
@@ -16,6 +18,9 @@ import {
   predictiveLine,
   sugarTimingFact,
   hypoIobWarning,
+  uncoveredMealWarning,
+  inRangeActionLine,
+  plannedMealNote,
   type GuardProfile,
 } from "../_shared/doseGuard.ts";
 import { chatJson, llmErrorKind, llmErrorMessage } from "../_shared/llm.ts";
@@ -116,15 +121,14 @@ function statsSummary(s: any, lang: string, stability?: { word: string; note: st
   // high day "stable". Stability (oscillations) is a separate thing, not the day's verdict.
   const lead = lang === "es" ? `Día ${dayQuality(s, lang)}. ` : `Journée ${dayQuality(s, lang)}. `;
   const drops = Number(s.rapid_drops_24h) || 0;
-  // "Today" = the LOCAL day that restarts at 08:00 (tir_today_cal etc.), so the bilan's % matches the
-  // History screen's per-day boxes. Fall back to the rolling 24 h for older clients / empty early days.
-  const tir = s.tir_today_cal ?? s.tir_24h, avg = s.avg_today_cal ?? s.avg_24h, mx = s.max_today_cal ?? s.max_24h, mn = s.min_today_cal ?? s.min_24h;
+  // The exact figures (today's %, average, vs-yesterday) are the CODE-OWNED dayStatsLine, prepended
+  // separately, so this fallback stays QUALITATIVE — no number here to duplicate or be read as today.
   if (lang === "es") {
     const d = drops ? ` ${drops} bajada(s) rápida(s) de glucosa.` : "";
-    return `${lead}Hoy: ${tir}% del tiempo en objetivo (media ${avg} mg/dL), con un pico a ${mx} y un mínimo a ${mn} mg/dL.${d} Sigue ajustando para suavizar las variaciones.`;
+    return `${lead}${d} Sigue ajustando para suavizar las variaciones.`;
   }
   const d = drops ? ` ${drops} chute(s) rapide(s) de glycémie.` : "";
-  return `${lead}Aujourd'hui : ${tir}% du temps dans la cible (moyenne ${avg} mg/dL), avec un pic à ${mx} et un creux à ${mn} mg/dL.${d} Continue d'ajuster pour lisser les variations.`;
+  return `${lead}${d} Continue d'ajuster pour lisser les variations.`;
 }
 
 function toGuardProfile(p: any): GuardProfile | null {
@@ -155,17 +159,24 @@ function profileContext(p: any, meals: any[], lang: string, nowMs: number): stri
   if (p?.diagnosis_date) bits.push(lang === "es" ? `diabético desde ${p.diagnosis_date}` : `diabétique depuis ${p.diagnosis_date}`);
   if (p?.honeymoon) bits.push(lang === "es" ? `luna de miel ${p.honeymoon}` : `lune de miel ${p.honeymoon}`);
   const who = bits.join(", ");
-  // List the day's meals WITH their timing (most-recent first, capped, past-dated only) so the
-  // model can connect a meal to a glucose move — e.g. a spike after the donuts. Previously this
-  // listed at most 3 meals with no time, so a daily bilan ignored most of what was logged.
+  // List the day's meals WITH their timing (most-recent first, capped) so the model can connect a
+  // meal to a glucose move — e.g. a spike after the donuts. Previously this listed at most 3 meals
+  // with no time, so a daily bilan ignored most of what was logged. PLANNED meals (announced, not
+  // yet eaten — possibly future-dated) are now INCLUDED and labelled "prévu", so "je vais manger un
+  // McDo" stays visible to the coach instead of being silently dropped by the past-only filter.
   const dayMeals = (meals || [])
-    .filter((m) => m && m.ts && new Date(m.ts).getTime() <= nowMs + 60000)
+    .filter((m) => m && m.ts && (m.planned === true || new Date(m.ts).getTime() <= nowMs + 60000))
     .slice(0, 8);
   const mealsTxt = dayMeals
     .map((m) => {
       const mins = Math.round((nowMs - new Date(m.ts).getTime()) / 60000);
       const c = m.carbs_g ? ` ~${m.carbs_g}g` : "";
-      return `${m.description}${c} (${agoLabel(mins, lang)})`;
+      const when = m.planned === true
+        ? (mins < -1
+          ? (lang === "es" ? `previsto en ${-mins} min, aún no comido` : `prévu dans ${-mins} min, pas encore mangé`)
+          : (lang === "es" ? "previsto, aún no comido" : "prévu, pas encore mangé"))
+        : agoLabel(mins, lang);
+      return `${m.description}${c} (${when})`;
     })
     .join(", ");
   const parts: string[] = [];
@@ -174,18 +185,26 @@ function profileContext(p: any, meals: any[], lang: string, nowMs: number): stri
   return parts.join(" ");
 }
 
-function insulinContext(doses: any[], lang: string): string {
+// A FUTURE-dated dose is a PLANNED injection (not yet active — activeIob skips it): say so instead
+// of the nonsense "il y a -53 min". Each PAST dose carries its computed state (still working /
+// finished) and the line closes with the SYSTEM total (iobSystemLine) — the model used to see only
+// "4 u il y a 290 min" and estimated the decay ITSELF, writing "insuline presque terminée" while
+// the computed IOB (and the Insuline tab) said 0.
+function insulinContext(doses: any[], iob: number, defaultDur: number, nowMs: number, lang: string): string {
   const rapid = (doses || []).filter((d: any) => d.kind !== "basal");
   if (!rapid.length) return "";
-  const now = Date.now();
-  const ago = lang === "es" ? "hace" : "il y a";
+  const es = lang === "es";
   const parts = rapid.map((d: any) => {
-    const mins = Math.round((now - new Date(d.ts).getTime()) / 60000);
-    return `${d.units} u${d.insulin_name ? ` ${d.insulin_name}` : ""} ${ago} ${mins} min`;
+    const mins = Math.round((nowMs - new Date(d.ts).getTime()) / 60000);
+    const what = `${d.units} u${d.insulin_name ? ` ${d.insulin_name}` : ""}`;
+    if (mins < -1) return es ? `${what} PREVISTA en ${-mins} min (aún no activa)` : `${what} PRÉVUE dans ${-mins} min (pas encore active)`;
+    const done = mins >= (insulinActionMinutes(d.insulin_name) ?? defaultDur);
+    const state = done ? (es ? "ya terminó de actuar" : "a fini d'agir") : (es ? "sigue actuando" : "agit encore");
+    return es ? `${what} hace ${Math.max(0, mins)} min (${state})` : `${what} il y a ${Math.max(0, mins)} min (${state})`;
   });
-  return lang === "es"
-    ? `INSULINA RÁPIDA RECIENTE: ${parts.join("; ")} (ya descontada por el sistema).`
-    : `INSULINE RAPIDE RÉCENTE : ${parts.join(" ; ")} (déjà déduite par le système).`;
+  return es
+    ? `INSULINA RÁPIDA RECIENTE: ${parts.join("; ")}. ${iobSystemLine(iob, lang)}`
+    : `INSULINE RAPIDE RÉCENTE : ${parts.join(" ; ")}. ${iobSystemLine(iob, lang)}`;
 }
 
 function fmtUnits(u: number): string {
@@ -201,18 +220,29 @@ function fmtUnits(u: number): string {
 function accountingLine(insulin: any[], meals: any[], iob: number, nowMs: number, lang: string): string {
   const es = lang === "es";
   const rapid = (insulin || []).filter((d: any) => d.kind !== "basal");
+  // Split PAST (taken) vs FUTURE (planned) doses: "dernière dose" must be a dose actually injected —
+  // a planned future dose used to land here as "il y a -53 min" and read as already on board.
+  const past = rapid.filter((d: any) => new Date(d.ts).getTime() <= nowMs + 60000);
+  const future = rapid.filter((d: any) => new Date(d.ts).getTime() > nowMs + 60000);
   let insPart: string;
-  if (rapid.length) {
-    const d = rapid[0]; // most recent (rows arrive newest-first)
-    const mins = Math.round((nowMs - new Date(d.ts).getTime()) / 60000);
-    const act = iob >= 0.1
-      ? (es ? `≈ ${fmtUnits(iob)} u aún activa` : `≈ ${fmtUnits(iob)} u encore active`)
-      : (es ? "casi agotada" : "presque épuisée");
+  if (past.length) {
+    const d = past[0]; // most recent taken (rows arrive newest-first)
+    const mins = Math.max(0, Math.round((nowMs - new Date(d.ts).getTime()) / 60000));
+    // Three honest tiers (code-owned, tested): a long-finished dose says "terminée", matching the
+    // Insuline tab's 0 — "presque épuisée" used to cover finished doses too and read as still active.
+    const act = iobStatusPhrase(iob, lang);
     insPart = es
-      ? `insulina ${act} (última dosis ${fmtUnits(Number(d.units))} u hace ${mins} min, tenida en cuenta)`
-      : `insuline ${act} (dernière dose ${fmtUnits(Number(d.units))} u il y a ${mins} min, prise en compte)`;
+      ? `insulina ${act} (última dosis ${fmtUnits(Number(d.units))} u ${agoLabel(mins, lang)}, tenida en cuenta)`
+      : `insuline ${act} (dernière dose ${fmtUnits(Number(d.units))} u ${agoLabel(mins, lang)}, prise en compte)`;
   } else {
     insPart = es ? "ninguna insulina registrada" : "aucune insuline loggée";
+  }
+  if (future.length) {
+    const f = future[future.length - 1]; // the soonest upcoming (rows newest-first → last is earliest)
+    const inMins = Math.max(1, Math.round((new Date(f.ts).getTime() - nowMs) / 60000));
+    insPart += es
+      ? ` · 1 dosis PREVISTA (${fmtUnits(Number(f.units))} u en ${inMins} min, aún no activa)`
+      : ` · 1 dose PRÉVUE (${fmtUnits(Number(f.units))} u dans ${inMins} min, pas encore active)`;
   }
   let mealPart: string;
   // Count EVERY meal logged in the last day (scanned OR eaten), naming the most recent — so a day
@@ -344,6 +374,30 @@ function evoLine(s: any, lang: string): string {
   return `Encore peu de données sur les jours précédents : concentre-toi sur aujourd'hui.`;
 }
 
+/** CODE-OWNED day figures shown to the user — time-in-range %, average, and the day-over-day
+ *  comparison, ALL from the 08:00→08:00 LOCAL day (tir_today_cal), the SAME window the History
+ *  screen's per-day boxes use, so the two screens always agree. The LLM is told NOT to write these
+ *  numbers: it had put the "vs hier" % ("71%") in a spot that read as TODAY, while today was 89% —
+ *  the user saw "today 71%". Owning the line in code makes today unmistakably "today" and yesterday
+ *  unmistakably "hier". Falls back to the rolling 24 h for token-less / very-early-morning clients. */
+function dayStatsLine(s: any, lang: string): string {
+  if (!s || !s.count_24h) return "";
+  const tir = s.tir_today_cal ?? s.tir_24h;
+  const avg = s.avg_today_cal ?? s.avg_24h;
+  if (tir == null) return "";
+  const tPrev = s.tir_yesterday_cal ?? s.tir_prev_day;
+  const es = lang === "es";
+  let cmp = "";
+  if (tPrev != null) {
+    if (tir >= tPrev + 5) cmp = es ? ` — mejor que ayer (ayer ${tPrev}%)` : ` — mieux qu'hier (hier ${tPrev}%)`;
+    else if (tir <= tPrev - 5) cmp = es ? ` — menos bien que ayer (ayer ${tPrev}%)` : ` — moins bien qu'hier (hier ${tPrev}%)`;
+    else cmp = es ? ` — como ayer (ayer ${tPrev}%)` : ` — comme hier (hier ${tPrev}%)`;
+  }
+  return es
+    ? `Hoy (de 8 h a 8 h): ${tir}% del tiempo en objetivo, media ${avg} mg/dL${cmp}.`
+    : `Aujourd'hui (de 8 h à 8 h) : ${tir}% du temps dans la cible, moyenne ${avg} mg/dL${cmp}.`;
+}
+
 /** Coefficient of variation (SD / mean, in %) — the clinical measure of glucose variability.
  *  ≤ 36% is considered stable; higher means the line swings a lot. */
 function variabilityCv(sorted: { ts: number; value: number }[]): number | null {
@@ -464,7 +518,7 @@ function mealSpikeNote(meals: any[], sorted: { ts: number; value: number }[], no
   return "";
 }
 
-function buildPrompt(cur: number | null, s: any, lang: string, ctx: string, swing: string, pr: Record<string, string>, hint: string, recent: string, stability: { word: string; note: string }, signalLost: boolean, staleMin: number): string {
+function buildPrompt(cur: number | null, s: any, lang: string, ctx: string, swing: string, pr: Record<string, string>, hint: string, recent: string, stability: { word: string; note: string }, signalLost: boolean, staleMin: number, sensorExpired: boolean): string {
   const curMg = cur != null ? `${cur} mg/dL` : (lang === "es" ? "desconocida" : "inconnue");
   const evo = evoLine(s, lang);
   const quality = dayQuality(s, lang); // the day's VERDICT (from time-in-range), not the stability word
@@ -485,29 +539,34 @@ function buildPrompt(cur: number | null, s: any, lang: string, ctx: string, swin
       P(pr, "coach.persona", `Eres Doctor Claude, un coach de salud inteligente y directo para alguien con diabetes tipo 1. Sin cursilerías ni apodos: alguien puede ver la pantalla.`),
       ctx,
       signalLost
-        ? `SEÑAL PERDIDA: sin medición desde hace ${staleMin} min, la glucosa ACTUAL es DESCONOCIDA. Última glucosa conocida: ${curMg} (hace ${staleMin} min).`
+        ? (sensorExpired
+          ? `SENSOR CADUCADO: los 14 días del sensor se cumplieron y no hay medición desde hace ${staleMin} min — la glucosa ACTUAL es DESCONOCIDA. Última conocida: ${curMg}.`
+          : `SEÑAL PERDIDA: sin medición desde hace ${staleMin} min, la glucosa ACTUAL es DESCONOCIDA. Última glucosa conocida: ${curMg} (hace ${staleMin} min).`)
         : `Glucosa actual: ${curMg}.`,
       signalLost
-        ? `IMPORTANTE — SEÑAL PERDIDA: EMPIEZA diciendo claramente que se perdió la señal (sin medición desde hace ${staleMin} min) y que NO se conoce la glucosa actual. Habla de la ÚLTIMA glucosa conocida (${curMg}) y de la tendencia pasada, pero NUNCA digas «estás en ${cur}» ni «tu glucosa es ${cur}» como si fuera ahora — di «tu última glucosa conocida era ${cur}». Aconseja PRIMERO reconectar el sensor (el teléfono que lo escanea debe estar cerca y conectado, volver a escanear si hace falta); una punción capilar SOLO si la señal no vuelve.`
+        ? (sensorExpired
+          ? `IMPORTANTE — SENSOR CADUCADO: EMPIEZA diciendo claramente que el sensor llegó al final de sus 14 días y que hay que poner uno NUEVO (cuenta ~1 h de arranque tras la colocación). Habla de la ÚLTIMA glucosa conocida (${curMg}), NUNCA como si fuera ahora. Aconseja una punción capilar mientras tanto. NO digas «acercar el teléfono» ni «volver a escanear»: un sensor terminado no vuelve.`
+          : `IMPORTANTE — SEÑAL PERDIDA: EMPIEZA diciendo claramente que se perdió la señal (sin medición desde hace ${staleMin} min) y que NO se conoce la glucosa actual. Habla de la ÚLTIMA glucosa conocida (${curMg}) y de la tendencia pasada, pero NUNCA digas «estás en ${cur}» ni «tu glucosa es ${cur}» como si fuera ahora — di «tu última glucosa conocida era ${cur}». Aconseja PRIMERO reconectar el sensor (el teléfono que lo escanea debe estar cerca y conectado, volver a escanear si hace falta); una punción capilar SOLO si la señal no vuelve.`)
         : "",
       day,
       recent,
-      `VEREDICTO DEL DÍA (lo calcula el sistema según el TIEMPO EN OBJETIVO): día ${quality} (${tToday ?? "?"}% en objetivo hoy, desde las 8 h). ESE es el balance del día — EMPIEZA por esa palabra.`,
+      `VEREDICTO DEL DÍA (lo calcula el sistema según el TIEMPO EN OBJETIVO): día ${quality} (${tToday ?? "?"}% en objetivo hoy, desde las 8 h). ESE es el balance del día — EMPIEZA por esa palabra. NO escribas tú el porcentaje (el sistema añade la línea con cifras).`,
       `ESTABILIDAD (SOLO las oscilaciones): ${stability.word} (${stability.note}). Describe ÚNICAMENTE si la curva está calmada o agitada, NO si el día fue bueno. NUNCA digas "día estable" como balance del día: un día plano pero a menudo por encima del objetivo es un día DIFÍCIL — el tiempo en objetivo manda sobre la regularidad.`,
       `Evolución: ${evo}`,
-      `COMPARACIÓN CON AYER: para decir si el día es mejor, peor o comparable a ayer, básate ÚNICAMENTE en el veredicto «Evolución» de arriba (compara el tiempo en objetivo). La palabra de ESTABILIDAD describe SOLO las oscilaciones de hoy: NUNCA escribas «más estable que ayer» ni «menos estable que ayer». Un día poco agitado pero a menudo por encima del objetivo es ESTABLE *y* PEOR que ayer — estabilidad (oscilaciones) y control (tiempo en objetivo) son cosas distintas.`,
+      `COMPARACIÓN CON AYER: para decir si el día es mejor, peor o comparable a ayer, básate ÚNICAMENTE en el veredicto «Evolución» de arriba (compara el tiempo en objetivo). La palabra de ESTABILIDAD describe SOLO las oscilaciones de hoy: NUNCA escribas «más estable que ayer» ni «menos estable que ayer». Un día poco agitado pero a menudo por encima del objetivo es ESTABLE *y* PEOR que ayer — estabilidad (oscilaciones) y control (tiempo en objetivo) son cosas distintas. NO reescribas los porcentajes (de hoy ni de ayer): el sistema añade la comparación con cifras.`,
       swing,
       hint ? `SITUACIÓN (la calcula el sistema): ${hint}.` : "",
-      `ESTRUCTURA: rellena CADA campo con UNA frase corta (el sistema los pone en líneas separadas) — "day" = balance de las últimas 24 h (media, tiempo en objetivo, picos); "hour" = la última hora (la tendencia); "now" = los últimos 10 minutos (dónde estamos); "tip" = un punto concreto a mejorar, deducido de los datos. La acción con cifras y lo que se ha tenido en cuenta se añaden aparte; no los escribas tú.`,
+      `ESTRUCTURA: rellena CADA campo con UNA frase corta (el sistema los pone en líneas separadas) — "day" = opinión CUALITATIVA del día (bueno/difícil y por qué: picos, bajadas) SIN cifras (% / media — el sistema añade la línea con cifras); "hour" = la última hora (la tendencia); "now" = los últimos 10 minutos (dónde estamos); "tip" = un punto concreto a mejorar, deducido de los datos. La acción con cifras y lo que se ha tenido en cuenta se añaden aparte; no los escribas tú.`,
       P(pr, "coach.rules", `REGLAS: habla del DÍA que acaba de pasar y enlázalo con los días previos. El objetivo es 70-180; lo más alto del día es un pico a corregir, no un techo aceptable. Tono directo, motivador, basado en cifras. Resalta los progresos. Sin falsas promesas de cura.`),
       `COMIDAS: la lista « Comidas de hoy » (arriba, con las horas) dice qué se ha COMIDO y cuándo — úsala para ligar las variaciones de glucosa a las comidas (un pico tras tal comida, etc.). NUNCA afirmes que no se registró ninguna comida si la lista contiene alguna.`,
       `VELOCIDAD DE LOS CARBOHIDRATOS: un azúcar rápido (zumo, refresco, dulces, pan blanco) sube la glucosa MUY RÁPIDO (pico ~15-45 min); los carbohidratos lentos (pasta, legumbres, integral) y las comidas grasas suben DESPACIO y TARDE (pico 2-3 h después). Tenlo en cuenta para EXPLICAR las variaciones y el momento de los picos, y para el TIMING del bolo (azúcar rápido → pre-bolo; lento/graso → más tarde o dividido).`,
       `AZÚCAR: para una hipo (<70), aconseja SOLO terrones de azúcar — nada de refrescos ni zumos (más fácil de dosificar, evita malos hábitos). Solo se toma azúcar por debajo de 70; si baja pero está en rango (70-180), di que tenga azúcar a mano y vigile, NO que lo tome ya. POR ENCIMA DE 180 (hiper), NO hables de azúcar — hace falta una corrección de insulina, no azúcar.`,
       sugarTimingFact(lang),
+      `INSULINA ACTIVA: la línea «INSULINA AÚN ACTIVA (calculada por el sistema)» del contexto manda. Si dice «terminada», NUNCA digas que queda insulina activa ni que «está a punto de terminar»; si da una cifra, es la única válida. Nunca estimes tú lo que queda de una dosis.`,
       noNumbers,
       `UNIDADES: en "display", glucosa en mg/dL. En "voice", di la glucosa SIN UNIDAD — solo el número (« 78 », « 218 »), NUNCA digas « mg/dL ».`,
       `REDACCIÓN: escribe frases completas; cuando des una cifra, di SIEMPRE qué cuenta ("11 bajadas rápidas", nunca "11" a secas). Responde en español.`,
-      `Responde SOLO en JSON. Rellena POR SEPARADO los 5 campos, UNA frase cada uno, dando tu OPINIÓN (no solo cifras: di si está bien o hay que vigilar, y POR QUÉ). NO uses un campo "display". Glucosa en mg/dL, SIN ninguna cifra de dosis: {"day":"<tu opinión sobre el día: bueno o difícil y por qué, con media / % objetivo / pico-mínimo>","hour":"<tu opinión sobre la ÚLTIMA HORA: sube/baja/estable, tranquilizador o a vigilar y por qué>","now":"<dónde estamos ahora y qué implica>","tip":"<un consejo concreto a mejorar>","voice":"<1-2 frases habladas, lo esencial>"}`,
+      `Responde SOLO en JSON. Rellena POR SEPARADO los 5 campos, UNA frase cada uno, dando tu OPINIÓN (no solo cifras: di si está bien o hay que vigilar, y POR QUÉ). NO uses un campo "display". Glucosa en mg/dL, SIN ninguna cifra de dosis: {"day":"<tu opinión CUALITATIVA del día: bueno o difícil y POR QUÉ (picos, bajadas rápidas) — SIN porcentaje, SIN media, SIN comparación numérica: el sistema añade la línea con cifras de hoy y la comparación con ayer>","hour":"<tu opinión sobre la ÚLTIMA HORA: sube/baja/estable, tranquilizador o a vigilar y por qué>","now":"<dónde estamos ahora y qué implica>","tip":"<un consejo concreto a mejorar>","voice":"<1-2 frases habladas, lo esencial>"}`,
     ].filter(Boolean).join(" ");
   }
 
@@ -518,29 +577,34 @@ function buildPrompt(cur: number | null, s: any, lang: string, ctx: string, swin
     P(pr, "coach.persona", `Tu es Doctor Claude, un coach santé intelligent et direct pour une personne qui a un diabète de type 1. Pas de mièvrerie ni de surnoms : quelqu'un peut voir l'écran.`),
     ctx,
     signalLost
-      ? `SIGNAL PERDU : aucune mesure depuis ${staleMin} min, la glycémie ACTUELLE est INCONNUE. Dernière glycémie connue : ${curMg} (il y a ${staleMin} min).`
+      ? (sensorExpired
+        ? `CAPTEUR EXPIRÉ : les 14 jours du capteur sont atteints et aucune mesure depuis ${staleMin} min — la glycémie ACTUELLE est INCONNUE. Dernière connue : ${curMg}.`
+        : `SIGNAL PERDU : aucune mesure depuis ${staleMin} min, la glycémie ACTUELLE est INCONNUE. Dernière glycémie connue : ${curMg} (il y a ${staleMin} min).`)
       : `Glycémie actuelle : ${curMg}.`,
     signalLost
-      ? `IMPORTANT — SIGNAL PERDU : COMMENCE en disant clairement que le signal est perdu (aucune mesure depuis ${staleMin} min) et qu'on ne connaît PAS la glycémie actuelle. Parle de la DERNIÈRE glycémie connue (${curMg}) et de la tendance passée, mais ne dis JAMAIS « tu es à ${cur} » ni « ta glycémie est ${cur} » comme si c'était maintenant — dis « ta dernière glycémie connue était ${cur} ». Conseille D'ABORD de reconnecter le capteur (le téléphone qui le scanne doit être près de lui et connecté, re-scanner au besoin) ; un test au doigt SEULEMENT si le signal ne revient pas.`
+      ? (sensorExpired
+        ? `IMPORTANT — CAPTEUR EXPIRÉ : COMMENCE en disant clairement que le capteur a atteint ses 14 jours et qu'il faut en poser un NOUVEAU (compte ~1 h de démarrage après la pose). Parle de la DERNIÈRE glycémie connue (${curMg}), JAMAIS comme si c'était maintenant. Conseille un test au doigt en attendant. NE dis PAS « rapprocher le téléphone » ni « re-scanner » : un capteur fini ne revient pas.`
+        : `IMPORTANT — SIGNAL PERDU : COMMENCE en disant clairement que le signal est perdu (aucune mesure depuis ${staleMin} min) et qu'on ne connaît PAS la glycémie actuelle. Parle de la DERNIÈRE glycémie connue (${curMg}) et de la tendance passée, mais ne dis JAMAIS « tu es à ${cur} » ni « ta glycémie est ${cur} » comme si c'était maintenant — dis « ta dernière glycémie connue était ${cur} ». Conseille D'ABORD de reconnecter le capteur (le téléphone qui le scanne doit être près de lui et connecté, re-scanner au besoin) ; un test au doigt SEULEMENT si le signal ne revient pas.`)
       : "",
     day,
     recent,
-    `VERDICT DE LA JOURNÉE (calculé par le système d'après le TEMPS DANS LA CIBLE) : journée ${quality} (${tToday ?? "?"}% dans la cible aujourd'hui, depuis 8 h). C'EST le bilan de la journée — COMMENCE par ce mot.`,
+    `VERDICT DE LA JOURNÉE (calculé par le système d'après le TEMPS DANS LA CIBLE) : journée ${quality} (${tToday ?? "?"}% dans la cible aujourd'hui, depuis 8 h). C'EST le bilan de la journée — COMMENCE par ce mot. Ne cite PAS le pourcentage toi-même (le système ajoute la ligne chiffrée).`,
     `STABILITÉ (les oscillations UNIQUEMENT) : ${stability.word} (${stability.note}). Ça décrit SEULEMENT si la courbe est calme ou agitée, PAS si la journée est bonne. NE dis JAMAIS « journée stable » comme bilan : une journée plate mais souvent au-dessus de la cible est une journée DIFFICILE — le temps dans la cible prime sur la régularité.`,
     `Évolution : ${evo}`,
-    `COMPARAISON À HIER : pour dire si la journée est meilleure, moins bonne ou comparable à hier, fie-toi UNIQUEMENT au verdict « Évolution » ci-dessus (il compare le temps dans la cible). Le mot de STABILITÉ ne décrit QUE les oscillations d'aujourd'hui : n'écris JAMAIS « plus stable qu'hier » ni « moins stable qu'hier ». Une journée peu agitée mais souvent au-dessus de la cible est STABLE *et* MOINS BONNE qu'hier — la stabilité (les oscillations) et le contrôle (le temps dans la cible) sont deux choses distinctes.`,
+    `COMPARAISON À HIER : pour dire si la journée est meilleure, moins bonne ou comparable à hier, fie-toi UNIQUEMENT au verdict « Évolution » ci-dessus (il compare le temps dans la cible). Le mot de STABILITÉ ne décrit QUE les oscillations d'aujourd'hui : n'écris JAMAIS « plus stable qu'hier » ni « moins stable qu'hier ». Une journée peu agitée mais souvent au-dessus de la cible est STABLE *et* MOINS BONNE qu'hier — la stabilité (les oscillations) et le contrôle (le temps dans la cible) sont deux choses distinctes. Ne réécris PAS les pourcentages (d'aujourd'hui ou d'hier) : le système ajoute la comparaison chiffrée.`,
     swing,
     hint ? `SITUATION (calculée par le système) : ${hint}.` : "",
-    `STRUCTURE : remplis CHAQUE champ avec UNE phrase courte (le système les met sur des lignes séparées) — "day" = bilan des dernières 24 h (moyenne, temps dans la cible, pics) ; "hour" = la dernière heure (la tendance) ; "now" = les 10 dernières minutes (où on en est) ; "tip" = un point concret à améliorer, déduit des données. L'action chiffrée et ce qui a été pris en compte sont ajoutés séparément ; ne les écris pas toi-même.`,
+    `STRUCTURE : remplis CHAQUE champ avec UNE phrase courte (le système les met sur des lignes séparées) — "day" = avis QUALITATIF sur la journée (bonne/difficile et pourquoi : pics, chutes) SANS chiffre (% / moyenne — le système ajoute la ligne chiffrée d'aujourd'hui) ; "hour" = la dernière heure (la tendance) ; "now" = les 10 dernières minutes (où on en est) ; "tip" = un point concret à améliorer, déduit des données. L'action chiffrée et ce qui a été pris en compte sont ajoutés séparément ; ne les écris pas toi-même.`,
     P(pr, "coach.rules", `RÈGLES : parle de la JOURNÉE écoulée et relie-la aux jours précédents. La cible est 70-180 ; le point le plus haut du jour est un pic à corriger, pas un plafond acceptable. Ton direct, motivant, basé sur les chiffres. Souligne les progrès. Pas de fausse promesse de guérison.`),
     `REPAS : la liste « Repas d'aujourd'hui » (ci-dessus, avec les heures) dit ce qui a été MANGÉ et quand — sers-t'en pour relier les variations de glycémie aux repas (un pic après tel repas, etc.). N'affirme JAMAIS qu'aucun repas n'a été loggé si la liste en contient.`,
     `VITESSE DES GLUCIDES : un sucre rapide (jus, soda, bonbons, pain blanc) fait monter la glycémie TRÈS VITE (pic ~15-45 min) ; les glucides lents (pâtes, légumineuses, complet) et les repas gras la font monter LENTEMENT et TARD (pic 2-3 h après). Tiens-en compte pour EXPLIQUER les variations et le moment des pics, et pour le TIMING du bolus (sucre rapide → pré-bolus ; lent/gras → plus tard ou étalé).`,
     `SUCRE : pour une hypo (<70), conseille UNIQUEMENT des morceaux de sucre — pas de soda ni de jus (plus simple à doser, évite les mauvaises habitudes). On ne prend du sucre que sous 70 ; si ça descend mais reste dans la cible (70-180), dis de garder du sucre à portée et de surveiller, PAS d'en prendre tout de suite. Au-dessus de 180 (hyper), ne parle PAS de sucre — c'est une CORRECTION d'insuline qu'il faut, pas du sucre.`,
     sugarTimingFact(lang),
+    `INSULINE ACTIVE : la ligne « INSULINE ENCORE ACTIVE (calculée par le système) » du contexte fait foi. Si elle dit « terminée », ne dis JAMAIS qu'il reste de l'insuline active ni qu'elle « se termine bientôt » ; si elle donne un chiffre, c'est le seul valable. N'estime jamais toi-même ce qui reste d'une dose.`,
     noNumbers,
     `UNITÉS : dans "display", glycémie en mg/dL. Dans "voice", dis la glycémie SANS UNITÉ — juste le nombre (« 78 », « 218 »), JAMAIS « mg/dL » ni « grammes par litre ».`,
     `RÉDACTION : écris des phrases complètes ; quand tu donnes un nombre, dis TOUJOURS ce qu'il compte (« 11 chutes rapides », jamais « 11 » tout seul). Réponds en français.`,
-    `Réponds UNIQUEMENT en JSON. Remplis SÉPARÉMENT les 5 champs, UNE phrase chacun, en donnant ton AVIS (pas juste des chiffres : dis si c'est bien ou à surveiller, et POURQUOI). N'utilise PAS de champ "display". Glycémie en mg/dL, AUCUN chiffre de dose : {"day":"<ton avis sur la journée : bonne ou difficile et pourquoi, avec moyenne / % cible / pic-creux>","hour":"<ton avis sur la DERNIÈRE HEURE : ça monte/descend/stable, est-ce rassurant ou à surveiller et pourquoi>","now":"<où on en est maintenant et ce que ça implique>","tip":"<un conseil concret à améliorer>","voice":"<1-2 phrases parlées, l'essentiel>"}`,
+    `Réponds UNIQUEMENT en JSON. Remplis SÉPARÉMENT les 5 champs, UNE phrase chacun, en donnant ton AVIS (pas juste des chiffres : dis si c'est bien ou à surveiller, et POURQUOI). N'utilise PAS de champ "display". Glycémie en mg/dL, AUCUN chiffre de dose : {"day":"<ton avis QUALITATIF sur la journée : bonne ou difficile et POURQUOI (pics, chutes rapides) — SANS pourcentage, SANS moyenne, SANS comparaison chiffrée : le système ajoute la ligne chiffrée d'aujourd'hui et la comparaison à hier>","hour":"<ton avis sur la DERNIÈRE HEURE : ça monte/descend/stable, est-ce rassurant ou à surveiller et pourquoi>","now":"<où on en est maintenant et ce que ça implique>","tip":"<un conseil concret à améliorer>","voice":"<1-2 phrases parlées, l'essentiel>"}`,
   ].filter(Boolean).join(" ");
 }
 
@@ -648,7 +712,13 @@ Deno.serve(async (req: Request) => {
       .order("ts", { ascending: false })
       .limit(4);
     const nowMs = Date.now();
-    const insCtx = insulinContext(insulin ?? [], lang);
+    // IOB FIRST: the insulin context line hands the model the SYSTEM-computed active insulin, so it
+    // never estimates a dose's decay itself (it used to write "presque terminée" off the raw dose
+    // list while the computed IOB — and the Insuline tab — said 0).
+    const gp = toGuardProfile(profile);
+    const rapidDur = insulinActionMinutes(gp?.rapidInsulin) ?? 240; // insulin-type-aware decay
+    const iob = activeIob(insulin ?? [], nowMs, rapidDur);
+    const insCtx = insulinContext(insulin ?? [], iob, rapidDur, nowMs, lang);
     const actCtx = activityContext(activity ?? [], lang);
     const ctx = profileContext(profile, meals ?? [], lang, nowMs)
       + (insCtx ? " " + insCtx : "")
@@ -658,17 +728,22 @@ Deno.serve(async (req: Request) => {
       .filter((r) => r.value > 0)
       .sort((a, b) => a.ts - b.ts);
     const last = sorted[sorted.length - 1];
-    const cur = last ? Math.round(last.value) : (stats?.avg_24h ?? stats?.avg_7d ?? null);
+    // Current glucose = the LATEST READING only. It used to fall back to the 24 h average, so a
+    // call with no readings made the report assert "Glycémie actuelle : 152" — an average is not a
+    // measurement. Null lets the guard take its no_reading path and the prompt say "inconnue".
+    const cur = last ? Math.round(last.value) : null;
     const lastTs = last ? last.ts : 0;
     const staleMin = lastTs ? Math.round((nowMs - lastTs) / 60000) : 999;
     // Match the client's NO SIGNAL window (GlucoseAlert.FRESHNESS_WINDOW_MS = 5 min): once the last
     // reading is older than that, the LIVE value is UNKNOWN. The analysis/voice must SAY "signal
     // perdu" and speak of the LAST KNOWN glucose — never assert "tu es à X" as if it were current.
     const signalLost = lastTs > 0 && (nowMs - lastTs) > 5 * 60000;
+    // The CLIENT knows the sensor's expiry (LibreLinkUp activation + 14 d). When it flags it AND the
+    // signal is indeed gone, the lost signal has a known cause: a finished sensor → advise a NEW one
+    // (not "move the phone closer / re-scan", which can't revive it).
+    const sensorExpired = body.sensorExpired === true && signalLost;
 
-    // ----- CODE OWNS THE DOSE -----
-    const gp = toGuardProfile(profile);
-    const iob = activeIob(insulin ?? [], nowMs, insulinActionMinutes(gp?.rapidInsulin) ?? 240); // insulin-type-aware decay
+    // ----- CODE OWNS THE DOSE ----- (gp / iob computed above, before the insulin context)
     const trend = lastTs ? trendFromReadings(sorted, nowMs) : "unknown";
     const recentHypo = recentHypoFrom(sorted, nowMs);
     const minSinceRescue = minutesSinceLastRescue(meals ?? [], nowMs);
@@ -683,7 +758,10 @@ Deno.serve(async (req: Request) => {
     // don't nag "log your meal" at night (it read as wrong: a McDo logged 8 h earlier is long gone).
     const localHour = ((Math.floor((nowMs + tzOffsetMin * 60000) / 3600000) % 24) + 24) % 24;
     const isNight = localHour < 7 || localHour >= 23;
-    const mealNudge = !isNight && risingNow && cur != null && cur > 140 && (nowMs - lastMealTs > 90 * 60 * 1000);
+    // > 3 h since the last logged meal (was 90 min): a meal keeps glucose rising for ~2–3 h, so a
+    // shorter window made the coach suggest "log your meal" long after breakfast WAS logged. Mirrors
+    // the client's live banner gate (MainActivity: mealLoggedRecently ≤ 180 min).
+    const mealNudge = !isNight && risingNow && cur != null && cur > 140 && (nowMs - lastMealTs > 180 * 60 * 1000);
     const mealNudgeNote = mealNudge
       ? (lang === "es"
         ? "INDICIO: la glucosa sube sin comida registrada; sugiere amablemente registrar lo que ha comido (no inventes ninguna dosis)."
@@ -702,7 +780,7 @@ Deno.serve(async (req: Request) => {
     const prompt = buildPrompt(
       cur, stats, lang,
       ctx + (mealNudgeNote ? " " + mealNudgeNote : "") + (spikeNote ? " " + spikeNote : ""),
-      swing, pr, hint, recent, stability, signalLost, staleMin,
+      swing, pr, hint, recent, stability, signalLost, staleMin, sensorExpired,
     );
     let raw = "";
     try {
@@ -748,6 +826,11 @@ Deno.serve(async (req: Request) => {
       .map((s) => s.trim())
       .filter(Boolean)
       .join("\n\n");
+    // CODE-OWNED day figures LEAD the analysis (today's % / average / vs-yesterday, all 8 h→8 h) so the
+    // numbers always match the History screen's per-day boxes and "hier" can never be read as today —
+    // the LLM no longer writes them. Skipped during signal loss (the lost-signal warning must lead).
+    const dsl = signalLost ? "" : dayStatsLine(stats, lang);
+    if (dsl) display = `${dsl}\n\n${display}`;
     const voiceRaw = (typeof parsed.voice === "string" && parsed.voice.trim()) ? parsed.voice.trim() : extractStr(raw, "voice");
     let voice: string = (voiceRaw && !(!parseOk && looksTruncated(voiceRaw))) ? voiceRaw : display.replace(/\n+/g, " ");
 
@@ -762,15 +845,25 @@ Deno.serve(async (req: Request) => {
     const acct = accountingLine(insulin ?? [], meals ?? [], iob, nowMs, lang);
     if (acct) display = `${display}\n\n${acct}`;
 
-    const showAction = signalLost || !(guard.reason === "in_range" || guard.reason === "no_reading");
+    // The analysis ALWAYS ends with a concrete action now — a blank "Action" on the (frequent) in-range
+    // readings read as "the coach stopped giving advice". Only a TOTAL no-reading has nothing to say.
+    // In range we give a contextual, dose-free step (cover a just-logged meal / watch a drift / "in
+    // range, keep monitoring"); otherwise the code-owned dose action (sugar / correction / wait).
+    const showAction = signalLost || guard.reason !== "no_reading";
     if (showAction) {
       // Signal lost → never append a dose off a value we don't trust; tell the user to fingerstick
       // first (matches the screen's NO SIGNAL state and the guard's stale_data safety stance).
       const line = signalLost
-        ? (lang === "es"
-          ? "Señal perdida: reconecta el sensor (acerca el teléfono que lo escanea, vuelve a escanear); si no vuelve, hazte una punción capilar antes de cualquier decisión."
-          : "Signal perdu : reconnecte le capteur (rapproche le téléphone qui le scanne, re-scanne) ; s'il ne revient pas, fais un test au doigt avant toute décision.")
-        : combinedActionLine(guard, 0, lang, gp);
+        ? (sensorExpired
+          ? (lang === "es"
+            ? "Sensor caducado: pon un sensor NUEVO lo antes posible (cuenta ~1 h de arranque); mientras tanto, decide solo con una punción capilar."
+            : "Capteur expiré : pose un NOUVEAU capteur dès que possible (compte ~1 h de démarrage) ; en attendant, décide uniquement avec un test au doigt.")
+          : (lang === "es"
+            ? "Señal perdida: reconecta el sensor (acerca el teléfono que lo escanea, vuelve a escanear); si no vuelve, hazte una punción capilar antes de cualquier decisión."
+            : "Signal perdu : reconnecte le capteur (rapproche le téléphone qui le scanne, re-scanne) ; s'il ne revient pas, fais un test au doigt avant toute décision."))
+        : guard.reason === "in_range"
+          ? inRangeActionLine(meals ?? [], insulin ?? [], sorted, nowMs, gp, lang)
+          : combinedActionLine(guard, 0, lang, gp);
       const label = lang === "es" ? "Acción" : "Action";
       display = `${display}\n\n${label} : ${line}`;
       voice = `${voice} ${line}`.trim();
@@ -783,6 +876,36 @@ Deno.serve(async (req: Request) => {
     if (guard.kind === "sugar" && !signalLost) {
       const warn = hypoIobWarning(iob, lang);
       if (warn) { display = `${display}\n\n${warn}`; voice = `${voice} ${warn.replace("⚠️", "").trim()}`.trim(); }
+    }
+
+    // A high being CORRECTED while a recent meal was logged but never bolused: its carbs (esp. slow/
+    // fatty) are still digesting, so a correction alone dips then rebounds / plateaus ABOVE target —
+    // the potato-dinner case (why it sat at ~175 with a 120 target). Explain it + say to recheck later.
+    if (guard.kind === "correction" && !signalLost) {
+      const warn = uncoveredMealWarning(meals ?? [], insulin ?? [], nowMs, gp, lang);
+      if (warn) { display = `${display}\n\n${warn}`; voice = `${voice} ${warn.replace("⚠️", "").trim()}`.trim(); }
+    }
+
+    // An ANNOUNCED (planned, not-yet-eaten) meal logged in the last ~3 h: remind that it will need
+    // its bolus AT EATING TIME and whether a recent dose is on record — mirrors ask's
+    // plannedMealNote so "je vais manger un McDo" carries into the next ANALYSE too. Skipped during
+    // a hypo (sugar first) and on a lost signal (the lost-signal action must stand alone).
+    if (guard.kind !== "sugar" && !signalLost) {
+      const upcoming = (meals ?? []).find((m: any) => {
+        if (!m || m.planned !== true || !m.ts) return false;
+        const t = new Date(m.ts).getTime();
+        return Number.isFinite(t) && t >= nowMs - 3 * 3600 * 1000; // announced recently, or future-dated
+      });
+      if (upcoming) {
+        const recentRapid = (insulin ?? []).some((d: any) => {
+          if (!d || d.kind === "basal") return false;
+          const t = new Date(d.ts).getTime();
+          return Number.isFinite(t) && t <= nowMs + 60000 && nowMs - t <= 45 * 60000;
+        });
+        const note = plannedMealNote(Number((upcoming as any).carbs_g) || null, recentRapid, lang);
+        display = `${display}\n\n${note}`;
+        voice = `${voice} ${note}`.trim();
+      }
     }
 
     // The spoken voice must never read the unit aloud ("128", not "128 milligrammes par décilitre").

@@ -169,16 +169,18 @@ function tensCrossed(a: number, b: number): boolean {
   return Math.floor(a / 10) !== Math.floor(b / 10);
 }
 
-// Alert only on a NEW 10 mg/dL step while out of range, + "back to normal" on return.
-function alertFor(prev: number, cur: number): string | null {
-  if (prev < LOW && cur >= LOW && cur <= HIGH) return `✅ <b>Glycémie de Ryan revenue à la normale</b> : ${cur} mg/dL`;
-  if (prev > HIGH && cur <= HIGH && cur >= LOW) return `✅ <b>Glycémie de Ryan revenue à la normale</b> : ${cur} mg/dL`;
+// Alert only on a NEW 10 mg/dL step while out of range, + "back to normal" on return. `name` is the
+// patient's OWN first name (from LibreLinkUp) so an account following several people never mislabels
+// a value — e.g. sending the father's glucose under the son's name.
+function alertFor(prev: number, cur: number, name: string): string | null {
+  if (prev < LOW && cur >= LOW && cur <= HIGH) return `✅ <b>Glycémie de ${name} revenue à la normale</b> : ${cur} mg/dL`;
+  if (prev > HIGH && cur <= HIGH && cur >= LOW) return `✅ <b>Glycémie de ${name} revenue à la normale</b> : ${cur} mg/dL`;
   if (cur < LOW && tensCrossed(prev, cur)) {
-    if (cur <= VERY_LOW) return `🚨 <b>Glycémie de Ryan : ${cur} mg/dL — TRÈS BASSE</b>\nResucrage immédiat (15 g de sucre rapide).`;
-    return `🔻 <b>Glycémie de Ryan : ${cur} mg/dL — basse</b>`;
+    if (cur <= VERY_LOW) return `🚨 <b>Glycémie de ${name} : ${cur} mg/dL — TRÈS BASSE</b>\nResucrage immédiat (15 g de sucre rapide).`;
+    return `🔻 <b>Glycémie de ${name} : ${cur} mg/dL — basse</b>`;
   }
   if (cur > HIGH && tensCrossed(prev, cur)) {
-    return `🔺 <b>Glycémie de Ryan : ${cur} mg/dL — haute</b>`;
+    return `🔺 <b>Glycémie de ${name} : ${cur} mg/dL — haute</b>`;
   }
   return null;
 }
@@ -213,28 +215,115 @@ Deno.serve(async (req) => {
 
     const auth = H({ authorization: `Bearer ${s.token}`, "account-id": await sha256hex(s.uid) });
     const conn = await (await fetch(`https://${s.host}/llu/connections`, { headers: auth })).json();
-    const patient = conn?.data?.[0];
-    if (!patient?.patientId) return new Response("no patient shared");
+    const patients: any[] = Array.isArray(conn?.data) ? conn.data : [];
+    if (!patients[0]?.patientId) return new Response("no patient shared");
 
-    const g = await (await fetch(`https://${s.host}/llu/connections/${patient.patientId}/graph`, { headers: auth })).json();
-    const arr: number[] = (g?.data?.graphData ?? [])
-      .map((x: any) => Number(x.ValueInMgPerDl))
-      .filter((n: number) => n > 0);
-    const live = g?.data?.connection?.glucoseMeasurement?.ValueInMgPerDl;
-    if (live) arr.push(Number(live));
-    if (!arr.length) return new Response("no reading");
+    // Process EVERY followed patient. A single follower account can follow several people (e.g. a
+    // parent following two diabetics); each has its OWN subject = sha256(patientId), its OWN state
+    // row, its OWN stored readings, and is named by its OWN firstName in the alert — so a value is
+    // NEVER pushed under the wrong person's name (the reason we don't just read conn.data[0]).
+    // ?preview / ?selftest are debug tools → scoped to the first patient only.
+    const params = new URL(req.url).searchParams;
+    const debug = params.has("preview") || params.has("selftest");
+    const list = debug ? patients.slice(0, 1) : patients;
+    const out: string[] = [];
+    for (const patient of list) {
+      if (!patient?.patientId) continue;
+      const res = await processPatient(patient, s, auth, params, patient === patients[0]);
+      if (res instanceof Response) return res; // preview/selftest short-circuit (first patient)
+      out.push(`${patient.firstName || "?"}=${res}`);
+    }
+    return new Response(out.join(" | ") || "no patient");
+  } catch (e) {
+    return new Response(`err ${(e as Error)?.message ?? e}`);
+  }
+});
 
+// One patient's full pass: sensor-expiry alert, chart build, hypo/hyper alert decision, and state +
+// readings persistence — keyed by THIS patient's subject and named by THIS patient's firstName. All
+// the safety logic (thresholds, wording, snooze via monitor_state) is byte-for-byte the previous
+// single-patient behaviour; the only change is it runs per patient instead of only conn.data[0], and
+// says the patient's real name instead of a hardcoded "Ryan". Returns a short status string, or a
+// Response when `isFirst` and ?preview/?selftest is set (those render/send for one patient).
+async function processPatient(
+  patient: any,
+  s: { host: string; token: string; uid: string },
+  auth: Record<string, string>,
+  params: URLSearchParams,
+  isFirst: boolean,
+): Promise<string | Response> {
+  const name = String(patient.firstName || "").trim() || "Patient";
+  try {
+  const g = await (await fetch(`https://${s.host}/llu/connections/${patient.patientId}/graph`, { headers: auth })).json();
+  const arr: number[] = (g?.data?.graphData ?? [])
+    .map((x: any) => Number(x.ValueInMgPerDl))
+    .filter((n: number) => n > 0);
+  const live = g?.data?.connection?.glucoseMeasurement?.ValueInMgPerDl;
+  if (live) arr.push(Number(live));
+
+  const subject = await sha256hex(patient.patientId);
+  // tsOf/liveM/nowMs0 are shared by the expiry check, the chart series and the persistence block.
+  const tsOf = (x: any): string => (x?.FactoryTimestamp ?? x?.Timestamp ?? "");
+  const liveM = g?.data?.connection?.glucoseMeasurement;
+  const nowMs0 = Date.now();
+
+    // ── Sensor EXPIRED? ──────────────────────────────────────────────────
+    // connection.sensor.a = the sensor's activation time (epoch s); a Libre sensor lives 14 days.
+    // Once past expiry AND the readings have stopped, tell the parent ONCE PER SENSOR to put a new
+    // one on (the phone app may be dead — this cron is the safety net). The marker lives in
+    // mechabetics_monitor_state.expired_notified_at: a NEW sensor pushes sensorEndMs past the
+    // marker, re-arming the alert for the next expiry. Runs BEFORE the "no reading" early-return —
+    // a long-dead sensor returns an empty graph, which is exactly when this must still fire.
+    try {
+      const sensA = Number(g?.data?.connection?.sensor?.a) || 0;
+      const sensorEndMs = sensA > 0 ? sensA * 1000 + 14 * 24 * 3600 * 1000 : 0;
+      const items0: any[] = [...(g?.data?.graphData ?? [])];
+      if (liveM) items0.push(liveM);
+      const lastTs = items0.reduce((mx: number, x: any) => {
+        const t = Date.parse(tsOf(x));
+        return Number.isFinite(t) && t > mx ? t : mx;
+      }, 0);
+      const signalDead = !arr.length || !lastTs || nowMs0 - lastTs > 15 * 60000;
+      if (sensorEndMs > 0 && nowMs0 > sensorEndMs && signalDead) {
+        const { data: st0 } = await db
+          .from("mechabetics_monitor_state")
+          .select("expired_notified_at, last_value")
+          .eq("subject", subject)
+          .maybeSingle();
+        const notifiedAt = (st0 as any)?.expired_notified_at ? Date.parse((st0 as any).expired_notified_at) : 0;
+        if (!notifiedAt || notifiedAt < sensorEndMs) {
+          const sinceMin = lastTs ? Math.round((nowMs0 - lastTs) / 60000) : null;
+          const ok = await telegram(
+            `🔌 <b>Capteur de ${name} EXPIRÉ</b> — les 14 jours sont atteints${sinceMin != null ? ` (plus de mesure depuis ${sinceMin} min)` : ""}. Il faut poser un NOUVEAU capteur (compter ~1 h de démarrage) ; en attendant, glycémie au doigt.`,
+          );
+          if (ok) {
+            // 🔑 last_value is NOT NULL with no default. Postgres checks NOT NULL on the proposed
+            // INSERT tuple BEFORE resolving ON CONFLICT, so an upsert that OMITS last_value fails
+            // with a not_null_violation even when the row already exists — and supabase-js returns
+            // that as { error } WITHOUT throwing. The old `upsert({ subject, expired_notified_at })`
+            // therefore NEVER persisted the marker, so this "once per sensor" alert re-fired on EVERY
+            // 5-min run once the sensor passed 14 days (it stormed the parent's Telegram). Always send
+            // last_value too (the stored one, else the latest stale reading, else a mid-normal anchor),
+            // and surface any write error so a silent failure can't bring the storm back.
+            const lv = (st0 as any)?.last_value ?? (arr.length ? arr[arr.length - 1] : 100);
+            const { error: markErr } = await db
+              .from("mechabetics_monitor_state")
+              .upsert({ subject, last_value: lv, expired_notified_at: new Date().toISOString() });
+            if (markErr) console.error(`expiry marker upsert failed — ${markErr.message ?? markErr}`);
+          }
+        }
+      }
+    } catch (e) {
+      console.error(`sensor-expiry check failed — ${(e as Error)?.message ?? e}`);
+    }
+
+    if (!arr.length) return "no-reading";
     const cur = arr[arr.length - 1];
-    const subject = await sha256hex(patient.patientId);
 
     // Build the chart series for the Telegram image so it MATCHES the in-app homepage
     // graph: the same 24 h window, sourced from the persisted readings (continuous even
     // when the app is closed) PLUS this run's LibreLinkUp graph + live point, deduped to
     // 5-min buckets. FactoryTimestamp is the true UTC time; drop any future-dated point.
-    // tsOf/liveM are reused by the persistence block below.
-    const tsOf = (x: any): string => (x?.FactoryTimestamp ?? x?.Timestamp ?? "");
-    const liveM = g?.data?.connection?.glucoseMeasurement;
-    const nowMs0 = Date.now();
     const dayAgo = nowMs0 - 24 * 60 * 60 * 1000;
     let stored: { t: number; v: number }[] = [];
     try {
@@ -260,19 +349,18 @@ Deno.serve(async (req) => {
     const chartPoints = [...bucket.values()].sort((a, b) => a.t - b.t);
     const tzMin = tzOffsetMinFor("Europe/Paris", nowMs0);
 
-    // On-demand helpers (no state change, no alert logic):
+    // On-demand helpers (no state change, no alert logic), FIRST patient only:
     //   ?preview  → returns the rendered PNG directly (for eyeballing the image)
     //   ?selftest → sends ONE test image to the group, so the parent can confirm the pipeline
-    const params = new URL(req.url).searchParams;
-    if (params.has("preview")) {
+    if (isFirst && params.has("preview")) {
       const png = await renderGraphPng(chartPoints, tzMin);
       if (!png) return new Response("preview: render unavailable", { status: 500 });
       return new Response(png, { headers: { "content-type": "image/png" } });
     }
-    if (params.has("selftest")) {
+    if (isFirst && params.has("selftest")) {
       const png = await renderGraphPng(chartPoints, tzMin);
       if (!png) return new Response("selftest: render unavailable");
-      const ok = await telegramPhoto(png, `🧪 <b>Test Mechabetics</b> — graphe glycémie (actuel ${cur} mg/dL)`);
+      const ok = await telegramPhoto(png, `🧪 <b>Test Mechabetics</b> — ${name} (actuel ${cur} mg/dL)`);
       return new Response(ok ? "selftest: photo sent" : "selftest: photo FAILED");
     }
 
@@ -291,7 +379,7 @@ Deno.serve(async (req) => {
     }
     const prev = st?.last_value ?? 100; // mid-normal anchor on first run OR on a read blip (logged above)
 
-    const msg = alertFor(prev, cur);
+    const msg = alertFor(prev, cur, name);
 
     await db.from("mechabetics_monitor_state").upsert({
       subject,
@@ -330,10 +418,11 @@ Deno.serve(async (req) => {
       if (!sent) sent = await telegram(msg);
       // Distinguish a delivered alert from a dropped one so a vanished hypo/hyper push
       // shows up in the cron's return string (and logs), not just silently in Telegram.
-      return new Response(sent ? `alert ${cur} (prev ${prev})${png ? " +img" : ""}` : `alert-SEND-FAILED ${cur} (prev ${prev})`);
+      return sent ? `alert ${cur} (prev ${prev})${png ? " +img" : ""}` : `alert-SEND-FAILED ${cur} (prev ${prev})`;
     }
-    return new Response(`ok ${cur} (prev ${prev})`);
+    return `ok ${cur} (prev ${prev})`;
   } catch (e) {
-    return new Response(`err ${(e as Error)?.message ?? e}`);
+    // One patient's failure must not abort the others — return an error string, keep looping.
+    return `err(${name}): ${(e as Error)?.message ?? e}`;
   }
-});
+}

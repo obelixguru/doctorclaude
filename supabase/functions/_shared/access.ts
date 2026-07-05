@@ -33,11 +33,17 @@ export async function tokenSubject(req: Request, db: any): Promise<string | null
   }
 }
 
-// HARD CUT — ON. A valid capability token is REQUIRED; a missing/invalid token is rejected
-// (forbidden_subject). This closes the "anyone with the public anon key + a subject hash can read"
-// hole. Every install must send a token (the Phase-B client claims one on login/patient change).
-// Rollback: set this back to false and redeploy the 8 functions to re-open the grace window.
-const REQUIRE_TOKEN = true;
+// GRACE WINDOW — token NOT required (rolled back 2026-06-09). The hard cut stranded a real device:
+// `mechabetics-claim` rotates tokens by DELETING this account's previous token, so a SECOND install
+// sharing the same LibreLinkUp account (an emulator, a reinstall) evicts the first device's token.
+// The evicted device then sends a now-deleted token, `tokenSubject` returns null, and the hard cut
+// turned that into `forbidden_subject` + EMPTY readings/insulin — i.e. flat graphs and missing chart
+// markers, with no error surfaced. Until the claim flow stops evicting peers (multi-token per
+// account), require-token is unsafe. With this false, an absent/stale token falls back to the body
+// subject so every device keeps reading its own data; a PRESENT, VALID token is still enforced to
+// its own subject (line above), so token holders gain nothing by spoofing another subject.
+// Re-enable (set true) only AFTER the claim function no longer deletes peers' tokens.
+const REQUIRE_TOKEN = false;
 
 /**
  * Resolve the subject this request may act on. Throws Error("forbidden_subject") when a token is
@@ -51,6 +57,9 @@ export async function accessSubject(req: Request, db: any, bodySubject: string |
     if (bodySubject && bodySubject !== ts) throw new Error("forbidden_subject");
     return ts;
   }
+  // No valid token resolved (absent, or stale = rotated away by a peer install). Log which, once,
+  // so we can confirm devices are being stranded — then fall back (grace window) or reject (hard cut).
+  console.log(`access: noToken hadHeader=${!!req.headers.get("x-mechabetics-access")} requireToken=${REQUIRE_TOKEN} subj=${bodySubject ? bodySubject.slice(0, 8) : "none"}`);
   if (REQUIRE_TOKEN) throw new Error("forbidden_subject");
   return bodySubject;
 }

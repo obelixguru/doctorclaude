@@ -22,6 +22,11 @@ enum class Tab { GLUCOSE, MEALS, INSULIN, PROFILE }
 /** One row in the profile switcher (login screen + Profile tab). */
 data class ProfileItem(val email: String, val label: String, val active: Boolean)
 
+/** One selectable PATIENT within the active LibreLinkUp account. A single follower account can
+ *  follow several people (e.g. a parent following two diabetic children); this lets the user switch
+ *  which one Doctor Claude is showing. Data stays isolated server-side (subject = sha256(patientId)). */
+data class PatientChoice(val patientId: String, val label: String, val active: Boolean)
+
 @Composable
 fun DoctorClaudeBottomBar(current: Tab, glucoseColor: Color = AccentGreen, glucoseAlert: Boolean = false, onSelect: (Tab) -> Unit) {
     val s = LocalStrings.current

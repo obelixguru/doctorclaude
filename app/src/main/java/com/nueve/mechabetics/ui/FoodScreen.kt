@@ -20,6 +20,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.outlined.Delete
 import androidx.compose.material3.*
@@ -57,6 +58,7 @@ fun FoodScreen(
     onDataChanged: () -> Unit = {}
 ) {
     val s = LocalStrings.current
+    val bgS = bgStringsFor(lang)
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     var meals by remember { mutableStateOf<List<MealsService.Meal>>(emptyList()) }
@@ -153,39 +155,62 @@ fun FoodScreen(
         if (foodTab == 1) {
             DietetiqueTab(patientId, ai, lang, Modifier.weight(1f))
         } else {
-        if (scanning) {
-            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                CircularProgressIndicator(color = AccentGreen, strokeWidth = 2.dp, modifier = Modifier.size(20.dp))
-                Text(s.foodScanning, color = InkMuted, fontSize = 13.sp)
-            }
-        }
-        if (scanResult.isNotEmpty()) {
-            Surface(
-                color = CardWhite, shape = RoundedCornerShape(14.dp),
-                border = BorderStroke(1.dp, AccentGreen.copy(alpha = 0.4f)), modifier = Modifier.fillMaxWidth()
-            ) {
-                Text(scanResult, color = InkPrimary, fontSize = 14.sp, lineHeight = 20.sp, modifier = Modifier.padding(14.dp))
-            }
-            DoseDisclaimer()
-        }
-
-        // Meal list takes the remaining space; the action buttons stay pinned below it.
+        // The scan spinner + product analysis and the meal list now share ONE scroll (the LazyColumn
+        // below) as header items. Before, the analysis sat ABOVE the weighted meal box at its natural
+        // (unbounded) height, so a long product analysis pushed the meal list down to a ~20 px sliver
+        // you couldn't read or scroll. As scrolling header items the whole thing scrolls together, and
+        // the analysis carries a ✕ to dismiss it.
         Box(Modifier.weight(1f).fillMaxWidth()) {
-            when {
-                loading -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+            if (loading) {
+                Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
                     CircularProgressIndicator(color = AccentGreen, strokeWidth = 2.dp, modifier = Modifier.size(26.dp))
                 }
-                meals.isEmpty() -> Text(s.foodEmpty, color = InkDim, fontSize = 13.sp)
-                else -> LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                    items(meals, key = { it.id }) { m ->
-                        MealRow(m, s, lang,
-                            onEdit = {
-                                editingMeal = m; desc = m.description
-                                qty = m.quantity.coerceAtLeast(1).toString()
-                                // Show carbs PER UNIT (stored carbs_g is the total = per-unit × quantity).
-                                carbs = m.carbsG?.let { (it / m.quantity.coerceAtLeast(1)).toString() } ?: ""
-                                mealWhen = tsToMs(m.ts); showAdd = true
-                            })
+            } else {
+                LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    if (scanning) {
+                        item {
+                            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                                CircularProgressIndicator(color = AccentGreen, strokeWidth = 2.dp, modifier = Modifier.size(20.dp))
+                                Text(s.foodScanning, color = InkMuted, fontSize = 13.sp)
+                            }
+                        }
+                    }
+                    if (scanResult.isNotEmpty()) {
+                        item {
+                            Surface(
+                                color = CardWhite, shape = RoundedCornerShape(14.dp),
+                                border = BorderStroke(1.dp, AccentGreen.copy(alpha = 0.4f)), modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Column(Modifier.padding(start = 14.dp, end = 6.dp, top = 4.dp, bottom = 14.dp)) {
+                                    Row(verticalAlignment = Alignment.CenterVertically) {
+                                        Text(
+                                            if (es) "Análisis del producto" else "Analyse du produit",
+                                            color = AccentGreen, fontSize = 11.sp, fontWeight = FontWeight.Black,
+                                            letterSpacing = 0.5.sp, modifier = Modifier.weight(1f)
+                                        )
+                                        IconButton(onClick = { scanResult = "" }, modifier = Modifier.size(32.dp)) {
+                                            Icon(Icons.Filled.Close, contentDescription = if (es) "Cerrar" else "Fermer", tint = InkMuted, modifier = Modifier.size(20.dp))
+                                        }
+                                    }
+                                    Text(scanResult, color = InkPrimary, fontSize = 14.sp, lineHeight = 20.sp, modifier = Modifier.padding(end = 8.dp))
+                                }
+                            }
+                        }
+                        item { DoseDisclaimer() }
+                    }
+                    if (meals.isEmpty()) {
+                        if (!scanning) item { Text(s.foodEmpty, color = InkDim, fontSize = 13.sp) }
+                    } else {
+                        items(meals, key = { it.id }) { m ->
+                            MealRow(m, s, lang,
+                                onEdit = {
+                                    editingMeal = m; desc = m.description
+                                    qty = m.quantity.coerceAtLeast(1).toString()
+                                    // Show carbs PER UNIT (stored carbs_g is the total = per-unit × quantity).
+                                    carbs = m.carbsG?.let { (it / m.quantity.coerceAtLeast(1)).toString() } ?: ""
+                                    mealWhen = tsToMs(m.ts); showAdd = true
+                                })
+                        }
                     }
                 }
             }
@@ -245,7 +270,9 @@ fun FoodScreen(
                     if (perU != null && q > 1) {
                         Text(String.format(s.foodQtyTotal, perU * q), color = AccentGreen, fontSize = 12.sp, fontWeight = FontWeight.Bold)
                     }
-                    WhenPicker(mealWhen, { mealWhen = it }, AccentGreen)
+                    // allowFuture: a meal you're GOING to eat can be logged ahead — the server marks
+                    // a future-dated meal "prévu" (planned) and the coach times its bolus at eating.
+                    WhenPicker(mealWhen, { mealWhen = it }, AccentGreen, allowFuture = true, tomorrowLabel = bgS.whenTomorrow)
                     // Editing an existing meal → delete it from here (no separate trash icon / confirm),
                     // mirroring how the insulin-dose dialog handles deletion.
                     editingMeal?.let { em ->

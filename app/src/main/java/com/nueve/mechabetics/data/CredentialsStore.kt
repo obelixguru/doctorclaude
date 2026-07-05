@@ -58,6 +58,13 @@ class CredentialsStore(context: Context) {
         get() = prefs.getBoolean(KEY_MEAL_REMINDERS, true)
         set(v) = prefs.edit().putBoolean(KEY_MEAL_REMINDERS, v).apply()
 
+    /** Whether the one-time "allow background / exempt from battery optimization" prompt has been
+     *  shown. Set once it's offered (granted or dismissed) so we don't nag — the Notifications page
+     *  keeps a permanent toggle for changing it later. */
+    var batteryPromptShown: Boolean
+        get() = prefs.getBoolean(KEY_BATTERY_PROMPT, false)
+        set(v) = prefs.edit().putBoolean(KEY_BATTERY_PROMPT, v).apply()
+
     /** On-phone hypo/hyper alarm SOUND on/off. Default on (safety). Turning it off silences only the
      *  local ring — the red banner and the server→Telegram alert are unaffected. */
     var alarmSoundEnabled: Boolean
@@ -366,6 +373,7 @@ class CredentialsStore(context: Context) {
         private const val KEY_PATIENT_ID = "patient_id"
         private const val KEY_LANG = "language"
         private const val KEY_MEAL_REMINDERS = "meal_reminders"
+        private const val KEY_BATTERY_PROMPT = "battery_prompt_shown"
         private const val KEY_HEALTH_CONNECT = "health_connect_enabled"
         private const val KEY_ACCOUNTS = "accounts"
         private const val KEY_CONSENT_VERSION = "consent_version"

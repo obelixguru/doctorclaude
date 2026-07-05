@@ -5,6 +5,10 @@
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <!-- Lets the user whitelist the app from Doze / battery optimization so monitoring keeps polling
+         + alarming with the screen off. Without it, Samsung One UI (Galaxy A32) freezes the foreground
+         service in standby and glucose only refreshes on unlock. -->
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <uses-permission android:name="android.permission.VIBRATE" />
     <!-- On-phone ringing alarm for hypo/hyper + fast drops (foreground service that keeps playing). -->
@@ -101,6 +105,12 @@
         <!-- Meal-time reminders (08/12/16/20h); each fire reschedules the next slot. -->
         <receiver
             android:name=".data.MealReminderReceiver"
+            android:exported="false" />
+
+        <!-- Doze-proof watchdog: an allow-while-idle alarm wakes the device ~every 10 min to re-assert
+             monitoring (restart it if the OS killed it) + poke an immediate refresh, even in deep sleep. -->
+        <receiver
+            android:name=".MonitorWatchdogReceiver"
             android:exported="false" />
 
         <!-- Restart continuous monitoring after a device reboot / app update. -->

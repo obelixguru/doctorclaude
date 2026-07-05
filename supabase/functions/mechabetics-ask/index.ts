@@ -8,16 +8,19 @@ import {
   minutesSinceLastRescue,
   activeIob,
   insulinActionMinutes,
+  iobSystemLine,
   mealBolusUnits,
   combinedActionLine,
   situationHint,
   stripInsulinNumbers,
   carbsCubesPhrase,
+  carbEstimationRules,
   mealCarbSpeed,
   carbSpeedAdvice,
   sugarTimingFact,
   hypoIobWarning,
   starchyCarbNote,
+  plannedMealNote,
   type GuardProfile,
 } from "../_shared/doseGuard.ts";
 import { chatJson, llmErrorKind, llmErrorMessage } from "../_shared/llm.ts";
@@ -109,19 +112,27 @@ function toGuardProfile(p: any): GuardProfile | null {
   };
 }
 
-// Recent rapid-insulin doses -> a context line (for the model's wording; the guard computes IOB itself).
-function insulinContext(doses: any[], lang: string): string {
+// Recent rapid-insulin doses -> a context line (for the model's wording; the guard computes IOB
+// itself). A FUTURE-dated dose is a PLANNED injection (not yet active — activeIob skips it): say so
+// instead of the nonsense "il y a -53 min". Each PAST dose carries its computed state (still
+// working / finished) and the line closes with the SYSTEM total (iobSystemLine) — the model used
+// to see only "4 u il y a 290 min" and estimated the decay ITSELF, saying insulin was still ending
+// while the computed IOB (and the Insuline tab) said 0.
+function insulinContext(doses: any[], iob: number, defaultDur: number, nowMs: number, lang: string): string {
   const rapid = (doses || []).filter((d: any) => d.kind !== "basal");
   if (!rapid.length) return "";
-  const now = Date.now();
-  const ago = lang === "es" ? "hace" : "il y a";
+  const es = lang === "es";
   const parts = rapid.map((d: any) => {
-    const mins = Math.round((now - new Date(d.ts).getTime()) / 60000);
-    return `${d.units} u${d.insulin_name ? ` ${d.insulin_name}` : ""} ${ago} ${mins} min`;
+    const mins = Math.round((nowMs - new Date(d.ts).getTime()) / 60000);
+    const what = `${d.units} u${d.insulin_name ? ` ${d.insulin_name}` : ""}`;
+    if (mins < -1) return es ? `${what} PREVISTA en ${-mins} min (aún no activa)` : `${what} PRÉVUE dans ${-mins} min (pas encore active)`;
+    const done = mins >= (insulinActionMinutes(d.insulin_name) ?? defaultDur);
+    const state = done ? (es ? "ya terminó de actuar" : "a fini d'agir") : (es ? "sigue actuando" : "agit encore");
+    return es ? `${what} hace ${Math.max(0, mins)} min (${state})` : `${what} il y a ${Math.max(0, mins)} min (${state})`;
   });
-  return lang === "es"
-    ? `INSULINA RÁPIDA RECIENTE: ${parts.join("; ")} (ya descontada por el sistema).`
-    : `INSULINE RAPIDE RÉCENTE : ${parts.join(" ; ")} (déjà déduite par le système).`;
+  return es
+    ? `INSULINA RÁPIDA RECIENTE: ${parts.join("; ")}. ${iobSystemLine(iob, lang)}`
+    : `INSULINE RAPIDE RÉCENTE : ${parts.join(" ; ")}. ${iobSystemLine(iob, lang)}`;
 }
 
 // Recent physical activity -> a context line (sport lowers glucose).
@@ -140,7 +151,7 @@ function activityContext(acts: any[], lang: string): string {
     : `ACTIVITÉ PHYSIQUE RÉCENTE : ${parts.join(" ; ")} — le sport FAIT BAISSER la glycémie.`;
 }
 
-function buildSystem(lang: string, p: any, cur: number | null, series: string, meals: any[], pr: Record<string, string>, insCtx: string, actCtx: string, hint: string, signalLost: boolean, staleMin: number): string {
+function buildSystem(lang: string, p: any, cur: number | null, series: string, meals: any[], pr: Record<string, string>, insCtx: string, actCtx: string, hint: string, signalLost: boolean, staleMin: number, sensorExpired: boolean): string {
   const nick = p?.nickname || (lang === "es" ? "la persona" : "la personne");
   const curTxt = cur != null ? `${cur} mg/dL` : (lang === "es" ? "desconocida" : "inconnue");
   const mealsTxt = (meals && meals.length)
@@ -175,50 +186,60 @@ function buildSystem(lang: string, p: any, cur: number | null, series: string, m
   if (lang === "es") {
     return [
       persona,
-      `TEMA: eres ante todo su coach de diabetes, pero también su compañero: PUEDES responder brevemente y con amabilidad a preguntas generales (cultura, vida diaria, etc.). Sé cariñoso y apropiado — quizá sea un niño. Para una pregunta SIN relación con su salud / glucosa / comidas / insulina / deporte, responde igualmente pero pon "meal", "insulin", "activity" en null (no registres nada).`,
+      `ÁMBITO ("scope"): decide primero si la pregunta toca su salud / glucosa / diabetes / comidas / insulina / deporte / sueño / su cuerpo → "scope":"diabetes", o si es una pregunta general sin relación (deberes, cultura, ciencia, juegos, charla) → "scope":"general". Pregunta GENERAL: respóndela DE VERDAD y de forma completa, como un asistente inteligente y amable (adaptado a un niño/adolescente) — SIN límite de 2-3 frases, sin hablar de diabetes ni de glucosa (salvo que lo pida), y pon "meal","insulin","activity" en null (no registres nada). Pregunta de DIABETES: aplica todas las reglas siguientes.`,
       `PERFIL: ${profileLine}.`,
       signalLost
-        ? `GLUCOSA: SEÑAL PERDIDA (sin medición desde hace ${staleMin} min) — la actual es DESCONOCIDA; última conocida ${curTxt}; recientes (mg/dL): ${series || "n/d"}. NUNCA digas «estás en X» como si fuera ahora — di «tu última glucosa conocida»; aconseja reconectar el sensor primero (acercar el teléfono que lo escanea, volver a escanear), y una punción capilar si la señal no vuelve.`
+        ? (sensorExpired
+          ? `GLUCOSA: SENSOR CADUCADO (los 14 días se cumplieron) — sin medición desde hace ${staleMin} min, la actual es DESCONOCIDA; última conocida ${curTxt}; recientes (mg/dL): ${series || "n/d"}. Esa es la CAUSA de la falta de señal: aconseja poner un sensor NUEVO (y una punción capilar mientras tanto) — NADA de «acercar el teléfono» ni «volver a escanear», un sensor terminado no vuelve.`
+          : `GLUCOSA: SEÑAL PERDIDA (sin medición desde hace ${staleMin} min) — la actual es DESCONOCIDA; última conocida ${curTxt}; recientes (mg/dL): ${series || "n/d"}. NUNCA digas «estás en X» como si fuera ahora — di «tu última glucosa conocida»; aconseja reconectar el sensor primero (acercar el teléfono que lo escanea, volver a escanear), y una punción capilar si la señal no vuelve.`)
         : `GLUCOSA: actual ${curTxt}; recientes (mg/dL): ${series || "n/d"}.`,
       `COMIDAS RECIENTES: ${mealsTxt}.`,
       insCtx,
       actCtx,
       hint ? `SITUACIÓN (la calcula el sistema): ${hint}.` : "",
-      `REGLAS: responde a su pregunta, español sencillo y breve, glucosa en mg/dL. Si menciona algo que comió o va a comer, estima los carbohidratos y rellena "meal". Si dice que se puso X unidades de insulina, rellena "insulin".`,
+      `REGLAS (preguntas de diabetes): responde a su pregunta, español sencillo y breve, glucosa en mg/dL. Si menciona algo que comió o va a comer, estima los carbohidratos y rellena "meal". Si dice que se puso X unidades de insulina, rellena "insulin".`,
+      `COMIDA FUTURA: si dice que VA a comer algo («voy a comer un McDonald's», «esta noche pasta»), rellena "meal" con "planned":true y tu mejor estimación de carbohidratos — el sistema añadirá la consigna de ponerse la insulina al comer.`,
+      `SENSOR: si dice que su sensor está caducado / terminado o que acaba de cambiarlo, tenlo en cuenta (un sensor nuevo tarda ~1 h en arrancar) y aconseja punción capilar mientras tanto — no le digas que «vuelva a escanear» un sensor terminado.`,
       `TIEMPO: si dice CUÁNDO lo comió o se inyectó («hace 3 horas», «esta mañana», «a las 14h»), calcula los minutos transcurridos y ponlos en "minutesAgo" (0 si es ahora o no lo dice). No lo inventes.`,
       `Si menciona ejercicio o deporte (hecho o previsto), rellena "activity".`,
       `Si dice que YA se puso una dosis (rellena "insulin"), NO propongas otra inyección; si parece mucha insulina, aconseja vigilar una hipo y tener azúcar a mano. Nunca aconsejes más insulina sobre una dosis ya puesta.`,
-      `Para "meal", añade "basis":"stated" si dijo claramente el alimento y/o la cantidad, o "estimated" si es vago o lo estimas tú. No se inventa una dosis firme sobre una estimación. "carbsG" SIEMPRE se rellena para un alimento: da TU MEJOR ESTIMACIÓN en gramos (nunca null ni 0 para un alimento con carbohidratos) — es la base del análisis.`,
+      carbEstimationRules(lang),
+      `Para "meal", añade "basis":"stated" si dijo claramente el alimento y/o la cantidad, o "estimated" si es vago o lo estimas tú. No se inventa una dosis firme sobre una estimación. "carbsG" SIEMPRE se rellena para un alimento: da TU MEJOR ESTIMACIÓN en gramos (nunca null, y 0-2 SOLO para un alimento sin carbohidratos como carne/huevo/queso) — es la base del análisis.`,
       noNumbers,
       sugarRule,
       sugarTiming,
       sugarTimingFact(lang),
       `Es un consejo, no un dispositivo médico.`,
-      `Responde SOLO en JSON: {"reply":"<respuesta mostrada en mg/dL, 2-3 frases, SIN número de dosis>","voice":"<una frase hablada, SIN número de dosis; di la glucosa SIN unidad, solo el número (ej 78, 218)>","meal":{"description":"<comida>","carbsG":<numero>,"planned":<true si futura, false si ya comida>,"basis":"stated|estimated","minutesAgo":<minutos desde que comió, 0 si ahora>}|null,"insulin":{"units":<numero>,"name":"<insulina>","minutesAgo":<minutos desde la inyección, 0 si ahora>}|null,"activity":{"kind":"<tipo>","description":"<texto>","intensity":"low|moderate|high","planned":<true|false>,"minutesAgo":<minutos, 0 si ahora>}|null}`,
+      `Responde SOLO en JSON: {"scope":"diabetes|general","reply":"<respuesta mostrada en mg/dL — 2-3 frases para diabetes, completa y libre para una pregunta general — SIN número de dosis>","voice":"<lo que se lee en voz alta: para una pregunta general, la respuesta completa; para diabetes, una frase. SIN número de dosis; di la glucosa SIN unidad, solo el número (ej 78, 218)>","meal":{"description":"<comida>","carbsG":<numero>,"planned":<true si futura, false si ya comida>,"basis":"stated|estimated","minutesAgo":<minutos desde que comió, 0 si ahora>}|null,"insulin":{"units":<numero>,"name":"<insulina>","minutesAgo":<minutos desde la inyección, 0 si ahora>}|null,"activity":{"kind":"<tipo>","description":"<texto>","intensity":"low|moderate|high","planned":<true|false>,"minutesAgo":<minutos, 0 si ahora>}|null}`,
     ].filter(Boolean).join(" ");
   }
   return [
     persona,
-    `SUJET : tu es avant tout son coach diabète, mais aussi son compagnon : tu PEUX répondre brièvement et gentiment à des questions générales (culture, vie quotidienne, etc.). Reste bienveillant et adapté — c'est peut-être un enfant. Pour une question SANS rapport avec sa santé / glycémie / repas / insuline / sport, réponds quand même mais mets "meal", "insulin", "activity" à null (ne loggue rien).`,
+    `PORTÉE ("scope") : décide d'abord si la question touche sa santé / glycémie / diabète / repas / insuline / sport / sommeil / son corps → "scope":"diabetes", ou si c'est une question générale sans rapport (devoirs, culture, sciences, jeux, discussion) → "scope":"general". Question GÉNÉRALE : réponds-y VRAIMENT et complètement, comme un assistant intelligent et bienveillant (adapté à un enfant/ado) — SANS limite de 2-3 phrases, ne parle PAS de diabète ni de glycémie (sauf s'il le demande), et mets "meal","insulin","activity" à null (ne loggue rien). Question DIABÈTE : applique toutes les règles ci-dessous.`,
     `PROFIL : ${profileLine}.`,
     signalLost
-      ? `GLYCÉMIE : SIGNAL PERDU (aucune mesure depuis ${staleMin} min) — l'actuelle est INCONNUE ; dernière connue ${curTxt} ; récentes (mg/dL) : ${series || "n/d"}. Ne dis JAMAIS « tu es à X » comme si c'était maintenant — dis « ta dernière glycémie connue » ; conseille de reconnecter le capteur d'abord (rapprocher le téléphone qui le scanne, re-scanner), et un test au doigt si le signal ne revient pas.`
+      ? (sensorExpired
+        ? `GLYCÉMIE : CAPTEUR EXPIRÉ (les 14 jours sont atteints) — plus aucune mesure depuis ${staleMin} min, l'actuelle est INCONNUE ; dernière connue ${curTxt} ; récentes (mg/dL) : ${series || "n/d"}. C'est la CAUSE de l'absence de signal : conseille de poser un NOUVEAU capteur (et un test au doigt en attendant) — PAS de « rapprocher le téléphone » ni de « re-scanner », un capteur fini ne revient pas.`
+        : `GLYCÉMIE : SIGNAL PERDU (aucune mesure depuis ${staleMin} min) — l'actuelle est INCONNUE ; dernière connue ${curTxt} ; récentes (mg/dL) : ${series || "n/d"}. Ne dis JAMAIS « tu es à X » comme si c'était maintenant — dis « ta dernière glycémie connue » ; conseille de reconnecter le capteur d'abord (rapprocher le téléphone qui le scanne, re-scanner), et un test au doigt si le signal ne revient pas.`)
       : `GLYCÉMIE : actuelle ${curTxt} ; récentes (mg/dL) : ${series || "n/d"}.`,
     `REPAS RÉCENTS : ${mealsTxt}.`,
     insCtx,
     actCtx,
     hint ? `SITUATION (calculée par le système) : ${hint}.` : "",
-    `RÈGLES : réponds à sa question, français simple et court, glycémie en mg/dL. S'il mentionne un aliment mangé ou à venir, estime les glucides et remplis "meal". S'il dit avoir fait X unités d'insuline, remplis "insulin".`,
+    `RÈGLES (questions diabète) : réponds à sa question, français simple et court, glycémie en mg/dL. S'il mentionne un aliment mangé ou à venir, estime les glucides et remplis "meal". S'il dit avoir fait X unités d'insuline, remplis "insulin".`,
+    `REPAS À VENIR : s'il dit qu'il VA manger quelque chose (« je vais manger un McDo », « ce soir je mange des pâtes »), remplis "meal" avec "planned":true et ta meilleure estimation de glucides — le système ajoutera la consigne de faire l'insuline au moment de manger.`,
+    `CAPTEUR : s'il dit que son capteur est expiré / fini ou qu'il vient d'en changer, prends-le en compte (un capteur neuf met ~1 h à démarrer) et conseille un test au doigt en attendant — ne lui dis pas de « re-scanner » un capteur fini.`,
     `QUAND : s'il précise QUAND il l'a mangé ou injecté («il y a 3 heures», «ce matin», «à 14h»), calcule les minutes écoulées et mets-les dans "minutesAgo" (0 si c'est maintenant ou non précisé). N'invente pas.`,
     `S'il mentionne du sport ou une activité (faite ou prévue), remplis "activity".`,
     `S'il dit avoir DÉJÀ fait une dose (remplis "insulin"), ne propose pas d'en refaire ; si ça semble beaucoup d'insuline, conseille de surveiller une hypo et d'avoir du sucre à portée. Ne conseille jamais d'insuline en plus d'une dose déjà faite.`,
-    `Pour "meal", ajoute "basis":"stated" s'il a clairement dit l'aliment et/ou la quantité, ou "estimated" si c'est vague ou que tu l'estimes. On n'invente pas de dose ferme sur une estimation. "carbsG" est TOUJOURS rempli pour un aliment : donne TA MEILLEURE ESTIMATION en grammes (jamais null ni 0 pour un aliment qui contient des glucides) — c'est la base de l'analyse.`,
+    carbEstimationRules(lang),
+    `Pour "meal", ajoute "basis":"stated" s'il a clairement dit l'aliment et/ou la quantité, ou "estimated" si c'est vague ou que tu l'estimes. On n'invente pas de dose ferme sur une estimation. "carbsG" est TOUJOURS rempli pour un aliment : donne TA MEILLEURE ESTIMATION en grammes (jamais null, et 0-2 SEULEMENT pour un aliment sans glucides comme viande/œuf/fromage) — c'est la base de l'analyse.`,
     noNumbers,
     sugarRule,
     sugarTiming,
     sugarTimingFact(lang),
     `C'est un conseil, pas un dispositif médical.`,
-    `Réponds UNIQUEMENT en JSON : {"reply":"<réponse affichée en mg/dL, 2-3 phrases, SANS chiffre de dose>","voice":"<une phrase parlée, SANS chiffre de dose ; dis la glycémie SANS unité, juste le nombre (ex 78, 218)>","meal":{"description":"<aliment>","carbsG":<nombre>,"planned":<true si à venir, false si déjà mangé>,"basis":"stated|estimated","minutesAgo":<minutes depuis qu'il a mangé, 0 si maintenant>}|null,"insulin":{"units":<nombre>,"name":"<insuline>","minutesAgo":<minutes depuis l'injection, 0 si maintenant>}|null,"activity":{"kind":"<type>","description":"<texte>","intensity":"low|moderate|high","planned":<true|false>,"minutesAgo":<minutes, 0 si maintenant>}|null}`,
+    `Réponds UNIQUEMENT en JSON : {"scope":"diabetes|general","reply":"<réponse affichée en mg/dL — 2-3 phrases pour le diabète, complète et libre pour une question générale — SANS chiffre de dose>","voice":"<ce qui est lu à voix haute : pour une question générale, la réponse complète ; pour le diabète, une phrase. SANS chiffre de dose ; dis la glycémie SANS unité, juste le nombre (ex 78, 218)>","meal":{"description":"<aliment>","carbsG":<nombre>,"planned":<true si à venir, false si déjà mangé>,"basis":"stated|estimated","minutesAgo":<minutes depuis qu'il a mangé, 0 si maintenant>}|null,"insulin":{"units":<nombre>,"name":"<insuline>","minutesAgo":<minutes depuis l'injection, 0 si maintenant>}|null,"activity":{"kind":"<type>","description":"<texte>","intensity":"low|moderate|high","planned":<true|false>,"minutesAgo":<minutes, 0 si maintenant>}|null}`,
   ].filter(Boolean).join(" ");
 }
 
@@ -243,6 +264,9 @@ Deno.serve(async (req: Request) => {
     const readings = Array.isArray(body.readings) ? body.readings : [];
     const byokGeminiKey = typeof body.geminiKey === "string" ? body.geminiKey.trim() : "";
     const premiumVoice = body.premiumVoice !== false; // absent => premium (older installs keep voice)
+    // The CLIENT knows the sensor's expiry (LibreLinkUp activation + 14 d) — when it says the sensor
+    // is expired, a lost signal has a known cause: advise a NEW sensor, not "re-scan / move closer".
+    const sensorExpired = body.sensorExpired === true;
     const didntCatch = lang === "es" ? "No te he entendido, ¿puedes repetir?" : "Je n'ai pas compris, tu peux répéter ?";
     if (!question) return json({ text: didntCatch, isError: true });
     // Cost model: server LLM key only in Hosted mode; free users bring a Gemini key (BYOK).
@@ -308,13 +332,13 @@ Deno.serve(async (req: Request) => {
     const guard = computeGuard({ glucoseMgdl: cur, trend, staleMin, iobUnits: iob, recentHypo, minSinceRescue, profile: gp });
     const hint = situationHint(guard, lang);
 
-    const insCtx = insulinContext(insulinDoses, lang);
+    const insCtx = insulinContext(insulinDoses, iob, dia, nowMs, lang);
     const actCtx = activityContext(activity, lang);
     // Match the client's NO SIGNAL window (5 min): a stale last reading means the LIVE value is
     // unknown — the spoken reply must not assert "tu es à X", only the LAST KNOWN value.
     const signalLost = cur != null && (!hasTs || (nowMs - (lastR as any).ts) > 5 * 60000);
     const pr = await loadPrompts(lang);
-    const sys = buildSystem(lang, profile, cur, series, meals, pr, insCtx, actCtx, hint, signalLost, staleMin);
+    const sys = buildSystem(lang, profile, cur, series, meals, pr, insCtx, actCtx, hint, signalLost, staleMin, sensorExpired);
 
     let raw = "";
     try {
@@ -342,6 +366,12 @@ Deno.serve(async (req: Request) => {
     const voiceRaw = (typeof parsed.voice === "string" && parsed.voice.trim()) ? parsed.voice.trim() : extractStr(raw, "voice");
     let voice: string = voiceRaw || reply;
 
+    // Off-topic (GENERAL) question: the model answered freely; the diabetic apparatus (Action line,
+    // carb notes, auto-logging) stays OUT of it, and the client won't persist it. Belt: any extracted
+    // meal/insulin/activity forces "diabetes" — a question that logs something is never off-topic.
+    const scope = (parsed.scope === "general" && !parsed.meal && !parsed.insulin && !parsed.activity)
+      ? "general" : "diabetes";
+
     // ----- CODE OWNS THE DOSE -----
     const mealCarbs = (parsed.meal && typeof parsed.meal === "object" && Number.isFinite(Number(parsed.meal.carbsG)))
       ? Math.min(300, Math.max(0, Math.round(Number(parsed.meal.carbsG)))) : null; // clamp a hallucinated/injected carb count
@@ -350,6 +380,9 @@ Deno.serve(async (req: Request) => {
     const mealStated = !!(parsed.meal && typeof parsed.meal === "object" && parsed.meal.basis === "stated");
     const mealUnits = mealStated ? mealBolusUnits(mealCarbs, gp) : 0;
     const mealEstimated = !!mealCarbs && !mealStated;
+    // An ANNOUNCED future meal ("je vais manger un McDo"): its bolus happens AT EATING TIME, never
+    // now — combinedActionLine words it accordingly, and the estimated case gets plannedMealNote.
+    const mealPlanned = !!(parsed.meal && typeof parsed.meal === "object" && parsed.meal.planned === true);
 
     // SAFETY (overdose guard): if the user just told us they injected a dose, count it toward
     // insulin-on-board NOW and re-run the guard, so we NEVER stack a correction on top of a dose
@@ -374,16 +407,31 @@ Deno.serve(async (req: Request) => {
 
     let text = reply;
     let voiceText = voice;
-    if (signalLost) {
+    if (scope === "general") {
+      // A general answer stays a PURE answer — no diabetic Action appended, nothing logged. The one
+      // exception is a LIVE hypo (the kid may be asking about homework while at 55): the code-owned
+      // sugar action always wins. Everything else (alarms, banners) is the rest of the app's job.
+      if (!signalLost && guard.kind === "sugar") {
+        const label = lang === "es" ? "Acción" : "Action";
+        const line = combinedActionLine(guard, 0, lang, gp);
+        text = `${text}\n\n${label} : ${line}`;
+        voiceText = `${voiceText} ${line}`.trim();
+      }
+    } else if (signalLost) {
       // Reading is older than the 5-min NO SIGNAL window → the LIVE value is unknown, so NEVER append a
       // dose/sugar action off it (mirrors coach + the screen's own NO SIGNAL state). Tell them to
-      // reconnect / fingerstick instead, and strip any dose the model may have stated in its prose.
+      // reconnect / fingerstick instead — or to REPLACE the sensor when we know it's expired — and
+      // strip any dose the model may have stated in its prose.
       const safeReply = stripInsulinNumbers(reply) || reply;
       const safeVoice = stripInsulinNumbers(voice) || voice;
       const label = lang === "es" ? "Acción" : "Action";
-      const line = lang === "es"
-        ? "Señal perdida: reconecta el sensor (acerca el teléfono que lo escanea, vuelve a escanear); si no vuelve, hazte una punción capilar antes de cualquier decisión."
-        : "Signal perdu : reconnecte le capteur (rapproche le téléphone qui le scanne, re-scanne) ; s'il ne revient pas, fais un test au doigt avant toute décision.";
+      const line = sensorExpired
+        ? (lang === "es"
+          ? "Sensor caducado: pon un sensor NUEVO lo antes posible (cuenta ~1 h de arranque); mientras tanto, decide solo con una punción capilar."
+          : "Capteur expiré : pose un NOUVEAU capteur dès que possible (compte ~1 h de démarrage) ; en attendant, décide uniquement avec un test au doigt.")
+        : (lang === "es"
+          ? "Señal perdida: reconecta el sensor (acerca el teléfono que lo escanea, vuelve a escanear); si no vuelve, hazte una punción capilar antes de cualquier decisión."
+          : "Signal perdu : reconnecte le capteur (rapproche le téléphone qui le scanne, re-scanne) ; s'il ne revient pas, fais un test au doigt avant toute décision.");
       text = `${safeReply}\n\n${label} : ${line}`;
       voiceText = `${safeVoice} ${line}`.trim();
     } else if (overReported) {
@@ -400,7 +448,7 @@ Deno.serve(async (req: Request) => {
       // plain in-range reading or when there's no glucose data at all.
       const showAction = mealUnits > 0 || !(guardForAction.reason === "in_range" || guardForAction.reason === "no_reading");
       if (showAction) {
-        const line = combinedActionLine(guardForAction, mealUnits, lang, gp);
+        const line = combinedActionLine(guardForAction, mealUnits, lang, gp, mealPlanned);
         const label = lang === "es" ? "Acción" : "Action";
         text = `${reply}\n\n${label} : ${line}`;
         voiceText = `${voice} ${line}`.trim();
@@ -411,8 +459,19 @@ Deno.serve(async (req: Request) => {
         const warn = hypoIobWarning(iob, lang);
         if (warn) { text = `${text}\n\n${warn}`; voiceText = `${voiceText} ${warn.replace("⚠️", "").trim()}`.trim(); }
       }
-      // Estimated (not user-stated) carbs -> nudge to log instead of a firm meal dose.
-      if (mealEstimated) {
+      // Estimated (not user-stated) carbs -> no firm number. For an ANNOUNCED future meal, the note
+      // still says PLAINLY that insulin will be needed at eating time and whether any dose is on
+      // record (the McDo case); otherwise, the usual "log it for a precise dose" nudge.
+      if (mealEstimated && guardForAction.kind !== "sugar" && mealPlanned) {
+        const recentRapid = (insulinDoses || []).some((d: any) => {
+          if (!d || d.kind === "basal") return false;
+          const t = new Date(d.ts).getTime();
+          return Number.isFinite(t) && t <= nowMs + 60000 && nowMs - t <= 45 * 60000;
+        });
+        const note = plannedMealNote(mealCarbs, recentRapid, lang);
+        text = `${text}\n\n${note}`;
+        voiceText = `${voiceText} ${note}`.trim();
+      } else if (mealEstimated) {
         const nudge = lang === "es"
           ? "Para una dosis de comida precisa, registra los carbohidratos (pestaña Comidas o escanea el producto)."
           : "Pour une dose de repas précise, logge les glucides (onglet Repas ou scanne le produit).";
@@ -440,7 +499,7 @@ Deno.serve(async (req: Request) => {
     // rise, recheck later — fatty also gets the split-bolus note). Skip during a hypo rescue
     // (guard "sugar"): telling someone treating a low to "pre-bolus next time" is contradictory.
     if (parsed.meal && typeof parsed.meal === "object" && guardForAction.kind !== "sugar") {
-      const adv = carbSpeedAdvice(mealCarbSpeed(parsed.meal.description), lang);
+      const adv = carbSpeedAdvice(mealCarbSpeed(parsed.meal.description), lang, mealPlanned);
       if (adv) {
         text = `${text}\n\n${adv}`;
         voiceText = `${voiceText} ${adv}`.trim();
@@ -517,7 +576,9 @@ Deno.serve(async (req: Request) => {
       } catch (_) { /* voice optional */ }
     }
 
-    return json({ text, voice: voiceText, audioBase64, mime: "audio/mpeg", isError: false, meal: loggedMeal, logFailed });
+    // `scope` lets the client treat a general answer as transient (spoken/shown, never persisted
+    // as an analysis) — the user's rule: off-topic answers are answered well but not kept.
+    return json({ text, voice: voiceText, audioBase64, mime: "audio/mpeg", isError: false, meal: loggedMeal, logFailed, scope });
   } catch (e) {
     return json({ text: `Erreur serveur: ${(e as Error)?.message ?? e}`, isError: true });
   }

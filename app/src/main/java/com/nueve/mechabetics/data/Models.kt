@@ -52,7 +52,11 @@ data class SavedAccount(
 
 data class GraphSnapshot(
     val current: GlucoseReading?,
-    val history: List<GlucoseReading>
+    val history: List<GlucoseReading>,
+    // End of the sensor's 14-day life (LibreLinkUp connection.sensor.a + 14 d), null when the API
+    // didn't include the sensor block. Past this instant the readings stop: the UI shows CAPTEUR
+    // EXPIRÉ instead of a generic NO SIGNAL, and the AI is told the real cause.
+    val sensorEndMs: Long? = null
 )
 
 sealed class LibreResult<out T> {

@@ -58,6 +58,7 @@ fun InsulinScreen(
     onDataChanged: () -> Unit = {},
 ) {
     val s = LocalStrings.current
+    val bgS = bgStringsFor(lang)
     val scope = rememberCoroutineScope()
     var doses by remember { mutableStateOf<List<AnalysisService.InsulinDose>>(emptyList()) }
     var recentMeals by remember { mutableStateOf<List<AnalysisService.RecentMeal>>(emptyList()) } // for the sugar-vs-insulin tug (NB: `meals` is the MealsService param)
@@ -121,9 +122,13 @@ fun InsulinScreen(
 
     // Estimated insulin-on-board: linear decay over each dose's insulin-type duration (Fiasp ≈ 4 h,
     // regular ≈ 6 h) — mirrors the server's activeIob / insulinActionMinutes.
+    // BASAL (slow/background, e.g. Lantus/Tresiba) is NOT correction insulin-on-board — exclude it,
+    // exactly like the server's activeIob (doseGuard.ts skips kind=="basal"). Counting a 10 u Lantus
+    // here overstated "insuline encore active" by ~5 u (and via an unknown name fell back to a wrong
+    // 4 h decay). IOB = RAPID doses only.
     val iob = remember(doses) {
         val now = System.currentTimeMillis()
-        doses.sumOf { d ->
+        doses.filter { it.kind != "basal" }.sumOf { d ->
             val durMin = (insulinActionMinutes(d.name) ?: DEFAULT_INSULIN_ACTION_MIN).toDouble()
             val mins = (now - d.ts) / 60000.0
             if (mins in 0.0..durMin) d.units * (1 - mins / durMin) else 0.0
@@ -189,7 +194,7 @@ fun InsulinScreen(
                         else -> {
                             Text(s.insulinRecent, color = InkDim, fontSize = 11.sp, fontWeight = FontWeight.Bold, letterSpacing = 2.sp)
                             doses.forEach { d ->
-                                InsulinRow(d, s) {
+                                InsulinRow(d, s, bgS.dosePlanned) {
                                     editingDose = d; units = fmtUnits(d.units); name = d.name ?: ""
                                     doseKind = d.kind ?: "rapid"; doseWhen = d.ts; showAdd = true
                                 }
@@ -314,7 +319,9 @@ fun InsulinScreen(
                         onPick = { n, k -> name = n; doseKind = k },
                         s = s
                     )
-                    WhenPicker(doseWhen, { doseWhen = it }, AccentGreen)
+                    // allowFuture: a dose you're GOING to take can be logged ahead (e.g. "ce soir
+                    // 19 h") — it stays out of insulin-on-board until its time arrives.
+                    WhenPicker(doseWhen, { doseWhen = it }, AccentGreen, allowFuture = true, tomorrowLabel = bgS.whenTomorrow)
                     // When editing an existing dose, allow deleting it from here.
                     editingDose?.let { ed ->
                         TextButton(onClick = {
@@ -494,9 +501,11 @@ private fun SettingLine(text: String) {
 // Same visual style as the meal rows (bold primary line + muted sub-line + a right-side tag) so the
 // two history lists feel consistent.
 @Composable
-private fun InsulinRow(d: AnalysisService.InsulinDose, s: Strings, onEdit: () -> Unit) {
+private fun InsulinRow(d: AnalysisService.InsulinDose, s: Strings, plannedTag: String = "", onEdit: () -> Unit) {
     val fmt = remember { SimpleDateFormat("dd/MM HH:mm", Locale.getDefault()) }
     val isBasal = d.kind == "basal"
+    // A future-dated dose is PLANNED (not yet injected — excluded from insulin-on-board): tag it.
+    val isFuture = d.ts > System.currentTimeMillis()
     Surface(
         color = CardWhite, shape = RoundedCornerShape(12.dp),
         border = BorderStroke(1.dp, BorderLight), modifier = Modifier.fillMaxWidth()
@@ -511,7 +520,11 @@ private fun InsulinRow(d: AnalysisService.InsulinDose, s: Strings, onEdit: () ->
                     "${fmtUnits(d.units)} u" + if (!d.name.isNullOrBlank()) " ${d.name}" else "",
                     color = InkPrimary, fontSize = 14.sp, fontWeight = FontWeight.Bold
                 )
-                Text(fmt.format(Date(d.ts)), color = InkDim, fontSize = 11.sp)
+                Text(
+                    (if (isFuture && plannedTag.isNotBlank()) "$plannedTag · " else "") + fmt.format(Date(d.ts)),
+                    color = if (isFuture) AccentGreen else InkDim, fontSize = 11.sp,
+                    fontWeight = if (isFuture) FontWeight.Bold else FontWeight.Normal
+                )
             }
             Surface(
                 color = (if (isBasal) InkMuted else AccentGreen).copy(alpha = 0.15f),

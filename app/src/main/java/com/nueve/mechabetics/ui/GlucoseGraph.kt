@@ -80,14 +80,17 @@ private fun clusterEvents(events: List<GraphEvent>, gapMs: Long = 3 * 60_000): L
 private fun fmtUnitsShort(u: Double): String =
     if (u == u.toLong().toDouble()) u.toLong().toString() else u.toString().replace('.', ',')
 
-/** Build chart markers from the logged doses + EATEN meals (planned meals aren't on board yet). */
+/** Build chart markers from the logged doses + EATEN meals (planned meals aren't on board yet).
+ *  A FUTURE-dated (planned) dose is skipped the same way: the curve has no point at its time yet —
+ *  the marker appears naturally once that time arrives. */
 fun buildGraphEvents(
     insulin: List<AnalysisService.InsulinDose>,
     meals: List<AnalysisService.RecentMeal>
 ): List<GraphEvent> {
+    val now = System.currentTimeMillis()
     val out = ArrayList<GraphEvent>(insulin.size + meals.size)
     for (d in insulin) {
-        if (d.units <= 0) continue
+        if (d.units <= 0 || d.ts > now + 120_000L) continue
         out += GraphEvent(d.ts, true, "${fmtUnitsShort(d.units)} u${d.name?.takeIf { it.isNotBlank() }?.let { " $it" } ?: ""}")
     }
     for (m in meals) {

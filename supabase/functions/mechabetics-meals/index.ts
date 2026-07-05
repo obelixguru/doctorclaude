@@ -2,6 +2,7 @@ import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "jsr:@supabase/supabase-js@2";
 import { accessSubject } from "../_shared/access.ts";
 import { chatJson } from "../_shared/llm.ts";
+import { carbEstimationRules } from "../_shared/doseGuard.ts";
 
 const DEEPSEEK_API_KEY = Deno.env.get("MECHABETICS_DEEPSEEK_API_KEY") ?? "";
 const DEEPSEEK_MODEL = Deno.env.get("MECHABETICS_DEEPSEEK_MODEL") ?? "deepseek-v4-flash";
@@ -16,7 +17,7 @@ async function estimateCarbs(description: string, geminiKey?: unknown): Promise<
   try {
     const raw = await chatJson(
       {
-        system: `Tu estimes les glucides d'un aliment pour une personne diabétique. Réponds UNIQUEMENT en JSON {"carbsG":<grammes entiers pour une portion standard>}. Pas de texte.`,
+        system: `Tu estimes les glucides d'un aliment pour une personne diabétique. ${carbEstimationRules("fr")} Réponds UNIQUEMENT en JSON {"carbsG":<grammes entiers de glucides pour TOUT ce qui est décrit>}. Pas de texte.`,
         user: `Aliment : ${description}`,
         temperature: 0,
         maxTokens: 200,
@@ -51,13 +52,17 @@ function json(obj: unknown, status = 200): Response {
   return new Response(JSON.stringify(obj), { status, headers: { ...CORS, "content-type": "application/json" } });
 }
 
-/** A client-supplied epoch-ms (backdating a forgotten meal/dose), clamped to a sane window
- *  [now-14d, now+2min]. Returns an ISO string, or null when absent (=> DB stamps now). */
+/** A client-supplied epoch-ms (backdating a forgotten meal/dose, or PLANNING one ahead), clamped to
+ *  a sane window [now-14d, now+36h]. The future side enables planned meals (`planned` derives from a
+ *  future ts) and planned insulin doses — every IOB computation (server activeIob + the 3 client
+ *  sites) ignores a dose whose ts hasn't arrived yet, so a planned dose can't silence a HIGH alarm
+ *  or shrink a correction before it's actually injected. Returns an ISO string, or null when absent
+ *  (=> DB stamps now). */
 function clampTs(raw: unknown): string | null {
   const t = Number(raw);
   if (!Number.isFinite(t) || t <= 0) return null;
   const now = Date.now();
-  return new Date(Math.max(now - 14 * 24 * 3600 * 1000, Math.min(t, now + 120000))).toISOString();
+  return new Date(Math.max(now - 14 * 24 * 3600 * 1000, Math.min(t, now + 36 * 3600 * 1000))).toISOString();
 }
 
 /** Quantity multiplier (ate the same item N times), clamped to a sane 1..50. carbs_g stays the

@@ -34,12 +34,14 @@ import com.nueve.mechabetics.data.MealReminderReceiver
 import com.nueve.mechabetics.data.Predictor
 import com.nueve.mechabetics.data.Trend
 import com.nueve.mechabetics.data.cleanGlucoseSeries
+import com.nueve.mechabetics.data.glucoseRisingNow
 import com.nueve.mechabetics.data.insulinActionMinutes
 import com.nueve.mechabetics.data.DEFAULT_INSULIN_ACTION_MIN
 import com.nueve.mechabetics.data.local.LocalHistoryDb
 import com.nueve.mechabetics.ui.AppHeader
 import com.nueve.mechabetics.ui.ConsentScreen
 import com.nueve.mechabetics.ui.DashboardScreen
+import com.nueve.mechabetics.ui.NetworkBanner
 import com.nueve.mechabetics.ui.ServiceHealthBanner
 import com.nueve.mechabetics.ui.colorFor
 import com.nueve.mechabetics.ui.theme.AccentGreen
@@ -47,6 +49,7 @@ import com.nueve.mechabetics.ui.theme.GlucoseStatus
 import com.nueve.mechabetics.ui.theme.statusOf
 import com.nueve.mechabetics.ui.Safety
 import com.nueve.mechabetics.ui.SafetyModal
+import com.nueve.mechabetics.ui.BatteryExemptionDialog
 import com.nueve.mechabetics.ui.HistoryScreen
 import com.nueve.mechabetics.ui.NotificationSettingsScreen
 import com.nueve.mechabetics.ui.Lang
@@ -69,6 +72,7 @@ import com.nueve.mechabetics.ai.ProfileService
 import com.nueve.mechabetics.ui.DoctorClaudeBottomBar
 import com.nueve.mechabetics.ui.FoodScreen
 import com.nueve.mechabetics.ui.InsulinScreen
+import com.nueve.mechabetics.ui.PatientChoice
 import com.nueve.mechabetics.ui.ProfileItem
 import com.nueve.mechabetics.ui.ProfileScreen
 import com.nueve.mechabetics.ui.Tab
@@ -117,6 +121,10 @@ class MainActivity : ComponentActivity() {
         // Meal-time reminders (08/12/16/20h) — only if the user kept them on in Profile.
         if (store.mealRemindersEnabled) MealReminderReceiver.schedule(this)
 
+        // Track real phone connectivity so the global "réseau perdu" banner can warn that the app is
+        // limited (online-only: glucose, coach + saves all need the network) until it comes back.
+        NetworkMonitor.start(this)
+
         // Start always-on monitoring so polling + hypo/hyper alarms keep running when the app is
         // backgrounded / the screen is off (the MonitorService is the sole poller now).
         if (store.token != null) MonitorService.start(this)
@@ -149,6 +157,12 @@ class MainActivity : ComponentActivity() {
     private fun AppRoot() {
         val state by repo.state.collectAsStateWithLifecycle()
         val isSpeaking by ai.speaking.collectAsStateWithLifecycle()
+        // Sensor past its 14-day life (LibreLinkUp activation + 14 d). Drives the home CAPTEUR
+        // EXPIRÉ card (via sensorEndMs below) and is flagged to every AI call so a lost signal is
+        // explained by its real cause (replace the sensor — not "re-scan"). Recomputed on every
+        // state emission (each 60 s poll flips isLoading, so this stays fresh even with no reading).
+        val sensorExpired = state.sensorEndMs?.let { System.currentTimeMillis() > it } == true
+        LaunchedEffect(sensorExpired) { ai.sensorExpired = sensorExpired }
         // Pre-fill the last saved analysis (per patient) so the homepage report is shown immediately
         // and never "disappears" — it persists across restarts and stays visible with its timestamp.
         var aiText by remember { mutableStateOf(if (store.lastReportPatient == store.patientId) store.lastReportText.orEmpty() else "") }
@@ -180,6 +194,9 @@ class MainActivity : ComponentActivity() {
         var addingAccount by remember { mutableStateOf(false) }
         var consented by remember { mutableStateOf(store.consentVersion >= Safety.CONSENT_VERSION) }
         var showSafety by remember { mutableStateOf(false) }
+        // One-time prompt to whitelist the app from battery optimization so monitoring keeps polling
+        // with the screen off (Doze). Shown once per install when logged in and not yet exempt.
+        var showBatteryPrompt by remember { mutableStateOf(false) }
         var mealNudge by remember { mutableStateOf(false) }
         // Insulin-on-board from recent rapid doses — silences the HIGH alarm/banner when a
         // correction is already working (so it stops nagging after you've taken insulin).
@@ -252,18 +269,23 @@ class MainActivity : ComponentActivity() {
                 h.tir24h?.let { stat24Tir = it }
                 h.pctHigh24h?.let { stat24High = it }
                 h.pctLow24h?.let { stat24Low = it }
-                // Insulin-on-board (recent rapid doses, ~4 h linear decay).
+                // Insulin-on-board (recent RAPID doses, ~4 h linear decay). BASAL (slow/background,
+                // e.g. Lantus) is NOT correction IOB and must be EXCLUDED — mirrors the server's
+                // activeIob (which skips kind=="basal"). Otherwise a 10 u Lantus both inflated the IOB
+                // and SILENCED the HIGH alarm for hours (recentInsulinIob gates the HIGH alarm/banner).
                 val iNow = System.currentTimeMillis()
-                recentInsulinIob = h.insulin.sumOf { d ->
+                val rapidDoses = h.insulin.filter { it.kind != "basal" }
+                recentInsulinIob = rapidDoses.sumOf { d ->
                     val dur = (insulinActionMinutes(d.name) ?: DEFAULT_INSULIN_ACTION_MIN).toDouble()
                     val mins = (iNow - d.ts) / 60000.0
                     if (mins in 0.0..dur) d.units * (1 - mins / dur) else 0.0
                 }.coerceAtLeast(0.0)
                 iobReady = true // IOB now known → the HIGH alarm may evaluate (see the alert effect)
-                // Share the raw doses (with their insulin name) with the repo so the background
-                // MonitorService can compute a type-aware IOB for its HIGH-alarm suppression even
-                // while the app is closed (doses can't change then).
-                repo.setInsulinDoses(h.insulin.map { Triple(it.ts, it.units, it.name) })
+                // Share the RAPID doses (name kept for type-aware decay) with the repo so the
+                // background MonitorService computes the same IOB for its HIGH-alarm suppression while
+                // the app is closed. Basal is filtered out HERE (the Triple carries no kind, so the
+                // monitor could not exclude it itself) — it must never silence the HIGH alarm.
+                repo.setInsulinDoses(rapidDoses.map { Triple(it.ts, it.units, it.name) })
                 // Last EATEN (non-planned) meal, in minutes, mirroring the server's
                 // minutesSinceLastRescue (drop planned, ignore >1 min future, round to minutes) so the
                 // LOW banner agrees with the spoken analysis.
@@ -272,6 +294,24 @@ class MainActivity : ComponentActivity() {
                 rescueRecent = minSinceRescue != null && minSinceRescue in 0..RESCUE_WINDOW_MIN
                 // Share it with the repo so the BACKGROUND MonitorService's LOW alarm is rescue-aware too.
                 repo.setLastRescueMs(lastRescueMs ?: 0L)
+                // Meal nudge ("ça monte sans repas enregistré") — computed LIVE here, every reading,
+                // instead of trusting the server's sticky flag. Two bugs came from the old flag:
+                //  (1) it was set on a rising trend and NEVER cleared when the rise ended, so it
+                //      lingered on the home screen for hours (stale); (2) its 90-min window was shorter
+                //      than how long a meal keeps glucose up (~2–3 h), so it nagged "log a meal" long
+                //      after breakfast WAS logged. Now the nudge shows ONLY while glucose is actually
+                //      rising, > 140, signal fresh, not at night, AND no meal logged in the last 3 h —
+                //      re-evaluated on every reading, so it appears/disappears with the real situation
+                //      and can never go stale. (Server still computes its own mealNudge for the AI's
+                //      WORDING; the banner no longer depends on it.)
+                val lastMealMs = h.meals.maxOfOrNull { it.ts }
+                val mealLoggedRecently = lastMealMs != null && iNow - lastMealMs <= 180 * 60_000L
+                val localHour = java.util.Calendar.getInstance().get(java.util.Calendar.HOUR_OF_DAY)
+                val isNight = localHour < 7 || localHour >= 23
+                val liveFresh = state.current?.let { iNow - it.timestampMs <= GlucoseAlert.FRESHNESS_WINDOW_MS } ?: false
+                val curVal = state.current?.valueMgDl
+                mealNudge = !isNight && liveFresh && !mealLoggedRecently &&
+                    curVal != null && curVal > 140 && glucoseRisingNow(state.history)
             }
         }
         val graph24 = remember(history24, state.history, state.current) {
@@ -355,7 +395,6 @@ class MainActivity : ComponentActivity() {
                                 r.tir24h?.let { stat24Tir = it }
                                 r.pctHigh24h?.let { stat24High = it }
                                 r.pctLow24h?.let { stat24Low = it }
-                                mealNudge = r.mealNudge
                             }
                         } catch (e: Exception) {
                             android.util.Log.e("Dashboard", "auto-greet analyze failed", e)
@@ -405,7 +444,6 @@ class MainActivity : ComponentActivity() {
                             r.tir24h?.let { stat24Tir = it }
                             r.pctHigh24h?.let { stat24High = it }
                             r.pctLow24h?.let { stat24Low = it }
-                            mealNudge = r.mealNudge
                         } catch (e: Exception) {
                             android.util.Log.e("Dashboard", "lang-change analyze failed", e)
                             if (aiText.isBlank()) { aiText = stringsFor(lang).aiError; aiLang = code }
@@ -526,7 +564,9 @@ class MainActivity : ComponentActivity() {
                                 aiText = r.text; aiAt = System.currentTimeMillis(); aiLang = code; aiIsReport = false
                             } catch (e: Exception) {
                                 android.util.Log.e("Dashboard", "hypo auto-analyze failed", e)
-                                if (aiText.isBlank()) { aiText = stringsFor(lang).aiError; aiLang = code }
+                                // Fresh timestamp so the error is shown as current, not instantly aged
+                                // out into the "refaire une analyse" prompt by the 20-min freshness rule.
+                                if (aiText.isBlank()) { aiText = stringsFor(lang).aiError; aiAt = System.currentTimeMillis(); aiLang = code }
                             } finally {
                                 aiLoading = false
                             }
@@ -541,6 +581,14 @@ class MainActivity : ComponentActivity() {
             if (consented && state.isLoggedIn &&
                 System.currentTimeMillis() - store.lastSafetyPromptMs > Safety.SAFETY_PROMPT_INTERVAL_MS
             ) showSafety = true
+        }
+
+        // One-time "let the app run in the background" prompt — the keystone for monitoring to keep
+        // scanning in standby (esp. Samsung One UI). Offered once; thereafter it's in Notifications.
+        LaunchedEffect(state.isLoggedIn, consented) {
+            if (consented && state.isLoggedIn && !store.batteryPromptShown &&
+                !PowerExemption.isExempt(this@MainActivity)
+            ) showBatteryPrompt = true
         }
 
         CompositionLocalProvider(LocalStrings provides stringsFor(lang)) {
@@ -575,6 +623,9 @@ class MainActivity : ComponentActivity() {
             }) { pad ->
                 Box(Modifier.padding(pad)) {
                   Column(Modifier.fillMaxSize()) {
+                    // GLOBAL "phone offline" banner — visible on EVERY tab. Shown FIRST because no
+                    // network is the root cause; the backend-health banner stays hidden while offline.
+                    NetworkBanner(lang)
                     // GLOBAL "something fell" banner — visible on EVERY tab. Any backend call that
                     // fails (history/stats/DB/AI/credits) raises it; a later success clears it.
                     ServiceHealthBanner()
@@ -640,6 +691,7 @@ class MainActivity : ComponentActivity() {
                 serverLow = stat24Low,
                 isLoading = state.isLoading,
                 lastUpdateMs = state.lastUpdateMs,
+                sensorEndMs = state.sensorEndMs,
                 error = state.error,
                 aiText = aiText,
                 aiAt = aiAt,
@@ -685,7 +737,6 @@ class MainActivity : ComponentActivity() {
                                 r.tir24h?.let { stat24Tir = it }
                                 r.pctHigh24h?.let { stat24High = it }
                                 r.pctLow24h?.let { stat24Low = it }
-                                mealNudge = r.mealNudge
                                 val h = ai.history(state.patientId, 1)
                                 if (h.readings.isNotEmpty()) history24 = h.readings
                                 h.avg24h?.let { stat24Avg = it }
@@ -694,7 +745,9 @@ class MainActivity : ComponentActivity() {
                                 h.pctLow24h?.let { stat24Low = it }
                             } catch (e: Exception) {
                                 android.util.Log.e("Dashboard", "analyze failed", e)
-                                if (aiText.isBlank()) { aiText = stringsFor(lang).aiError; aiLang = lang.code.lowercase() }
+                                // Fresh timestamp so the error is shown as current, not instantly aged
+                                // out into the "refaire une analyse" prompt by the 20-min freshness rule.
+                                if (aiText.isBlank()) { aiText = stringsFor(lang).aiError; aiAt = System.currentTimeMillis(); aiLang = lang.code.lowercase() }
                             } finally {
                                 aiLoading = false
                             }
@@ -764,6 +817,29 @@ class MainActivity : ComponentActivity() {
                             },
                             onClearLocalData = { repo.clearLocalData() },
                             onOpenNotifications = { showNotifSettings = true },
+                            patients = state.connections.map { c ->
+                                PatientChoice(
+                                    patientId = c.patientId,
+                                    label = "${c.firstName} ${c.lastName}".trim().ifBlank { c.patientId },
+                                    active = c.patientId == state.patientId
+                                )
+                            },
+                            onSwitchPatient = { pid ->
+                                val nm = state.connections.firstOrNull { it.patientId == pid }
+                                    ?.let { "${it.firstName} ${it.lastName}".trim() }
+                                    .orEmpty()
+                                lifecycleScope.launch {
+                                    ai.stopSpeaking()
+                                    AlarmService.stop(this@MainActivity)
+                                    aiText = ""; aiLang = ""; autoGreeted = false
+                                    repo.switchPatient(pid, nm)
+                                    MonitorService.start(this@MainActivity)
+                                    tab = Tab.GLUCOSE
+                                }
+                            },
+                            onRefreshPatients = {
+                                lifecycleScope.launch { if (state.isLoggedIn) repo.refreshConnections() }
+                            },
                             header = { tabHeader(stringsFor(lang).tabProfile, true) }
                         )
                     }
@@ -817,6 +893,22 @@ class MainActivity : ComponentActivity() {
                 store.lastSafetyPromptMs = System.currentTimeMillis()
                 showSafety = false
             })
+        }
+        if (showBatteryPrompt) {
+            BatteryExemptionDialog(
+                lang = lang,
+                onAllow = {
+                    // Mark BEFORE launching the system dialog (it bounces us through onStop/onResume,
+                    // which would otherwise re-trigger the prompt).
+                    store.batteryPromptShown = true
+                    showBatteryPrompt = false
+                    PowerExemption.request(this@MainActivity)
+                },
+                onLater = {
+                    store.batteryPromptShown = true
+                    showBatteryPrompt = false
+                }
+            )
         }
         }
         }
