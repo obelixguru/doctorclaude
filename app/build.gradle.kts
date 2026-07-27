@@ -18,6 +18,15 @@ android {
     }
 
     buildTypes {
+        debug {
+            // Install the test build ALONGSIDE the one already on the phone instead of colliding with
+            // it. Same applicationId + a different signing key is exactly what makes Android answer
+            // "Application non installée": the installed app is signed with a release key that isn't
+            // in this repo, so a debug APK can never replace it in place. A distinct id sidesteps
+            // that entirely and, more importantly, leaves the working app and its data untouched.
+            applicationIdSuffix = ".debug"
+            versionNameSuffix = "-test"
+        }
         release {
             isMinifyEnabled = false
             proguardFiles(
