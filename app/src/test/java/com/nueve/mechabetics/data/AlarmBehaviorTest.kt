@@ -70,6 +70,50 @@ class AlarmBehaviorTest {
         assertTrue("a hypo dropping into severe re-sounds despite the snooze", d.ring)
     }
 
+    // ── HIGH escalates on VALUE (the Telegram 50-palier), never on a timer ──────────────────────
+    // The complaint: sitting high re-rang every 20 min for a situation already known and already
+    // corrected. A HIGH now breaks its silence only by crossing a new multiple of 50 further out.
+
+    @Test
+    fun sittingHigh_neverReRingsOnTime_evenHoursLater() {
+        val fourHours = now + 4 * 60 * 60 * 1000L
+        val d = AlarmEngine.decide(alert(AlertKind.HIGH, 245), book("HIGH", now, 250), fourHours)
+        assertFalse("a hyper stuck in the same palier stays quiet however long it lasts", d.ring)
+    }
+
+    @Test
+    fun highCrossingANewPalier_reRings() {
+        // Rang at 250; drifting to 262 is the same 250-palier → silent…
+        assertFalse(AlarmEngine.decide(alert(AlertKind.HIGH, 262), book("HIGH", now, 250), now + 60_000).ring)
+        // …reaching 300 is a genuinely worse palier → rings, and the new value is remembered.
+        val worse = AlarmEngine.decide(alert(AlertKind.HIGH, 302), book("HIGH", now, 250), now + 60_000)
+        assertTrue("crossing into the next 50-palier re-rings", worse.ring)
+        assertEquals(302, worse.book.lastAlarmValue)
+    }
+
+    @Test
+    fun highDriftingDown_doesNotReRing() {
+        // 250 → 210 crosses a palier boundary DOWNWARD; it is improving, so it must stay silent.
+        val d = AlarmEngine.decide(alert(AlertKind.HIGH, 210), book("HIGH", now, 250), now + 60_000)
+        assertFalse("an improving hyper never re-rings", d.ring)
+    }
+
+    @Test
+    fun firstHighOfAnEpisode_ringsWhateverThePalier() {
+        val d = AlarmEngine.decide(alert(AlertKind.HIGH, 185), book(null), now)
+        assertTrue("the first alert of a hyper episode always sounds", d.ring)
+        // …then 200 is the next palier and sounds again, matching the Telegram cadence 180 → 200 → 250.
+        assertTrue(AlarmEngine.decide(alert(AlertKind.HIGH, 205), d.book, now + 60_000).ring)
+    }
+
+    @Test
+    fun lowKeepsItsTimeSnooze_andItsFinerEscalation() {
+        // The hypo path is deliberately untouched: still snoozes on time…
+        assertFalse(AlarmEngine.decide(alert(AlertKind.LOW, 64), book("LOW", now, 65), now + 60_000).ring)
+        // …and still escalates on a 10 mg/dL further drop, finer than the monitor's 15.
+        assertTrue(AlarmEngine.decide(alert(AlertKind.LOW, 55), book("LOW", now, 65), now + 60_000).ring)
+    }
+
     // ── AlarmPolicy ─────────────────────────────────────────────────────────────────────────────
 
     private fun settings(

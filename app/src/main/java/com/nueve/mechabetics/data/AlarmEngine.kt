@@ -51,7 +51,19 @@ object AlarmEngine {
             alert.value <= book.lastAlarmValue - GlucoseAlert.HYPO_ESCALATE_DROP ||
             (alert.value < GlucoseAlert.SEVERE_LOW && book.lastAlarmValue >= GlucoseAlert.SEVERE_LOW)
         )
-        val snoozed = !newEpisode && !worseningHypo && (nowMs - book.lastAlarmMs) < GlucoseAlert.SNOOZE_MS
+        // A HIGH escalates on VALUE, not on a timer: it re-sounds only when it crosses a new
+        // GlucoseAlert.PALIER boundary further out (…, 200, 250, 300) — the Telegram monitor's rule.
+        // A time snooze re-rang every 20 min for a hyper the parent already knew about and had already
+        // corrected; that is the alarm fatigue this removes.
+        val worseningHigh = alert.kind == AlertKind.HIGH && book.lastAlarmValue > 0 &&
+            (alert.value / GlucoseAlert.PALIER) > (book.lastAlarmValue / GlucoseAlert.PALIER)
+        val snoozed = !newEpisode && when (alert.kind) {
+            // Never re-ring a HIGH on elapsed time — only a genuinely worse palier breaks the silence.
+            AlertKind.HIGH -> !worseningHigh
+            // A LOW keeps the time snooze AND its finer escalation: the acute emergency stays loud.
+            AlertKind.LOW -> !worseningHypo && (nowMs - book.lastAlarmMs) < GlucoseAlert.SNOOZE_MS
+            else -> (nowMs - book.lastAlarmMs) < GlucoseAlert.SNOOZE_MS
+        }
         if (snoozed) return Decision(ring = false, book = book, recovered = false)
         return Decision(
             ring = true,

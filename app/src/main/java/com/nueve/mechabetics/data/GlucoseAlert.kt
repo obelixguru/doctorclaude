@@ -40,9 +40,21 @@ data class GlucoseAlert(
 
         // ── Ring-policy constants — ONE source of truth, shared by the foreground UI alarm and the
         //    background MonitorService so the two can never disagree. ───────────────────────────────
-        /** After a sound, the same ongoing episode stays quiet this long before it may sound again. */
+        /** After a sound, the same ongoing episode stays quiet this long before it may sound again.
+         *  Applies to LOW and RAPID_FALL only — a HIGH re-sounds on VALUE, not on a timer (see [PALIER]). */
         const val SNOOZE_MS = 20 * 60 * 1000L
-        /** A LOW that drops another this-many mg/dL since the last ring re-sounds despite the snooze. */
+        /**
+         * A HIGH re-sounds ONLY when it crosses a new multiple of this further out (…, 200, 250, 300),
+         * never on elapsed time. Ported from the Telegram monitor, whose alerting the parent asked for
+         * by name: sitting at 250 for two hours used to re-ring every 20 min (six alarms) for a
+         * situation already known and already acted on. Now it rings once at 250 and again only if it
+         * genuinely worsens to 300. The episode re-arms normally once the glucose recovers past
+         * [RECOVERY_MARGIN], so the NEXT hyper still alarms from scratch.
+         */
+        const val PALIER = 50
+        /** A LOW that drops another this-many mg/dL since the last ring re-sounds despite the snooze.
+         *  Deliberately FINER than the Telegram monitor's 15: a hypo is the acute emergency and the
+         *  escalation grid is the last thing that should be loosened. */
         const val HYPO_ESCALATE_DROP = 10
         /** Crossing below this (severe hypo) re-sounds despite the snooze. */
         const val SEVERE_LOW = 54
