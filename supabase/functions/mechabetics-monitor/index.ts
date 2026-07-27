@@ -4,12 +4,12 @@ import { Resvg, initWasm } from "https://esm.sh/@resvg/resvg-wasm@2.6.2";
 import { buildGlucoseSvg } from "../_shared/glucoseChart.ts";
 
 // ── 24/7 hypo/hyper monitor for Mechabetics ──────────────────────────────
-// Logs into LibreLinkUp (follower creds in secrets), reads the latest value, and
-// alerts the Telegram GROUP only when glucose crosses a NEW multiple-of-10 step
-// vs the LAST reading we saw — remembered in `mechabetics_monitor_state`, so there
-// are no repeats within the same ten (the old "stateless" version compared against
-// a stale graph point and re-alerted every run). Plus one "back to normal" when it
-// crosses back over LOW (70) / HIGH (170) after being red. Secrets: MECHABETICS_*.
+// Logs into LibreLinkUp (follower creds in secrets), reads the latest value, and alerts the Telegram
+// GROUP once per hypo/hyper EPISODE — plus a re-alert only when it crosses a new 50 mg/dL palier
+// further out of range (…, 250, 300…) and one "back to normal" on recovery. The episode is remembered
+// in `mechabetics_monitor_state` (alert_kind + alert_value), so a value oscillating around a threshold
+// no longer re-alerts every 5-min run (the old "multiple-of-10 step" logic stormed the parent). See
+// decideEpisode below. Secrets: MECHABETICS_*.
 
 const db = createClient(
   Deno.env.get("SUPABASE_URL")!,
@@ -27,6 +27,18 @@ const LOW = Number(Deno.env.get("MECHABETICS_LOW") ?? "70"); // hypo floor (norm
 // secret (not just this default) if you want the push alert to match the app's 180 threshold.
 const HIGH = Number(Deno.env.get("MECHABETICS_HIGH") ?? "180"); // hyper ceiling (see note above)
 const VERY_LOW = Number(Deno.env.get("MECHABETICS_VERY_LOW") ?? "50"); // 🚨 wording below this
+// Hysteresis: once an episode has alerted, we only re-arm (and announce "back to normal") after the
+// glucose comes this far back INSIDE the range — a value hovering at the threshold can't flip-flop and
+// re-alert. Mirrors GlucoseAlert.RECOVERY_MARGIN in the app.
+const RECOVERY_MARGIN = 15;
+// Re-alert while STILL out of range only when a new multiple-of-PALIER boundary is crossed FURTHER out
+// (…, 250, 300, 350 for a high) — the user's "que si ça passe un palier de 50".
+const PALIER = 50;
+// A worsening LOW escalates on a FINER grid than a high. Below the severe floor (50) the 50-palier
+// gives no further step — 0..49 is one band — so a crash 48→30→18 would go SILENT after the first
+// "TRÈS BASSE". A hypo is the acute emergency, so a LOW re-alerts on each further HYPO_ESCALATE_DROP
+// drop (and the first time it crosses into severe), all the way down.
+const HYPO_ESCALATE_DROP = 15;
 
 function H(extra: Record<string, string> = {}) {
   return {
@@ -164,25 +176,65 @@ async function telegramPhoto(png: Uint8Array, caption: string): Promise<boolean>
   return false;
 }
 
-// True if a multiple-of-10 boundary lies between the two readings.
-function tensCrossed(a: number, b: number): boolean {
-  return Math.floor(a / 10) !== Math.floor(b / 10);
-}
+// ── Alert de-spam: ONE alert per hypo/hyper EPISODE, a re-alert ONLY when it gets meaningfully WORSE
+//    (a new 50-palier for a high — 250, 300, 350; each further ~15 mg/dL for a low, which stays finer
+//    so a worsening hypo keeps escalating), and ONE "back to normal" on recovery. Replaces the old
+//    "re-alert on every 10 mg/dL wobble" that stormed the
+//    parent's Telegram every 5 min ("les notifs insupportables"). State lives in
+//    mechabetics_monitor_state: alert_kind = the episode we're in, alert_value = the glucose at the
+//    last alert (so we can tell whether a NEW palier was crossed). `name` is the patient's OWN first
+//    name (from LibreLinkUp) so an account following several people never mislabels a value.
+type EpisodeKind = "LOW" | "HIGH";
+const bandOf = (v: number): number => Math.floor(v / PALIER);
 
-// Alert only on a NEW 10 mg/dL step while out of range, + "back to normal" on return. `name` is the
-// patient's OWN first name (from LibreLinkUp) so an account following several people never mislabels
-// a value — e.g. sending the father's glucose under the son's name.
-function alertFor(prev: number, cur: number, name: string): string | null {
-  if (prev < LOW && cur >= LOW && cur <= HIGH) return `✅ <b>Glycémie de ${name} revenue à la normale</b> : ${cur} mg/dL`;
-  if (prev > HIGH && cur <= HIGH && cur >= LOW) return `✅ <b>Glycémie de ${name} revenue à la normale</b> : ${cur} mg/dL`;
-  if (cur < LOW && tensCrossed(prev, cur)) {
+function alertMessage(kind: EpisodeKind, cur: number, name: string): string {
+  if (kind === "LOW") {
     if (cur <= VERY_LOW) return `🚨 <b>Glycémie de ${name} : ${cur} mg/dL — TRÈS BASSE</b>\nResucrage immédiat (15 g de sucre rapide).`;
     return `🔻 <b>Glycémie de ${name} : ${cur} mg/dL — basse</b>`;
   }
-  if (cur > HIGH && tensCrossed(prev, cur)) {
-    return `🔺 <b>Glycémie de ${name} : ${cur} mg/dL — haute</b>`;
+  return `🔺 <b>Glycémie de ${name} : ${cur} mg/dL — haute</b>`;
+}
+
+interface EpisodeDecision {
+  message: string | null;           // text to push (null = stay silent this run)
+  alertKind: EpisodeKind | null;    // episode state to persist (null = in range / recovered)
+  alertValue: number;               // glucose at the last alert (for the next run's palier compare)
+}
+
+// Pure decision from the latest value + the persisted episode state: what (if anything) to push, and
+// what episode state to persist. No repeats within the same palier; a worsening palier re-alerts;
+// recovery is announced once (with hysteresis so a value at the edge can't re-arm and spam).
+function decideEpisode(cur: number, name: string, prevKind: string | null, prevAlertValue: number): EpisodeDecision {
+  const curKind: EpisodeKind | null = cur < LOW ? "LOW" : cur > HIGH ? "HIGH" : null;
+
+  if (curKind === null) {
+    // Back in range. If no episode was open, nothing to do.
+    if (prevKind !== "LOW" && prevKind !== "HIGH") return { message: null, alertKind: null, alertValue: 0 };
+    // Re-arm + announce "back to normal" ONCE, but only after coming clearly back inside the range
+    // (hysteresis) so a value hovering at the threshold can't flip-flop and re-alert every run.
+    const recovered =
+      (prevKind === "HIGH" && cur <= HIGH - RECOVERY_MARGIN) ||
+      (prevKind === "LOW" && cur >= LOW + RECOVERY_MARGIN);
+    if (recovered) return { message: `✅ <b>Glycémie de ${name} revenue à la normale</b> : ${cur} mg/dL`, alertKind: null, alertValue: 0 };
+    // Still settling near the edge — hold the episode open, stay silent.
+    return { message: null, alertKind: prevKind, alertValue: prevAlertValue };
   }
-  return null;
+
+  const newEpisode = prevKind !== curKind;
+  // Same episode: re-alert only when it gets genuinely WORSE than the value at the LAST alert — so an
+  // oscillation that dips back and re-crosses the same level does NOT re-alert. A HIGH steps on the
+  // 50-palier grid (250/300/350). A LOW uses a finer grid (each further HYPO_ESCALATE_DROP drop, plus
+  // the first crossing into severe) so a worsening hypo keeps escalating all the way down.
+  const worse = !newEpisode && (
+    (curKind === "HIGH" && bandOf(cur) > bandOf(prevAlertValue)) ||
+    (curKind === "LOW" && (
+      cur <= prevAlertValue - HYPO_ESCALATE_DROP ||
+      (cur <= VERY_LOW && prevAlertValue > VERY_LOW)
+    ))
+  );
+  if (newEpisode || worse) return { message: alertMessage(curKind, cur, name), alertKind: curKind, alertValue: cur };
+  // Same episode, no new palier — stay quiet ("on le sait déjà").
+  return { message: null, alertKind: curKind, alertValue: prevAlertValue };
 }
 
 async function login(): Promise<{ host: string; token: string; uid: string } | null> {
@@ -239,12 +291,10 @@ Deno.serve(async (req) => {
   }
 });
 
-// One patient's full pass: sensor-expiry alert, chart build, hypo/hyper alert decision, and state +
-// readings persistence — keyed by THIS patient's subject and named by THIS patient's firstName. All
-// the safety logic (thresholds, wording, snooze via monitor_state) is byte-for-byte the previous
-// single-patient behaviour; the only change is it runs per patient instead of only conn.data[0], and
-// says the patient's real name instead of a hardcoded "Ryan". Returns a short status string, or a
-// Response when `isFirst` and ?preview/?selftest is set (those render/send for one patient).
+// One patient's full pass: sensor-expiry alert, chart build, hypo/hyper EPISODE decision (see
+// decideEpisode), and state + readings persistence — keyed by THIS patient's subject and named by THIS
+// patient's firstName, so a value is never pushed under the wrong person's name. Returns a short status
+// string, or a Response when `isFirst` and ?preview/?selftest is set (those render/send for one patient).
 async function processPatient(
   patient: any,
   s: { host: string; token: string; uid: string },
@@ -364,28 +414,36 @@ async function processPatient(
       return new Response(ok ? "selftest: photo sent" : "selftest: photo FAILED");
     }
 
-    // Compare against the ACTUAL previous reading (remembered), not a stale graph
-    // point — this is what stops the repeated alerts.
+    // Read the EPISODE state we persisted last run (which out-of-range episode we're already alerting
+    // for, and the glucose at that last alert) — the memory that turns "alert on every reading" into
+    // "alert once per episode + on each new 50-palier".
     const { data: st, error: stErr } = await db
       .from("mechabetics_monitor_state")
-      .select("last_value")
+      .select("alert_kind, alert_value")
       .eq("subject", subject)
       .maybeSingle();
     if (stErr) {
-      // A DB read blip — NOT the same as "no prior state". Log it so the 100-default
-      // fallback below (which can cause a harmless duplicate alert) is explainable in
-      // the logs instead of looking like a silent first run.
+      // A DB read blip — log it so an unexpected (harmless) duplicate alert is explainable in the
+      // logs instead of looking like a silent first run.
       console.error(`monitor_state read failed — ${stErr.message ?? stErr}`);
     }
-    const prev = st?.last_value ?? 100; // mid-normal anchor on first run OR on a read blip (logged above)
+    const prevKind = ((st as any)?.alert_kind as string | null) ?? null;
+    const prevAlertValue = Number((st as any)?.alert_value) || 0;
 
-    const msg = alertFor(prev, cur, name);
+    const decision = decideEpisode(cur, name, prevKind, prevAlertValue);
 
-    await db.from("mechabetics_monitor_state").upsert({
+    // Persist last_value (NOT NULL → always sent) + the possibly-updated episode state every run. When
+    // the decision is "stay silent" the episode fields are written back unchanged, so the episode is
+    // remembered across runs. (An upsert only overwrites the columns it names, so the sensor-expiry
+    // marker written above is untouched.)
+    const { error: stateErr } = await db.from("mechabetics_monitor_state").upsert({
       subject,
       last_value: cur,
       updated_at: new Date().toISOString(),
+      alert_kind: decision.alertKind,
+      alert_value: decision.alertValue,
     });
+    if (stateErr) console.error(`monitor_state upsert failed — ${stateErr.message ?? stateErr}`);
 
     // Persist the fetched readings so the cloud history stays CONTINUOUS even when the app isn't
     // open — the app only saves while running, which left multi-day holes in the advanced view.
@@ -409,7 +467,8 @@ async function processPatient(
       }
     } catch (_) { /* persistence is best-effort; never block alerting */ }
 
-    if (msg) {
+    if (decision.message) {
+      const msg = decision.message;
       // Prefer the image (curve + caption); fall back to plain text so a render or
       // sendPhoto failure never costs us the alert. A rare duplicate (photo landed but
       // its response read failed) is acceptable — a missed hypo/hyper alert is not.
@@ -418,9 +477,10 @@ async function processPatient(
       if (!sent) sent = await telegram(msg);
       // Distinguish a delivered alert from a dropped one so a vanished hypo/hyper push
       // shows up in the cron's return string (and logs), not just silently in Telegram.
-      return sent ? `alert ${cur} (prev ${prev})${png ? " +img" : ""}` : `alert-SEND-FAILED ${cur} (prev ${prev})`;
+      const tag = decision.alertKind ?? "recover";
+      return sent ? `alert ${cur} (${tag})${png ? " +img" : ""}` : `alert-SEND-FAILED ${cur} (${tag})`;
     }
-    return `ok ${cur} (prev ${prev})`;
+    return `ok ${cur} (${decision.alertKind ?? "in-range"})`;
   } catch (e) {
     // One patient's failure must not abort the others — return an error string, keep looping.
     return `err(${name}): ${(e as Error)?.message ?? e}`;
