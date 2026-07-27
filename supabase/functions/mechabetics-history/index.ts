@@ -81,11 +81,35 @@ Deno.serve(async (req: Request) => {
     // Only the CURRENT language's analyses (plus legacy rows with no lang) — the bilingual prefetch
     // stores both an FR and an ES copy of each report, so without this filter the ANALYSES tab would
     // show whichever was written last (often the ES prefetch) even when the user is in French.
-    const { data: logs } = await db.from("mechabetics_coach_log")
-      .select("ts, message, glucose_at_time").eq("subject", subject)
-      .or(`lang.eq.${lang},lang.is.null`)
-      .order("ts", { ascending: false }).limit(40);
-    const analyses = (logs ?? []).map((l: any) => ({ ts: new Date(l.ts).getTime(), message: l.message, glucose: l.glucose_at_time }));
+    // Two histories share this table: the ANALYSE reports and the spoken Q&A (kind = 'voice'), split
+    // here so History can show them under their own sub-tabs instead of one mixed list. `kind` and
+    // `question` arrive with the 20260727_voice_log migration; before it runs the select errors, so
+    // we fall back to the legacy columns and every row reads as an analysis (voices simply empty).
+    let logs: any[] = [];
+    let hasKind = true;
+    {
+      const r = await db.from("mechabetics_coach_log")
+        .select("ts, message, glucose_at_time, kind, question").eq("subject", subject)
+        .or(`lang.eq.${lang},lang.is.null`)
+        .order("ts", { ascending: false }).limit(60);
+      if (r.error) {
+        hasKind = false;
+        const legacy = await db.from("mechabetics_coach_log")
+          .select("ts, message, glucose_at_time").eq("subject", subject)
+          .or(`lang.eq.${lang},lang.is.null`)
+          .order("ts", { ascending: false }).limit(40);
+        logs = legacy.data ?? [];
+      } else {
+        logs = r.data ?? [];
+      }
+    }
+    const row = (l: any) => ({
+      ts: new Date(l.ts).getTime(), message: l.message, glucose: l.glucose_at_time,
+      question: l.question ?? null,
+    });
+    // A NULL kind is a legacy row, i.e. an analysis — only an explicit 'voice' is a spoken Q&A.
+    const analyses = logs.filter((l: any) => !hasKind || l.kind !== "voice").map(row).slice(0, 40);
+    const voices = hasKind ? logs.filter((l: any) => l.kind === "voice").map(row).slice(0, 40) : [];
 
     const { data: ins } = await db.from("mechabetics_insulin")
       .select("id, ts, units, insulin_name, kind").eq("subject", subject).gte("ts", since)
@@ -107,7 +131,7 @@ Deno.serve(async (req: Request) => {
     // bar work WITHOUT the (gated) AI coach — these are plain DB aggregates, not AI.
     const { data: stats } = await db.rpc("mechabetics_stats", { p_subject: subject });
 
-    return json({ readings, analyses, insulin, meals, stats });
+    return json({ readings, analyses, voices, insulin, meals, stats });
   } catch (e) {
     return json({ readings: [], analyses: [], error: `${(e as Error)?.message ?? e}` });
   }

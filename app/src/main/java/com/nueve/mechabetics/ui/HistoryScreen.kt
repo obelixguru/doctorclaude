@@ -76,6 +76,8 @@ fun HistoryScreen(
 
     var serverReadings by remember { mutableStateOf<List<GlucoseReading>>(emptyList()) }
     var analyses by remember { mutableStateOf<List<AnalysisService.PastAnalysis>>(emptyList()) }
+    // Spoken Q&A, kept out of the home screen and browsable here under its own sub-tab.
+    var voices by remember { mutableStateOf<List<AnalysisService.PastAnalysis>>(emptyList()) }
     var events by remember { mutableStateOf<List<GraphEvent>>(emptyList()) }
     var refreshKey by remember { mutableStateOf(0) }
     var loading by remember { mutableStateOf(false) }
@@ -84,6 +86,7 @@ fun HistoryScreen(
         val r = ai.history(patientId, 14, lang.code.lowercase())
         if (r.readings.isNotEmpty()) serverReadings = r.readings
         analyses = r.analyses
+        voices = r.voices
         events = buildGraphEvents(r.insulin, r.meals)
         loading = false
     }
@@ -117,6 +120,8 @@ fun HistoryScreen(
     }
 
     var tab by remember { mutableStateOf(initialTab) } // 0 = Général (graph/stats), 1 = Historique (list), 2 = Analyses
+    // Sub-tab inside ANALYSES: 0 = the written ANALYSE reports, 1 = the spoken Q&A.
+    var aiSub by remember { mutableStateOf(0) }
 
     Column(modifier = Modifier.fillMaxSize().background(LightBg)) {
         // Top bar: back · title · language · refresh (mirrors the dashboard).
@@ -193,12 +198,28 @@ fun HistoryScreen(
                     }
                 }
             }
-            // ANALYSES : past AI reports.
-            else -> if (analyses.isEmpty()) HistEmpty(s.historyEmpty) else LazyColumn(
-                modifier = Modifier.fillMaxSize().padding(horizontal = 16.dp),
-                verticalArrangement = Arrangement.spacedBy(8.dp),
-                contentPadding = PaddingValues(vertical = 12.dp)
-            ) { items(analyses, key = { "a" + it.ts }) { a -> AnalysisHistoryCard(a) } }
+            // ANALYSES : past AI output, split into ANALYSE (written reports) and VOIX (spoken Q&A).
+            // The home screen now carries only a one-line summary + the action, so the full reports
+            // and every spoken answer live here instead of piling up on the dashboard.
+            else -> Column(Modifier.fillMaxSize()) {
+                val subTabs = listOf(s.aiSubAnalysis, s.aiSubVoice)
+                TabRow(selectedTabIndex = aiSub, containerColor = LightBg, contentColor = GlucoseStatus.GOOD.strong) {
+                    subTabs.forEachIndexed { i, label ->
+                        Tab(
+                            selected = aiSub == i,
+                            onClick = { aiSub = i },
+                            text = { Text(label, fontSize = 11.sp, fontWeight = FontWeight.Bold, letterSpacing = 0.5.sp) }
+                        )
+                    }
+                }
+                val rows = if (aiSub == 0) analyses else voices
+                if (rows.isEmpty()) HistEmpty(if (aiSub == 0) s.historyEmpty else s.voiceHistoryEmpty)
+                else LazyColumn(
+                    modifier = Modifier.fillMaxSize().padding(horizontal = 16.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                    contentPadding = PaddingValues(vertical = 12.dp)
+                ) { items(rows, key = { (if (aiSub == 0) "a" else "v") + it.ts }) { a -> AnalysisHistoryCard(a) } }
+            }
         }
     }
 }
@@ -416,8 +437,11 @@ private fun tirSplit(readings: List<GlucoseReading>): Triple<Int, Int, Int> {
     return Triple(pct(low), pct(inRange), pct(high))
 }
 
-/** The 3 value boxes — moyenne / min / max — for the window. The time-in-range split (target / low /
- *  high %) is NOT here: it's the TIR bar above, so the 3 boxes that duplicated it were removed. */
+/** The 3 value boxes for the window, ordered by VALUE — min | moyenne | max, left to right — so the
+ *  row reads low → middle → high like the glucose scale itself. (It used to be moyenne | min | max,
+ *  which put the average on the left and read as "moyen, bas, haut".) The time-in-range split
+ *  (target / low / high %) is NOT here: it's the TIR bar above, so the boxes that duplicated it were
+ *  removed. */
 @Composable
 private fun DayStats(readings: List<GlucoseReading>) {
     if (readings.size < 2) return
@@ -427,8 +451,8 @@ private fun DayStats(readings: List<GlucoseReading>) {
     val mn = values.min()
     val mx = values.max()
     Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-        MiniStat(s.average, "$avg", InkPrimary, Modifier.weight(1f))
         MiniStat("MIN", "$mn", colorFor(mn), Modifier.weight(1f))
+        MiniStat(s.average, "$avg", InkPrimary, Modifier.weight(1f))
         MiniStat("MAX", "$mx", colorFor(mx), Modifier.weight(1f))
     }
 }
@@ -446,6 +470,15 @@ private fun AnalysisHistoryCard(a: AnalysisService.PastAnalysis) {
                 if (a.glucose != null) Text("${a.glucose} mg/dL", color = colorFor(a.glucose), fontSize = 11.sp, fontWeight = FontWeight.Bold)
             }
             Spacer(Modifier.height(4.dp))
+            // A voice row leads with the question that was asked — an answer alone ("15 g de sucre
+            // rapide…") is unreadable weeks later without knowing what was asked.
+            a.question?.takeIf { it.isNotBlank() }?.let { q ->
+                Text(
+                    "« $q »", color = InkMuted, fontSize = 12.sp, lineHeight = 17.sp,
+                    fontStyle = androidx.compose.ui.text.font.FontStyle.Italic
+                )
+                Spacer(Modifier.height(6.dp))
+            }
             Text(a.message, color = InkPrimary, fontSize = 13.sp, lineHeight = 18.sp)
         }
     }

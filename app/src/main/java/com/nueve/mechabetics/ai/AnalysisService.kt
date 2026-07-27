@@ -133,10 +133,11 @@ class AnalysisService(private val context: Context) {
     /** Honest message when we can't even reach the backend (network down, timeout, Supabase paused,
      *  non-2xx). The glucose feed + alarms are INDEPENDENT (LibreLinkUp-direct), so we say so. */
     private fun transportMsg(lang: String): String =
-        if (lang == "es") "No se puede contactar con el servicio de Doctor Claude ahora. Tu glucosa y las alarmas siguen funcionando."
-        else "Service Doctor Claude injoignable pour le moment. Ta glycémie et les alarmes fonctionnent toujours."
+        if (lang == "es") "No se puede contactar con el servicio de Dr Claude ahora. Tu glucosa y las alarmas siguen funcionando."
+        else "Service Dr Claude injoignable pour le moment. Ta glycémie et les alarmes fonctionnent toujours."
 
-    data class PastAnalysis(val ts: Long, val message: String, val glucose: Int?)
+    /** A past AI entry. [question] is set only for spoken Q&A rows (History › Voix); an ANALYSE has none. */
+    data class PastAnalysis(val ts: Long, val message: String, val glucose: Int?, val question: String? = null)
     data class InsulinDose(val ts: Long, val units: Double, val name: String?, val id: Long = 0, val kind: String? = null)
     /** A logged meal (epoch ms + planned flag, plus description/carbs for the chart markers) — also
      *  mirrors the server's "rescue recent" rule so the LOW banner stops saying "take sugar". */
@@ -149,7 +150,10 @@ class AnalysisService(private val context: Context) {
         val avg24h: Int? = null,
         val tir24h: Int? = null,
         val pctHigh24h: Int? = null,
-        val pctLow24h: Int? = null
+        val pctLow24h: Int? = null,
+        /** Spoken Q&A history (History › Voix). LAST so the positional HistoryResult(...) call sites
+         *  above keep compiling. Empty until the 20260727_voice_log migration is applied. */
+        val voices: List<PastAnalysis> = emptyList()
     )
 
     data class RatioSuggestion(
@@ -446,19 +450,27 @@ class AnalysisService(private val context: Context) {
                             readings.add(GlucoseReading(o.optLong("ts"), o.optInt("value")))
                         }
                     }
-                    val analyses = mutableListOf<PastAnalysis>()
-                    j.optJSONArray("analyses")?.let { arr ->
-                        for (i in 0 until arr.length()) {
-                            val o = arr.getJSONObject(i)
-                            analyses.add(
-                                PastAnalysis(
-                                    o.optLong("ts"),
-                                    o.optString("message"),
-                                    if (o.isNull("glucose")) null else o.optInt("glucose")
+                    // "analyses" (ANALYSE reports) and "voices" (spoken Q&A) are two separate lists —
+                    // History shows them under their own sub-tabs. Same row shape, so one parser.
+                    fun pastList(key: String): List<PastAnalysis> {
+                        val out = mutableListOf<PastAnalysis>()
+                        j.optJSONArray(key)?.let { arr ->
+                            for (i in 0 until arr.length()) {
+                                val o = arr.getJSONObject(i)
+                                out.add(
+                                    PastAnalysis(
+                                        o.optLong("ts"),
+                                        o.optString("message"),
+                                        if (o.isNull("glucose")) null else o.optInt("glucose"),
+                                        if (o.isNull("question")) null else o.optString("question")
+                                    )
                                 )
-                            )
+                            }
                         }
+                        return out
                     }
+                    val analyses = pastList("analyses")
+                    val voices = pastList("voices")
                     val insulin = mutableListOf<InsulinDose>()
                     j.optJSONArray("insulin")?.let { arr ->
                         for (i in 0 until arr.length()) {
@@ -490,7 +502,8 @@ class AnalysisService(private val context: Context) {
                     HistoryResult(
                         readings, analyses, insulin, meals,
                         avg24h = stat("avg_24h"), tir24h = stat("tir_24h"),
-                        pctHigh24h = stat("pct_high_24h"), pctLow24h = stat("pct_low_24h")
+                        pctHigh24h = stat("pct_high_24h"), pctLow24h = stat("pct_low_24h"),
+                        voices = voices
                     )
                 }
             } catch (e: Exception) {
