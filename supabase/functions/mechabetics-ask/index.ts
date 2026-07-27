@@ -11,6 +11,8 @@ import {
   iobSystemLine,
   mealBolusUnits,
   combinedActionLine,
+  planMealDose,
+  mealPlanLine,
   situationHint,
   stripInsulinNumbers,
   carbsCubesPhrase,
@@ -287,7 +289,7 @@ Deno.serve(async (req: Request) => {
       .sort((a: any, b: any) => (a.ts || 0) - (b.ts || 0));
     const lastR = rds.length ? rds[rds.length - 1] : null;
     const cur = lastR ? Math.round(lastR.value) : null;
-    const series = rds.slice(-12).map((r) => Math.round(r.value)).join(", ");
+    const series = rds.slice(-12).map((r: any) => Math.round(r.value)).join(", ");
     const hasTs = !!(lastR && Number.isFinite(lastR.ts) && lastR.ts > 0);
     // No usable timestamp → treat as STALE (forces WAIT), never as fresh: a reading of unknown age
     // must not yield a dose (mirrors the coach's safe default).
@@ -326,7 +328,7 @@ Deno.serve(async (req: Request) => {
     const gp = toGuardProfile(profile);
     const dia = insulinActionMinutes(gp?.rapidInsulin) ?? 240; // insulin-type-aware decay (Fiasp≈4h, regular≈6h)
     const iob = activeIob(insulinDoses, nowMs, dia);
-    const recentHypo = hasTs ? recentHypoFrom(rds, nowMs) : rds.some((r) => r.value > 0 && r.value < 70);
+    const recentHypo = hasTs ? recentHypoFrom(rds, nowMs) : rds.some((r: any) => r.value > 0 && r.value < 70);
     // Sugar already taken recently? Don't re-recommend sugar for a low that's already being treated.
     const minSinceRescue = minutesSinceLastRescue(meals, nowMs);
     const guard = computeGuard({ glucoseMgdl: cur, trend, staleMin, iobUnits: iob, recentHypo, minSinceRescue, profile: gp });
@@ -375,10 +377,13 @@ Deno.serve(async (req: Request) => {
     // ----- CODE OWNS THE DOSE -----
     const mealCarbs = (parsed.meal && typeof parsed.meal === "object" && Number.isFinite(Number(parsed.meal.carbsG)))
       ? Math.min(300, Math.max(0, Math.round(Number(parsed.meal.carbsG)))) : null; // clamp a hallucinated/injected carb count
-    // Food fallback: only bolus carbs the user actually STATED. A vague/guessed carb count gets a
-    // "log it for a precise dose" nudge instead of a firm number (safety > convenience).
+    // Food: a meal bolus is computed from WHATEVER carb figure we have, stated or estimated. Gating
+    // it on basis === "stated" meant the model's own tag silently decided whether a dose existed at
+    // all — "je vais manger un McDo", and even a plainly stated "30 sucres" the model happened to tag
+    // "estimated", produced NO number anywhere (the reported bug). The estimate is not hidden: the
+    // mealEstimated nudge below still says to log the carbs for a precise dose.
     const mealStated = !!(parsed.meal && typeof parsed.meal === "object" && parsed.meal.basis === "stated");
-    const mealUnits = mealStated ? mealBolusUnits(mealCarbs, gp) : 0;
+    const mealUnits = mealBolusUnits(mealCarbs, gp);
     const mealEstimated = !!mealCarbs && !mealStated;
     // An ANNOUNCED future meal ("je vais manger un McDo"): its bolus happens AT EATING TIME, never
     // now — combinedActionLine words it accordingly, and the estimated case gets plannedMealNote.
@@ -446,9 +451,21 @@ Deno.serve(async (req: Request) => {
       // Show the code action line for every dose-relevant situation (incl. blocked highs:
       // falling/post-hypo/covered/stale -> explicit "aucune insuline"). Stay silent only for a
       // plain in-range reading or when there's no glucose data at all.
-      const showAction = mealUnits > 0 || !(guardForAction.reason === "in_range" || guardForAction.reason === "no_reading");
+      const showAction = mealUnits > 0 || mealPlanned || !(guardForAction.reason === "in_range" || guardForAction.reason === "no_reading");
       if (showAction) {
-        const line = combinedActionLine(guardForAction, mealUnits, lang, gp, mealPlanned);
+        // A meal that hasn't happened yet is a PROSPECTIVE question ("si je mange ça, combien ?"), not
+        // a reaction to the current glucose: answer it with the whole forward-looking plan — total
+        // dose, what the carbs would do unbolused, and when to inject for this carb speed. Reacting
+        // to the reading alone can never catch a +500 mg/dL load in time. An already-eaten meal keeps
+        // the now-oriented line.
+        const line = mealPlanned
+          ? mealPlanLine(planMealDose({
+            glucoseMgdl: cur, trend, staleMin, iobUnits: iob, carbsG: mealCarbs,
+            description: parsed.meal?.description ?? null,
+            minutesUntilMeal: Number(parsed.meal?.minutesAgo) < 0 ? -Number(parsed.meal.minutesAgo) : null,
+            minSinceRescue, recentHypo, profile: gp,
+          }), lang, gp)
+          : combinedActionLine(guardForAction, mealUnits, lang, gp, mealPlanned);
         const label = lang === "es" ? "Acción" : "Action";
         text = `${reply}\n\n${label} : ${line}`;
         voiceText = `${voice} ${line}`.trim();
@@ -459,10 +476,12 @@ Deno.serve(async (req: Request) => {
         const warn = hypoIobWarning(iob, lang);
         if (warn) { text = `${text}\n\n${warn}`; voiceText = `${voiceText} ${warn.replace("⚠️", "").trim()}`.trim(); }
       }
-      // Estimated (not user-stated) carbs -> no firm number. For an ANNOUNCED future meal, the note
-      // still says PLAINLY that insulin will be needed at eating time and whether any dose is on
-      // record (the McDo case); otherwise, the usual "log it for a precise dose" nudge.
-      if (mealEstimated && guardForAction.kind !== "sugar" && mealPlanned) {
+      // Estimated (not user-stated) carbs still get their bolus above; what changes here is the
+      // WARNING attached to it. For an ANNOUNCED future meal with no computable bolus, the note says
+      // PLAINLY that insulin will be needed at eating time and whether any dose is on record (the
+      // McDo case). Once firm units were given, that note would only repeat them in vaguer words, so
+      // the estimate is flagged by the shorter "log the carbs for a precise dose" nudge instead.
+      if (mealEstimated && guardForAction.kind !== "sugar" && mealPlanned && mealUnits <= 0) {
         const recentRapid = (insulinDoses || []).some((d: any) => {
           if (!d || d.kind === "basal") return false;
           const t = new Date(d.ts).getTime();
@@ -574,6 +593,21 @@ Deno.serve(async (req: Request) => {
         });
         if (tRes.ok) audioBase64 = toBase64(new Uint8Array(await tRes.arrayBuffer()));
       } catch (_) { /* voice optional */ }
+    }
+
+    // Persist the spoken Q&A so it is browsable later in History › Voix. Until now a voice answer
+    // existed only for as long as it was being read aloud — nothing was written anywhere, so there
+    // was no voice history to show. OFF-TOPIC answers stay transient (the user's rule: answer them
+    // well, don't keep them). Best-effort: the `kind`/`question` columns arrive with the
+    // 20260727_voice_log migration, and a logging failure must never cost the user their answer.
+    if (scope === "diabetes" && text.trim()) {
+      try {
+        // No fallback insert without `kind`: a row with kind NULL reads as an ANALYSE, so retrying
+        // without the column would file voice answers into the Analyses tab. Better to log nothing
+        // until the migration runs than to mix the two histories.
+        await db.from("mechabetics_coach_log")
+          .insert({ subject, message: text, question, glucose_at_time: cur, lang, kind: "voice" });
+      } catch (_) { /* history logging is never worth failing the answer for */ }
     }
 
     // `scope` lets the client treat a general answer as transient (spoken/shown, never persisted

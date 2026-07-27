@@ -289,7 +289,7 @@ Deno.serve(async (req: Request) => {
     const gp = toGuardProfile(profile);
     const dia = insulinActionMinutes(gp?.rapidInsulin) ?? 240; // insulin-type-aware decay (Fiasp≈4h, regular≈6h)
     const iob = activeIob(insulinDoses, nowMs, dia);
-    const recentHypo = hasTs ? recentHypoFrom(rds, nowMs) : rds.some((r) => r.value > 0 && r.value < 70);
+    const recentHypo = hasTs ? recentHypoFrom(rds, nowMs) : rds.some((r: any) => r.value > 0 && r.value < 70);
     const minSinceRescue = minutesSinceLastRescue(meals, nowMs);
     const guard = computeGuard({ glucoseMgdl: cur, trend, staleMin, iobUnits: iob, recentHypo, minSinceRescue, profile: gp });
     const hint = situationHint(guard, lang);

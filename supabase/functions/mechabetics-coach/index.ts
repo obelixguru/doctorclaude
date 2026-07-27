@@ -11,6 +11,9 @@ import {
   iobStatusPhrase,
   iobSystemLine,
   combinedActionLine,
+  mealBolusPlan,
+  planMealDose,
+  mealPlanLine,
   situationHint,
   stripInsulinNumbers,
   mealCarbSpeed,
@@ -566,7 +569,7 @@ function buildPrompt(cur: number | null, s: any, lang: string, ctx: string, swin
       noNumbers,
       `UNIDADES: en "display", glucosa en mg/dL. En "voice", di la glucosa SIN UNIDAD — solo el número (« 78 », « 218 »), NUNCA digas « mg/dL ».`,
       `REDACCIÓN: escribe frases completas; cuando des una cifra, di SIEMPRE qué cuenta ("11 bajadas rápidas", nunca "11" a secas). Responde en español.`,
-      `Responde SOLO en JSON. Rellena POR SEPARADO los 5 campos, UNA frase cada uno, dando tu OPINIÓN (no solo cifras: di si está bien o hay que vigilar, y POR QUÉ). NO uses un campo "display". Glucosa en mg/dL, SIN ninguna cifra de dosis: {"day":"<tu opinión CUALITATIVA del día: bueno o difícil y POR QUÉ (picos, bajadas rápidas) — SIN porcentaje, SIN media, SIN comparación numérica: el sistema añade la línea con cifras de hoy y la comparación con ayer>","hour":"<tu opinión sobre la ÚLTIMA HORA: sube/baja/estable, tranquilizador o a vigilar y por qué>","now":"<dónde estamos ahora y qué implica>","tip":"<un consejo concreto a mejorar>","voice":"<1-2 frases habladas, lo esencial>"}`,
+      `Responde SOLO en JSON. Rellena POR SEPARADO los 6 campos, UNA frase cada uno, dando tu OPINIÓN (no solo cifras: di si está bien o hay que vigilar, y POR QUÉ). NO uses un campo "display". Glucosa en mg/dL, SIN ninguna cifra de dosis: {"summary":"<UNA SOLA frase, lo esencial de la situación AHORA — es el único texto que se muestra en la pantalla de inicio, así que debe bastarse por sí solo y no REPETIR ningún otro campo>","day":"<tu opinión CUALITATIVA del día: bueno o difícil y POR QUÉ (picos, bajadas rápidas) — SIN porcentaje, SIN media, SIN comparación numérica: el sistema añade la línea con cifras de hoy y la comparación con ayer>","hour":"<tu opinión sobre la ÚLTIMA HORA: sube/baja/estable, tranquilizador o a vigilar y por qué>","now":"<dónde estamos ahora y qué implica>","tip":"<un consejo concreto a mejorar>","voice":"<1-2 frases habladas, lo esencial>"}`,
     ].filter(Boolean).join(" ");
   }
 
@@ -604,7 +607,7 @@ function buildPrompt(cur: number | null, s: any, lang: string, ctx: string, swin
     noNumbers,
     `UNITÉS : dans "display", glycémie en mg/dL. Dans "voice", dis la glycémie SANS UNITÉ — juste le nombre (« 78 », « 218 »), JAMAIS « mg/dL » ni « grammes par litre ».`,
     `RÉDACTION : écris des phrases complètes ; quand tu donnes un nombre, dis TOUJOURS ce qu'il compte (« 11 chutes rapides », jamais « 11 » tout seul). Réponds en français.`,
-    `Réponds UNIQUEMENT en JSON. Remplis SÉPARÉMENT les 5 champs, UNE phrase chacun, en donnant ton AVIS (pas juste des chiffres : dis si c'est bien ou à surveiller, et POURQUOI). N'utilise PAS de champ "display". Glycémie en mg/dL, AUCUN chiffre de dose : {"day":"<ton avis QUALITATIF sur la journée : bonne ou difficile et POURQUOI (pics, chutes rapides) — SANS pourcentage, SANS moyenne, SANS comparaison chiffrée : le système ajoute la ligne chiffrée d'aujourd'hui et la comparaison à hier>","hour":"<ton avis sur la DERNIÈRE HEURE : ça monte/descend/stable, est-ce rassurant ou à surveiller et pourquoi>","now":"<où on en est maintenant et ce que ça implique>","tip":"<un conseil concret à améliorer>","voice":"<1-2 phrases parlées, l'essentiel>"}`,
+    `Réponds UNIQUEMENT en JSON. Remplis SÉPARÉMENT les 6 champs, UNE phrase chacun, en donnant ton AVIS (pas juste des chiffres : dis si c'est bien ou à surveiller, et POURQUOI). N'utilise PAS de champ "display". Glycémie en mg/dL, AUCUN chiffre de dose : {"summary":"<UNE SEULE phrase, l'essentiel de la situation MAINTENANT — c'est le seul texte affiché sur l'écran d'accueil, donc il doit se suffire à lui-même et ne RÉPÉTER aucun autre champ>","day":"<ton avis QUALITATIF sur la journée : bonne ou difficile et POURQUOI (pics, chutes rapides) — SANS pourcentage, SANS moyenne, SANS comparaison chiffrée : le système ajoute la ligne chiffrée d'aujourd'hui et la comparaison à hier>","hour":"<ton avis sur la DERNIÈRE HEURE : ça monte/descend/stable, est-ce rassurant ou à surveiller et pourquoi>","now":"<où on en est maintenant et ce que ça implique>","tip":"<un conseil concret à améliorer>","voice":"<1-2 phrases parlées, l'essentiel>"}`,
   ].filter(Boolean).join(" ");
 }
 
@@ -812,6 +815,19 @@ Deno.serve(async (req: Request) => {
       if (typeof v === "string" && v.trim()) return v.trim();
       return extractStr(raw, k)?.trim() ?? "";
     };
+    // The HOME card gets ONE sentence, the DETAIL view gets the four. Stacking day + hour + now + tip
+    // on the home screen restated the same glucose four ways — "beaucoup trop d'éléments", and
+    // repetitive by construction since every field describes the same reading at a different zoom.
+    // "summary" is the model's single self-contained sentence; if it is missing we fall back to the
+    // most present-tense field rather than concatenating them again.
+    const summarySentence = (): string => {
+      const s = field("summary");
+      if (s) return s;
+      const fb = field("now") || field("day") || field("tip");
+      // Keep only the FIRST sentence of the fallback: the point is one line, not a paragraph.
+      const first = fb.split(/(?<=[.!?…])\s+/)[0]?.trim();
+      return first || fb;
+    };
     let display = [field("day"), field("hour"), field("now"), field("tip")].filter(Boolean).join("\n\n");
     if (!display) {
       // Legacy single "display" field, else a complete deterministic summary (never a half-sentence).
@@ -845,11 +861,34 @@ Deno.serve(async (req: Request) => {
     const acct = accountingLine(insulin ?? [], meals ?? [], iob, nowMs, lang);
     if (acct) display = `${display}\n\n${acct}`;
 
+    // ----- CODE OWNS THE MEAL BOLUS TOO -----
+    // The action line used to pass mealUnits = 0 unconditionally, so the analysis could NEVER name a
+    // dose for FOOD: a 120 g meal logged at 175 mg/dL fell in the in-range branch and came back
+    // "rien à corriger" (the reported bug). Carb counting does not depend on the glucose being high —
+    // an uncovered meal needs its bolus whatever the current value, and an ANNOUNCED meal needs one at
+    // eating time. The guard still owns the CORRECTION half and every no-insulin invariant (a hypo
+    // still wins inside combinedActionLine, which ignores the meal when kind === "sugar").
+    const upcomingMeal = (meals ?? []).find((m: any) => {
+      if (!m || m.planned !== true || !m.ts) return false;
+      const t = new Date(m.ts).getTime();
+      return Number.isFinite(t) && t >= nowMs - 3 * 3600 * 1000; // announced recently, or future-dated
+    }) as any;
+    // Which meal to dose and when it's due (eaten-and-uncovered outranks announced) is decided by the
+    // unit-tested helper in the guard, not here.
+    const mealPlan = mealBolusPlan(meals ?? [], insulin ?? [], nowMs, gp);
+    const mealUnits = mealPlan.units;
+    const mealPlanned = mealPlan.planned;
+
     // The analysis ALWAYS ends with a concrete action now — a blank "Action" on the (frequent) in-range
     // readings read as "the coach stopped giving advice". Only a TOTAL no-reading has nothing to say.
-    // In range we give a contextual, dose-free step (cover a just-logged meal / watch a drift / "in
-    // range, keep monitoring"); otherwise the code-owned dose action (sugar / correction / wait).
+    // In range with nothing to cover we give a contextual, dose-free step (watch a drift / "in range,
+    // keep monitoring"); otherwise the code-owned dose action (meal bolus / sugar / correction / wait).
     const showAction = signalLost || guard.reason !== "no_reading";
+    // Captured so the HOME card can reuse the exact same action text as the full report — the card is
+    // a SELECTION of the report, never a second wording of it (two phrasings of one dose is the worst
+    // possible outcome here).
+    let actionText = "";
+    let cardWarning = "";
     if (showAction) {
       // Signal lost → never append a dose off a value we don't trust; tell the user to fingerstick
       // first (matches the screen's NO SIGNAL state and the guard's stale_data safety stance).
@@ -861,9 +900,24 @@ Deno.serve(async (req: Request) => {
           : (lang === "es"
             ? "Señal perdida: reconecta el sensor (acerca el teléfono que lo escanea, vuelve a escanear); si no vuelve, hazte una punción capilar antes de cualquier decisión."
             : "Signal perdu : reconnecte le capteur (rapproche le téléphone qui le scanne, re-scanne) ; s'il ne revient pas, fais un test au doigt avant toute décision."))
-        : guard.reason === "in_range"
+        // An ANNOUNCED meal is a FORWARD-looking question: give the whole plan (total dose, what the
+        // carbs would do unbolused, when to inject for that carb speed) rather than a bare number —
+        // the point of logging a meal ahead is to know before eating, not after the rise.
+        // Also taken when the meal CANNOT be dosed (no carb ratio): mealPlanLine then says exactly
+        // that. Gating on units > 0 made an announced 120 g meal vanish behind "in range, nothing to
+        // correct" — silence about the single most important thing on the screen.
+        : (mealPlanned && mealPlan.carbsG != null)
+          ? mealPlanLine(planMealDose({
+            glucoseMgdl: cur, trend, staleMin, iobUnits: iob, carbsG: mealPlan.carbsG,
+            description: upcomingMeal?.description ?? null,
+            minSinceRescue, recentHypo, profile: gp,
+          }), lang, gp)
+        // In range AND nothing to cover -> the dose-free contextual step. As soon as there IS a meal
+        // bolus to name, combinedActionLine owns the line (meal-only or meal+correction).
+        : (guard.reason === "in_range" && mealUnits <= 0)
           ? inRangeActionLine(meals ?? [], insulin ?? [], sorted, nowMs, gp, lang)
-          : combinedActionLine(guard, 0, lang, gp);
+          : combinedActionLine(guard, mealUnits, lang, gp, mealPlanned);
+      actionText = line;
       const label = lang === "es" ? "Acción" : "Action";
       display = `${display}\n\n${label} : ${line}`;
       voice = `${voice} ${line}`.trim();
@@ -875,7 +929,10 @@ Deno.serve(async (req: Request) => {
     // IOB by the guard; this explains why and says to keep watching.
     if (guard.kind === "sugar" && !signalLost) {
       const warn = hypoIobWarning(iob, lang);
-      if (warn) { display = `${display}\n\n${warn}`; voice = `${voice} ${warn.replace("⚠️", "").trim()}`.trim(); }
+      if (warn) {
+        display = `${display}\n\n${warn}`; voice = `${voice} ${warn.replace("⚠️", "").trim()}`.trim();
+        cardWarning = warn; // safety-critical: this one earns its place on the home card
+      }
     }
 
     // A high being CORRECTED while a recent meal was logged but never bolused: its carbs (esp. slow/
@@ -883,29 +940,29 @@ Deno.serve(async (req: Request) => {
     // the potato-dinner case (why it sat at ~175 with a 120 target). Explain it + say to recheck later.
     if (guard.kind === "correction" && !signalLost) {
       const warn = uncoveredMealWarning(meals ?? [], insulin ?? [], nowMs, gp, lang);
-      if (warn) { display = `${display}\n\n${warn}`; voice = `${voice} ${warn.replace("⚠️", "").trim()}`.trim(); }
+      if (warn) {
+        display = `${display}\n\n${warn}`; voice = `${voice} ${warn.replace("⚠️", "").trim()}`.trim();
+        if (!cardWarning) cardWarning = warn; // explains why the correction alone won't hold
+      }
     }
 
     // An ANNOUNCED (planned, not-yet-eaten) meal logged in the last ~3 h: remind that it will need
     // its bolus AT EATING TIME and whether a recent dose is on record — mirrors ask's
     // plannedMealNote so "je vais manger un McDo" carries into the next ANALYSE too. Skipped during
     // a hypo (sugar first) and on a lost signal (the lost-signal action must stand alone).
-    if (guard.kind !== "sugar" && !signalLost) {
-      const upcoming = (meals ?? []).find((m: any) => {
-        if (!m || m.planned !== true || !m.ts) return false;
-        const t = new Date(m.ts).getTime();
-        return Number.isFinite(t) && t >= nowMs - 3 * 3600 * 1000; // announced recently, or future-dated
+    // Skipped when the Action line above ALREADY gave this planned meal firm units — the note would
+    // just repeat it in vaguer words ("il faudra le couvrir") right under a precise "X u au moment de
+    // manger". It still fires when no bolus could be computed (no carbs on the row, or no ratios).
+    const plannedAlreadyDosed = mealPlanned && mealPlan.carbsG != null;
+    if (guard.kind !== "sugar" && !signalLost && upcomingMeal && !plannedAlreadyDosed) {
+      const recentRapid = (insulin ?? []).some((d: any) => {
+        if (!d || d.kind === "basal") return false;
+        const t = new Date(d.ts).getTime();
+        return Number.isFinite(t) && t <= nowMs + 60000 && nowMs - t <= 45 * 60000;
       });
-      if (upcoming) {
-        const recentRapid = (insulin ?? []).some((d: any) => {
-          if (!d || d.kind === "basal") return false;
-          const t = new Date(d.ts).getTime();
-          return Number.isFinite(t) && t <= nowMs + 60000 && nowMs - t <= 45 * 60000;
-        });
-        const note = plannedMealNote(Number((upcoming as any).carbs_g) || null, recentRapid, lang);
-        display = `${display}\n\n${note}`;
-        voice = `${voice} ${note}`.trim();
-      }
+      const note = plannedMealNote(Number(upcomingMeal.carbs_g) || null, recentRapid, lang);
+      display = `${display}\n\n${note}`;
+      voice = `${voice} ${note}`.trim();
     }
 
     // The spoken voice must never read the unit aloud ("128", not "128 milligrammes par décilitre").
@@ -928,9 +985,22 @@ Deno.serve(async (req: Request) => {
       } catch (_) { /* voice optional */ }
     }
 
+    // ----- HOME CARD vs FULL REPORT -----
+    // The home screen gets ONE summary sentence + the action (+ a safety warning only when there is a
+    // genuinely critical one). Everything else — the day/hour/now/tip breakdown, the day figures, the
+    // accounting line — is DETAIL and belongs in History › Analyses, where the full report is logged.
+    // Nothing is duplicated between the two: the card's action text IS the report's action text.
+    const actionLabel = lang === "es" ? "Acción" : "Action";
+    const card = [
+      summarySentence(),
+      actionText ? `${actionLabel} : ${actionText}` : "",
+      cardWarning,
+    ].filter(Boolean).join("\n\n");
+
+    // The FULL report is what gets logged — History › Analyses stays as detailed as before.
     await db.from("mechabetics_coach_log").insert({ subject, message: display, glucose_at_time: cur, lang });
 
-    return json({ text: display, voice, audioBase64, mime: "audio/mpeg", isError: false, stats, mealNudge, predict });
+    return json({ text: card || display, detail: display, voice, audioBase64, mime: "audio/mpeg", isError: false, stats, mealNudge, predict });
   } catch (e) {
     return json({ text: `Erreur serveur: ${(e as Error)?.message ?? e}`, isError: true });
   }

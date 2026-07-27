@@ -21,6 +21,11 @@ import {
   carbSpeedAdvice,
   starchyCarbNote,
   findUncoveredMeal,
+  mealBolusPlan,
+  isHypoRescue,
+  carbsOnBoard,
+  planMealDose,
+  mealPlanLine,
   uncoveredMealWarning,
   inRangeActionLine,
   plannedMealNote,
@@ -504,4 +509,266 @@ test("iobSystemLine: authoritative system value the model must repeat, not estim
   assert.match(iobSystemLine(1.5, "fr"), /1,5 u/);
   assert.match(iobSystemLine(1.5, "fr"), /n'estime JAMAIS/);
   assert.match(iobSystemLine(0.8, "es"), /calculada por el sistema/);
+});
+
+// ---- Regression: FOOD must be dosed even when the glucose is IN RANGE ---------------------------
+// The reported failure: ~120 g of carbs ("30 sucres") logged at 175 mg/dL came back "attends d'être
+// au-dessus de 180" — no dose anywhere. Two causes, both in the CALLERS, not in the math: the coach
+// passed mealUnits = 0 unconditionally, and ask only computed a bolus when the model tagged the carbs
+// basis:"stated". The guard still owns the CORRECTION half (still none at 175, unchanged below); what
+// was missing is the MEAL bolus, which carb counting owes whatever the current glucose is.
+
+test("mealBolusPlan: uncovered eaten meal is dosed NOW, even with the glucose in range", () => {
+  const meals = [{ ts: minAgo(20), carbs_g: 120, description: "30 sucres" }];
+  const plan = mealBolusPlan(meals, [], NOW, prof);
+  assert.equal(plan.planned, false);
+  assert.equal(plan.units, 10); // 120 / 12
+  assert.equal(plan.carbsG, 120);
+  const g = computeGuard({ glucoseMgdl: 175, trend: "stable", staleMin: 2, iobUnits: 0, recentHypo: false, profile: prof });
+  assert.equal(g.reason, "in_range");      // no CORRECTION at 175 — that invariant is untouched
+  assert.equal(g.maxInsulinUnits, 0);      // …and the guard still authorises no correction insulin
+  assert.equal(combinedActionLine(g, plan.units, "fr", prof, plan.planned), "10 u de NovoRapid pour le repas.");
+});
+
+test("mealBolusPlan: announced future meal is dosed AT EATING TIME, never now", () => {
+  const meals = [{ ts: new Date(NOW + 40 * 60000).toISOString(), carbs_g: 60, description: "McDo", planned: true }];
+  const plan = mealBolusPlan(meals, [], NOW, prof);
+  assert.equal(plan.planned, true);
+  assert.equal(plan.units, 5); // 60 / 12
+  const g = computeGuard({ glucoseMgdl: 140, trend: "stable", staleMin: 2, iobUnits: 0, recentHypo: false, profile: prof });
+  assert.match(combinedActionLine(g, plan.units, "fr", prof, plan.planned), /5 u de NovoRapid AU MOMENT de manger/);
+});
+
+test("mealBolusPlan: an uncovered EATEN meal outranks an announced one (never two boluses at once)", () => {
+  const meals = [
+    { ts: minAgo(30), carbs_g: 48, description: "riz" },
+    { ts: new Date(NOW + 60 * 60000).toISOString(), carbs_g: 60, description: "McDo", planned: true },
+  ];
+  const plan = mealBolusPlan(meals, [], NOW, prof);
+  assert.equal(plan.planned, false);
+  assert.equal(plan.units, 4); // 48 / 12 — the eaten one, due now
+});
+
+test("mealBolusPlan: nothing to cover / already covered / no carb ratio -> no units", () => {
+  assert.deepEqual(mealBolusPlan([], [], NOW, prof), { units: 0, planned: false, carbsG: null });
+  const eaten = [{ ts: minAgo(30), carbs_g: 48, description: "riz" }];
+  assert.equal(mealBolusPlan(eaten, [{ ts: minAgo(30), units: 4, kind: "rapid" }], NOW, prof).units, 0);
+  // Announced meal, no ratios: carbs are known but no number may be invented — the caller then falls
+  // back to plannedMealNote's dose-free wording.
+  const p = mealBolusPlan([{ ts: new Date(NOW + 30 * 60000).toISOString(), carbs_g: 60, planned: true }], [], NOW, { weightKg: 38 });
+  assert.equal(p.units, 0);
+  assert.equal(p.planned, true);
+  assert.equal(p.carbsG, 60);
+});
+
+test("mealBolusPlan: an announced meal older than the window is ignored", () => {
+  assert.equal(mealBolusPlan([{ ts: minAgo(300), carbs_g: 60, description: "McDo", planned: true }], [], NOW, prof).units, 0);
+});
+
+test("meal bolus never overrides a hypo: sugar first, no units while low", () => {
+  const plan = mealBolusPlan([{ ts: minAgo(20), carbs_g: 120, description: "30 sucres" }], [], NOW, prof);
+  const g = computeGuard({ glucoseMgdl: 58, trend: "falling", staleMin: 2, iobUnits: 0, recentHypo: true, profile: prof });
+  const line = combinedActionLine(g, plan.units, "fr", prof, plan.planned);
+  assert.match(line, /sucre rapide/);
+  assert.doesNotMatch(line, /u de NovoRapid/);
+});
+
+// ---- PROSPECTIVE dosing: "if I eat this, how much?" ---------------------------------------------
+// The deeper report: reacting to the CURRENT glucose is useless day to day. 30 sucres (~120 g) is a
+// +500 mg/dL load on this profile — you have to know the dose BEFORE eating, not discover 350 after.
+
+const planBase = { trend: "stable" as const, staleMin: 2, iobUnits: 0, profile: prof };
+
+test("planMealDose: 120 g at 175 -> 10 u, and names the +500 mg/dL it would cause uncovered", () => {
+  const p = planMealDose({ ...planBase, glucoseMgdl: 175, carbsG: 120, description: "30 sucres" });
+  assert.equal(p.mealUnits, 10);          // 120 / 12
+  assert.equal(p.correctionUnits, 0);     // 175 is in range — no correction, invariant untouched
+  assert.equal(p.totalUnits, 10);
+  assert.equal(p.expectedRiseMgdl, 500);  // (120/12) * 50
+  assert.equal(p.projectedUncoveredMgdl, 600); // 175 + 500, clamped at the projection ceiling
+  assert.equal(p.speed, "fast");
+  assert.equal(p.timing, "prebolus");
+  const line = mealPlanLine(p, "fr", prof);
+  assert.match(line, /10 u de NovoRapid pour le repas/);
+  assert.match(line, /environ 500 mg\/dL/);
+  assert.match(line, /au-delà de 600/);
+  assert.match(line, /15 min AVANT/);
+});
+
+test("planMealDose: meal + a real high sums into ONE total, correction from the guard", () => {
+  const p = planMealDose({ ...planBase, glucoseMgdl: 250, carbsG: 60, description: "riz" });
+  assert.equal(p.mealUnits, 5);        // 60 / 12
+  assert.equal(p.correctionUnits, 3);  // (250-110)/50 = 2.8 -> 3
+  assert.equal(p.totalUnits, 8);
+  assert.match(mealPlanLine(p, "fr", prof), /8 u de NovoRapid au total \(5 u pour le repas \+ 3 u de correction\)/);
+});
+
+test("planMealDose: insulin on board is deducted from the correction, never from the meal", () => {
+  const p = planMealDose({ ...planBase, glucoseMgdl: 250, carbsG: 60, description: "riz", iobUnits: 2 });
+  assert.equal(p.mealUnits, 5);        // food still needs its full cover
+  assert.equal(p.correctionUnits, 1);  // 2.8 - 2 = 0.8 -> 1
+  assert.equal(p.totalUnits, 6);
+});
+
+test("planMealDose: falling glucose -> no correction and NEVER a pre-bolus", () => {
+  const p = planMealDose({ ...planBase, glucoseMgdl: 250, trend: "falling", carbsG: 40, description: "jus d'orange" });
+  assert.equal(p.correctionUnits, 0);   // guard: falling -> none
+  assert.equal(p.totalUnits, p.mealUnits);
+  assert.equal(p.timing, "at_meal");    // fast carbs, but falling -> no pre-bolus
+});
+
+test("planMealDose: hypo first — nothing to inject, the meal dose is deferred", () => {
+  const p = planMealDose({ ...planBase, glucoseMgdl: 58, trend: "falling", carbsG: 60, description: "pâtes" });
+  assert.equal(p.reason, "hypo_first");
+  assert.equal(p.totalUnits, 0);        // never inject while low
+  assert.equal(p.timing, "after_meal");
+  const line = mealPlanLine(p, "fr", prof);
+  assert.match(line, /^11 g de sucre rapide/); // the GRAMS lead — that is the number that matters now
+  assert.match(line, /APRÈS être remonté/);
+  assert.equal(line.match(/APRÈS/g)?.length, 1); // said once — the head owns it, no timing echo
+});
+
+test("planMealDose: slow / fatty meals get a split bolus, not a pre-bolus", () => {
+  assert.equal(planMealDose({ ...planBase, glucoseMgdl: 140, carbsG: 70, description: "pâtes complètes" }).timing, "split");
+  assert.equal(planMealDose({ ...planBase, glucoseMgdl: 140, carbsG: 90, description: "McDo" }).timing, "split");
+});
+
+test("planMealDose: stale data -> meal bolus still allowed, correction withheld", () => {
+  const p = planMealDose({ ...planBase, glucoseMgdl: 250, staleMin: 40, carbsG: 60, description: "riz" });
+  assert.equal(p.reason, "stale_no_correction");
+  assert.equal(p.correctionUnits, 0);
+  assert.equal(p.totalUnits, 5); // food is still food
+  assert.match(mealPlanLine(p, "fr", prof), /sans correction/);
+});
+
+test("planMealDose: no carb ratio -> no invented number, says what's missing", () => {
+  const p = planMealDose({ ...planBase, glucoseMgdl: 175, carbsG: 120, profile: { weightKg: 38 } });
+  assert.equal(p.reason, "no_ratios");
+  assert.equal(p.totalUnits, 0);
+  assert.match(mealPlanLine(p, "fr", { weightKg: 38 }), /ratio glucides manque/);
+});
+
+test("planMealDose: no carbs given -> asks what the meal is, no dose", () => {
+  const p = planMealDose({ ...planBase, glucoseMgdl: 175, carbsG: null });
+  assert.equal(p.reason, "no_carbs");
+  assert.equal(p.totalUnits, 0);
+  assert.match(mealPlanLine(p, "fr", prof), /Dis-moi ce que tu vas manger/);
+});
+
+test("planMealDose: ES wording mirrors FR", () => {
+  const p = planMealDose({ ...planBase, glucoseMgdl: 175, carbsG: 120, description: "30 terrones" });
+  const es = mealPlanLine(p, "es", prof);
+  assert.match(es, /10 u de NovoRapid para la comida/);
+  assert.match(es, /~500 mg\/dL/);
+  assert.match(es, /15 min ANTES/);
+});
+
+test("planMealDose: falling FAST on fast carbs -> dose still given, but cautioned", () => {
+  const p = planMealDose({ ...planBase, glucoseMgdl: 250, trend: "falling_fast", carbsG: 40, description: "jus d'orange" });
+  assert.equal(p.fastFallCaution, true);
+  assert.equal(p.mealUnits, 3.5); // a real meal on a fast fall still needs cover — we warn, not hide
+  assert.match(mealPlanLine(p, "fr", prof), /descends VITE.*ne le couvre pas/s);
+  // …and not raised for a slow meal or a steady glucose
+  assert.equal(planMealDose({ ...planBase, glucoseMgdl: 250, trend: "falling_fast", carbsG: 70, description: "pâtes" }).fastFallCaution, false);
+  assert.equal(planMealDose({ ...planBase, glucoseMgdl: 250, carbsG: 40, description: "jus d'orange" }).fastFallCaution, false);
+});
+
+test("planMealDose: during a hypo the projection is dropped — 'sugar first' must not compete", () => {
+  const line = mealPlanLine(planMealDose({ ...planBase, glucoseMgdl: 58, trend: "falling", carbsG: 70, description: "pâtes" }), "fr", prof);
+  assert.match(line, /g de sucre rapide/);
+  assert.doesNotMatch(line, /fait monter d'environ/);
+});
+
+// ---- Heading LOW before the meal can act --------------------------------------------------------
+// The gap this closes: 100 mg/dL falling with 3 u still on board is ~150 mg/dL of drop still to come.
+// The meal bolus was correct for the carbs and stated with no caveat — a right number at a wrong
+// moment. The dose stays; the TIMING moves to after the rise, and the pending drop is named.
+
+test("planMealDose: insulin on board dragging under 70 -> defer the bolus, name the floor", () => {
+  const p = planMealDose({ ...planBase, glucoseMgdl: 100, trend: "falling", iobUnits: 3, carbsG: 120, description: "30 sucres" });
+  assert.equal(p.lowBeforeMeal, true);
+  assert.equal(p.floorMgdl, -50);      // 100 − 3×50: the drop still owed, unclamped on purpose
+  assert.equal(p.timing, "after_meal");
+  assert.equal(p.mealUnits, 10);       // the carbs still need their full cover — only the timing moves
+  assert.equal(p.pendingDropMgdl, 150); // 3 u x 50 — shown instead of the nonsensical -50 floor
+  const line = mealPlanLine(p, "fr", prof);
+  assert.match(line, /va encore faire baisser d'environ 150 mg\/dL/);
+  assert.match(line, /mange d'abord/);
+  assert.doesNotMatch(line, /-50/);                       // never print a negative glucose
+  assert.equal(line.match(/mange d'abord/g)?.length, 1);  // instruction stated once, not twice
+});
+
+test("planMealDose: already low-ish AND falling, no IOB -> eat first, inject after the rise", () => {
+  const p = planMealDose({ ...planBase, glucoseMgdl: 90, trend: "falling", carbsG: 120, description: "30 sucres" });
+  assert.equal(p.lowBeforeMeal, true);
+  assert.equal(p.timing, "after_meal");
+  assert.match(mealPlanLine(p, "fr", prof), /bas et en train de descendre/);
+});
+
+test("planMealDose: falling but comfortably in range -> normal at-meal timing, no scare", () => {
+  const p = planMealDose({ ...planBase, glucoseMgdl: 150, trend: "falling", carbsG: 120, description: "30 sucres" });
+  assert.equal(p.lowBeforeMeal, false);
+  assert.equal(p.timing, "at_meal");
+  assert.doesNotMatch(mealPlanLine(p, "fr", prof), /⚠️/);
+});
+
+test("planMealDose: a real hypo still takes priority over the low-before-meal path", () => {
+  const p = planMealDose({ ...planBase, glucoseMgdl: 60, trend: "falling", iobUnits: 3, carbsG: 120, description: "30 sucres" });
+  assert.equal(p.reason, "hypo_first");
+  assert.equal(p.lowBeforeMeal, false); // hypo wording owns the message, no competing warning
+  assert.equal(p.totalUnits, 0);
+});
+
+// ---- Audit findings: a RESCUE is not a MEAL ----------------------------------------------------
+// Both directions were wrong. 15 g of sugar taken to stop a fall came back as "1,5 u for the meal"
+// (insulin advised to cover a hypo treatment), and 80 g of rice eaten 10 min before a 65 mg/dL
+// triggered the rule-of-15 hold ("you already took sugar, wait") — rice lifts nothing in 15 min.
+
+test("isHypoRescue: small fast sugar yes, a plate no, unknown quantity assumed yes", () => {
+  assert.equal(isHypoRescue({ carbs_g: 15, description: "3 sucres" }), true);
+  assert.equal(isHypoRescue({ carbs_g: 20, description: "jus d'orange" }), true);
+  assert.equal(isHypoRescue({ carbs_g: 80, description: "riz poulet" }), false);
+  assert.equal(isHypoRescue({ carbs_g: 40, description: "3 sucres" }), false); // too big to be a rescue
+  assert.equal(isHypoRescue({ carbs_g: 20, description: "pâtes" }), false);    // small but SLOW
+  assert.equal(isHypoRescue({ description: "quelque chose" }), true);          // unknown → safe side
+});
+
+test("a real MEAL does not trigger the rule-of-15 hold on a hypo", () => {
+  const meals = [{ ts: NOW - 10 * 60000, carbs_g: 80, description: "riz poulet", planned: false }];
+  assert.equal(minutesSinceLastRescue(meals, NOW), null); // rice is not a rescue
+  const g = computeGuard({ ...base, glucoseMgdl: 65, trend: "falling", minSinceRescue: minutesSinceLastRescue(meals, NOW) });
+  assert.equal(g.kind, "sugar"); // sugar IS given — the old code said "wait, you already ate"
+  // …while an actual rescue still holds
+  const rescue = [{ ts: NOW - 5 * 60000, carbs_g: 15, description: "3 sucres", planned: false }];
+  assert.equal(minutesSinceLastRescue(rescue, NOW), 5);
+});
+
+test("a hypo rescue is never advised a meal bolus", () => {
+  const rescue = [{ ts: minAgo(5), carbs_g: 15, description: "3 sucres" }];
+  assert.equal(findUncoveredMeal(rescue, [], NOW, prof), null);
+  assert.equal(mealBolusPlan(rescue, [], NOW, prof).units, 0); // used to advise 1,5 u for the sugar
+});
+
+// ---- Audit findings: in range is not always safe -----------------------------------------------
+
+test("in range but insulin on board heads under 70 -> warn instead of 'nothing to correct'", () => {
+  const doses = [{ ts: minAgo(30), units: 3.5, kind: "rapid" }];
+  const fr = inRangeActionLine([], doses, flat(90), NOW, prof, "fr");
+  assert.match(fr, /insuline active/);
+  assert.match(fr, /sous 70/);
+  assert.doesNotMatch(fr, /rien à corriger/);
+});
+
+test("a meal bolus taken WITH its meal must NOT read as an incoming hypo (no crying wolf)", () => {
+  // 2 u for 20 g eaten 10 min ago: balanced. Netting the carbs off is what keeps this quiet.
+  const meals = [{ ts: minAgo(10), carbs_g: 20, description: "2 saucisses" }];
+  const doses = [{ ts: minAgo(8), units: 2, kind: "rapid" }];
+  assert.match(inRangeActionLine(meals, doses, flat(112), NOW, prof, "fr"), /dans la cible/);
+});
+
+test("carbsOnBoard: decays over the carb-speed window, ignores planned meals", () => {
+  assert.equal(Math.round(carbsOnBoard([{ ts: minAgo(0), carbs_g: 60, description: "riz" }], NOW)), 60);
+  assert.equal(Math.round(carbsOnBoard([{ ts: minAgo(90), carbs_g: 60, description: "riz" }], NOW)), 30); // 180 min window
+  assert.equal(carbsOnBoard([{ ts: minAgo(300), carbs_g: 60, description: "riz" }], NOW), 0);
+  assert.equal(carbsOnBoard([{ ts: minAgo(10), carbs_g: 60, description: "riz", planned: true }], NOW), 0);
 });

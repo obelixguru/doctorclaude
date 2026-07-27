@@ -143,13 +143,39 @@ export function trendFromReadings(readings: { ts: number; value: number }[], _no
   return "stable";
 }
 
-/** Minutes since the last EATEN fast carbs / sugar (a hypo rescue), or null if there are none.
- *  A PLANNED (not-yet-eaten) meal doesn't count — it isn't on board. `ts` may be ISO or epoch ms.
- *  computeGuard only acts on this inside RESCUE_WINDOW_MIN, so a large value is harmless. */
+/** Above this a logged food is a MEAL, not a hypo rescue — a rescue is a few fast sugars, not a plate. */
+export const RESCUE_MAX_CARBS = 25;
+
+/**
+ * Is this logged food a HYPO RESCUE (fast sugar taken to bring a low up) rather than a meal?
+ *
+ * The distinction was missing entirely, and it cut both ways:
+ *  - `minutesSinceLastRescue` treated ANY eaten food as a rescue, so 80 g of rice eaten 10 min before
+ *    a 65 mg/dL answered "you already took sugar, let it act" — rice will not lift a hypo in 15 min.
+ *  - `findUncoveredMeal` treated a 15 g rescue as an uncovered meal, so the app advised INSULIN to
+ *    cover the sugar someone had just taken to stop a fall.
+ *
+ * Unknown carbs count as a rescue: for the rule-of-15 hold that is the safe direction, and
+ * findUncoveredMeal ignores sub-15 g entries anyway so it costs nothing there.
+ */
+export function isHypoRescue(m: { carbs_g?: number | null; carbsG?: number | null; description?: string | null }): boolean {
+  const carbs = Number(m?.carbs_g ?? m?.carbsG ?? NaN);
+  if (!Number.isFinite(carbs) || carbs <= 0) return true; // unknown quantity → assume a rescue
+  if (carbs > RESCUE_MAX_CARBS) return false;             // a plate of food is not a rescue
+  // Small AND fast (sugar, juice, soda…) — or small with no description to judge by.
+  return mealCarbSpeed(m.description) === "fast" || !m.description;
+}
+
+/** Minutes since the last EATEN fast carbs / sugar (a HYPO RESCUE), or null if there are none.
+ *  A PLANNED (not-yet-eaten) meal doesn't count — it isn't on board. A real MEAL doesn't count
+ *  either: the rule-of-15 hold is about sugar still being absorbed, not about dinner. `ts` may be
+ *  ISO or epoch ms. computeGuard only acts on this inside RESCUE_WINDOW_MIN, so a large value is
+ *  harmless. */
 export function minutesSinceLastRescue(meals: any[], nowMs: number): number | null {
   let latest = 0;
   for (const m of meals || []) {
     if (!m || m.planned === true) continue;
+    if (!isHypoRescue(m)) continue;
     const t = typeof m.ts === "number" ? m.ts : new Date(m.ts).getTime();
     if (Number.isFinite(t) && t <= nowMs + 60000 && t > latest) latest = t;
   }
@@ -569,6 +595,10 @@ export function predictiveLine(p: Predict, lang: string): string {
 // so "pain complet" never falls through to "pain blanc".
 const FAST_CARB_WORDS = [
   "sucre", "azúcar", "azucar", "sugar", "bonbon", "caramelo", "caramel", "sucette", "dragée", "dragee",
+  // "terrón/terrones" is the app's OWN Spanish word for a sugar cube (every carb figure is shown as
+  // "≈ N terrón(es)"), yet a meal logged as "30 terrones" fell through to "normal" — no pre-bolus
+  // advice on the fastest carb there is.
+  "terrón", "terron", "terrones",
   "miel", "honey", "confiture", "mermelada", "sirop", "sirope", "syrup",
   "jus de", "jus d'", "zumo", "juice", "soda", "coca", "cola", "fanta", "sprite", "pepsi",
   "limonade", "limonada", "refresco", "ice tea", "thé glacé", "smoothie",
@@ -693,6 +723,9 @@ export function findUncoveredMeal(
   let best: UncoveredMeal | null = null;
   for (const m of meals || []) {
     if (!m || m.planned === true) continue;
+    // A hypo rescue is NOT a meal to bolus. Without this, 15 g of sugar taken to stop a fall came
+    // back as "1,5 u for the meal" — insulin advised to cover the treatment for a low.
+    if (isHypoRescue(m)) continue;
     const carbs = Number(m.carbs_g ?? m.carbsG ?? 0);
     if (!Number.isFinite(carbs) || carbs < UNCOVERED_MEAL_MIN_CARBS) continue;
     const mt = typeof m.ts === "number" ? m.ts : new Date(m.ts).getTime();
@@ -715,6 +748,76 @@ export function findUncoveredMeal(
     }
   }
   return best;
+}
+
+/**
+ * Carbs still being absorbed (grams), decaying linearly over each meal's own carb-speed window.
+ *
+ * Needed to read insulin-on-board honestly: 2 u injected WITH the 20 g meal it covers is not "2 u
+ * pulling you toward a hypo", it is a balanced bolus. Without netting the food off, every single
+ * meal dose looked like an incoming low — an alarm that fires on normal behaviour is an alarm
+ * nobody reads. Planned (not-yet-eaten) meals are excluded: they are not on board.
+ */
+export function carbsOnBoard(meals: MealRow[], nowMs: number): number {
+  let g = 0;
+  for (const m of meals || []) {
+    if (!m || m.planned === true) continue;
+    const carbs = Number(m.carbs_g ?? m.carbsG ?? 0);
+    if (!Number.isFinite(carbs) || carbs <= 0) continue;
+    const t = typeof m.ts === "number" ? m.ts : new Date(m.ts).getTime();
+    if (!Number.isFinite(t)) continue;
+    const mins = (nowMs - t) / 60000;
+    if (mins < 0) continue;
+    const win = cobWindowMin(mealCarbSpeed(m.description));
+    if (mins > win) continue;
+    g += carbs * (1 - mins / win);
+  }
+  return Math.max(0, g);
+}
+
+export interface MealBolusPlan {
+  units: number;          // meal bolus to name (0 = nothing to cover, or no carb ratio)
+  planned: boolean;       // true => due AT EATING TIME, not now
+  carbsG: number | null;  // the carbs it covers
+}
+
+/**
+ * WHICH meal the action line should dose, and WHEN it is due. Extracted from the coach so the choice
+ * is unit-tested rather than inline in an edge function.
+ *
+ * An EATEN meal that is still digesting and was never bolused is due NOW, and it OUTRANKS an
+ * announced one (whose bolus is due at eating time) — otherwise a single line would advise two meal
+ * boluses at once. With nothing eaten to cover, the most recently ANNOUNCED meal within
+ * `announcedWindowMin` is dosed for eating time. `units` is 0 when there is nothing to cover, when
+ * the row carries no carbs, or when the profile has no carb ratio — the caller then falls back to its
+ * dose-free wording.
+ */
+export function mealBolusPlan(
+  meals: MealRow[],
+  doses: DoseRow[],
+  nowMs: number,
+  profile: GuardProfile | null,
+  announcedWindowMin = 180,
+): MealBolusPlan {
+  const uncovered = findUncoveredMeal(meals, doses, nowMs, profile);
+  if (uncovered) {
+    return { units: mealBolusUnits(uncovered.carbsG, profile), planned: false, carbsG: uncovered.carbsG };
+  }
+  // Most recently announced planned meal still in the window (matches the coach's newest-first scan).
+  let bestTs = -Infinity;
+  let bestCarbs = 0;
+  for (const m of meals || []) {
+    if (!m || m.planned !== true) continue;
+    const t = typeof m.ts === "number" ? m.ts : new Date(m.ts).getTime();
+    if (!Number.isFinite(t) || t < nowMs - announcedWindowMin * 60000) continue;
+    if (t <= bestTs) continue;
+    const c = Number(m.carbs_g ?? m.carbsG ?? 0);
+    bestTs = t;
+    bestCarbs = Number.isFinite(c) && c > 0 ? c : 0;
+  }
+  if (bestTs === -Infinity) return { units: 0, planned: false, carbsG: null };
+  const carbsG = bestCarbs > 0 ? Math.round(bestCarbs) : null;
+  return { units: mealBolusUnits(carbsG, profile), planned: true, carbsG };
 }
 
 /** Code-owned WARNING appended to a CORRECTION when a recent meal went unbolused and its carbs are
@@ -788,6 +891,24 @@ export function inRangeActionLine(
   const falling = pred.kind === "watch_fall";
   const rising = pred.kind === "watch_rise" || pred.kind === "high_soon";
 
+  // An IN-RANGE value is not safe when insulin is still working: 90 mg/dL falling with 3 u on board
+  // is ~150 mg/dL of drop still owed, and this used to answer "in range, nothing to correct — keep
+  // monitoring". The value is in range; the trajectory is a hypo. This outranks every drift message.
+  const isf = profile?.correctionFactor && profile.correctionFactor > 0 ? profile.correctionFactor : null;
+  const icr = profile?.carbRatio && profile.carbRatio > 0 ? profile.carbRatio : null;
+  const iobNow = activeIob(doses as any[], nowMs);
+  // Only the insulin NOT accounted for by food still digesting can drive the glucose down.
+  const netIob = iobNow - (icr ? carbsOnBoard(meals, nowMs) / icr : 0);
+  if (isf && netIob > 0 && pred.current != null) {
+    const floor = Math.round(pred.current - netIob * isf);
+    if (floor < LOW_MGDL) {
+      const u = fmtUnits(roundToHalf(netIob));
+      return es
+        ? `atención: quedan ~${u} u de insulina activa que aún pueden hacer bajar ~${Math.round(netIob * isf)} mg/dL — por debajo de 70. Ten azúcar rápido a mano, recontrola en ~15 min y toma azúcar en cuanto bajes de 70.`
+        : `attention : il reste ~${u} u d'insuline active qui peuvent encore faire baisser d'environ ${Math.round(netIob * isf)} mg/dL — soit sous 70. Garde du sucre rapide à portée, recontrôle dans ~15 min et resucre dès que tu passes sous 70.`;
+    }
+  }
+
   if (recentMeal) {
     const desc = (recentMeal.description || (es ? "este alimento" : "ce repas")).trim();
     const cubes = carbsCubes(recentMeal.carbsG);
@@ -835,4 +956,245 @@ export function starchyCarbNote(desc: string | null | undefined, lang: string): 
   return lang === "es"
     ? "Bueno saber: los féculentos (patata, pan, arroz, pasta) NO son dulces pero sí ricos en CARBOHIDRATOS — suben la glucosa igual que el azúcar, por eso se cubren con insulina (los « terrones » son el equivalente en carbohidratos, no en dulzor)."
     : "Bon à savoir : les féculents (pommes de terre, pain, riz, pâtes) ne sont PAS sucrés mais riches en GLUCIDES — ils font monter la glycémie autant que le sucre, d'où l'insuline (les « sucres » indiqués sont l'équivalent en glucides, pas en goût sucré).";
+}
+
+// ---- PROSPECTIVE meal dosing: "if I eat THIS, how much insulin?" --------------------------------
+// Everything above answers "what do I do RIGHT NOW, given the current glucose". That is not how a
+// meal is actually dosed: you decide BEFORE eating, from the carbs you are about to eat. Uncovered
+// carbs raise glucose by ~(carbs / ICR) × ISF mg/dL — 120 g on a 12 ICR / 50 ISF profile is +500
+// mg/dL, which is exactly why "30 sucres" reliably ends at 350+. Reacting to the current value can
+// never catch that in time; the number has to be available BEFORE the meal.
+//
+// planMealDose answers the whole question at once: the meal bolus, the correction, the total, where
+// the meal would take you if it went uncovered, and WHEN to inject for this kind of carb. The
+// correction half is DELEGATED to computeGuard, never re-implemented, so every no-insulin invariant
+// (stale data, falling, in-range, IOB subtraction, missing ratios) is inherited by construction.
+
+export type MealTiming = "prebolus" | "at_meal" | "split" | "after_meal" | "none";
+
+export interface MealPlanInput {
+  glucoseMgdl: number | null;
+  trend: Trend;
+  staleMin: number;
+  iobUnits: number;
+  carbsG: number | null | undefined;
+  description?: string | null;
+  minutesUntilMeal?: number | null; // 0 / absent = about to eat
+  minSinceRescue?: number | null;
+  recentHypo?: boolean;
+  profile: GuardProfile | null;
+}
+
+export interface MealPlanResult {
+  carbsG: number;
+  mealUnits: number;                     // carbs / ICR
+  correctionUnits: number;               // from computeGuard (0 unless a real high, IOB already deducted)
+  totalUnits: number;                    // what to inject (0 during a hypo — sugar first)
+  expectedRiseMgdl: number | null;       // rise if these carbs went completely uncovered
+  projectedUncoveredMgdl: number | null; // where that lands from the current value, IOB deducted
+  timing: MealTiming;
+  speed: CarbSpeed;
+  reason: string;                        // ok | no_carbs | no_ratios | hypo_first | stale_no_correction
+  // Dropping fast while about to take FAST carbs: that is usually a fall being arrested, not a meal.
+  // Bolusing it would fight the very thing it is there to fix, so the caller warns instead of hiding
+  // the number (a genuine meal eaten on a fast fall still needs its cover).
+  fastFallCaution: boolean;
+  // The glucose is heading LOW before the meal's carbs can land — either it is already low and
+  // falling, or the insulin still on board (iob × ISF) will drag it under on its own. A meal bolus
+  // then stacks onto a fall already in progress, so it is deferred to after the rise has started.
+  lowBeforeMeal: boolean;
+  // Where the insulin on board alone would take the glucose (current − iob × ISF), null without ISF.
+  // Kept UNCLAMPED for the logic — it can go negative, which is precisely the signal that the drop
+  // still owed is larger than the distance to zero. Never show it raw; show pendingDropMgdl instead.
+  floorMgdl: number | null;
+  // How much the insulin still on board has left to lower the glucose (iob × ISF), in mg/dL.
+  pendingDropMgdl: number | null;
+  guard: GuardResult;
+}
+
+/** Ceiling for the projected-if-uncovered figure; above this we say "plus de N" rather than a number
+ *  the meter itself could never show. Matches projectGlucose's clamp. */
+export const PROJECTION_MAX_MGDL = 600;
+
+export function planMealDose(input: MealPlanInput): MealPlanResult {
+  const { glucoseMgdl: g, trend, staleMin, iobUnits, profile } = input;
+  const carbs = Number(input.carbsG);
+  const carbsG = Number.isFinite(carbs) && carbs > 0 ? Math.round(carbs) : 0;
+  const speed = mealCarbSpeed(input.description);
+  const guard = computeGuard({
+    glucoseMgdl: g, trend, staleMin, iobUnits, recentHypo: !!input.recentHypo,
+    minSinceRescue: input.minSinceRescue ?? null, profile,
+  });
+
+  const icr = profile?.carbRatio && profile.carbRatio > 0 ? profile.carbRatio : null;
+  const isf = profile?.correctionFactor && profile.correctionFactor > 0 ? profile.correctionFactor : null;
+  const mealUnits = mealBolusUnits(carbsG, profile);
+  const correctionUnits = guard.kind === "correction" ? guard.insulinUnits : 0;
+
+  // What these carbs do UNBOLUSED: (carbs / ICR) units' worth of glucose, i.e. × ISF mg/dL. Insulin
+  // already on board is netted off — it will absorb part of the rise.
+  const expectedRiseMgdl = (icr && isf) ? Math.round((carbsG / icr) * isf) : null;
+  const projectedUncoveredMgdl = (expectedRiseMgdl != null && g != null && Number.isFinite(g) && g > 0)
+    ? Math.max(20, Math.min(PROJECTION_MAX_MGDL, Math.round(g + expectedRiseMgdl - (isf ? (iobUnits || 0) * isf : 0))))
+    : null;
+
+  // A low comes first, always: no pre-bolus, nothing injected until it is treated and the meal started.
+  const hypoFirst = guard.kind === "sugar" || guard.reason === "sugar_recent";
+  const falling = trend === "falling" || trend === "falling_fast";
+
+  // Insulin already injected keeps pulling the glucose DOWN while the meal is still being digested.
+  // If that pending drop (iob × ISF) lands the current value under the low threshold, or the glucose
+  // is already low AND falling, then a meal bolus — however correct for the carbs — is added on top
+  // of a fall that is already happening. The real shape of the miss: 100 mg/dL falling with 3 u still
+  // active is ~150 mg/dL of drop still to come, and the plan used to answer "10 u" with no caveat.
+  const floorMgdl = (g != null && Number.isFinite(g) && g > 0 && isf)
+    ? Math.round(g - (iobUnits || 0) * isf)
+    : null;
+  const lowBeforeMeal = !hypoFirst && carbsG > 0 && (
+    (floorMgdl != null && floorMgdl < LOW_MGDL) ||
+    (falling && g != null && g < FALL_WATCH_BELOW + 10)
+  );
+
+  let timing: MealTiming;
+  if (carbsG <= 0) timing = "none";
+  else if (hypoFirst) timing = "after_meal";
+  // Heading low: eat FIRST, inject once the rise is under way — never pre-bolus into a fall.
+  else if (lowBeforeMeal) timing = "after_meal";
+  else if (speed === "fatty" || speed === "slow") timing = "split";
+  else if (speed === "fast" && !falling) timing = "prebolus";
+  else timing = "at_meal";
+
+  let reason = "ok";
+  if (carbsG <= 0) reason = "no_carbs";
+  else if (!icr) reason = "no_ratios";
+  else if (hypoFirst) reason = "hypo_first";
+  else if (guard.reason === "stale_data") reason = "stale_no_correction";
+
+  const totalUnits = hypoFirst ? 0 : roundToHalf(mealUnits + correctionUnits);
+  const fastFallCaution = trend === "falling_fast" && speed === "fast" && !hypoFirst && carbsG > 0;
+  return {
+    carbsG, mealUnits, correctionUnits, totalUnits,
+    expectedRiseMgdl, projectedUncoveredMgdl, timing, speed, reason,
+    fastFallCaution, lowBeforeMeal, floorMgdl,
+    pendingDropMgdl: isf ? Math.round((iobUnits || 0) * isf) : null,
+    guard,
+  };
+}
+
+/** WHEN to inject, for this meal's carb speed. Sentence-sized, no dose numbers, TTS-clean. */
+export function mealTimingLine(timing: MealTiming, lang: string): string {
+  const es = lang === "es";
+  switch (timing) {
+    case "prebolus":
+      return es
+        ? "Azúcar rápido: pon la insulina ~15 min ANTES de empezar a comer, si no el pico llega antes que ella."
+        : "Sucre rapide : fais l'insuline ~15 min AVANT de commencer à manger, sinon le pic arrive avant elle.";
+    case "split":
+      return es
+        ? "Comida lenta o grasa: sube TARDE. Bolo dividido — una parte al empezar, el resto 1-2 h después — y recontrola a las 2-3 h."
+        : "Repas lent ou gras : ça monte TARD. Bolus étalé — une partie en commençant, le reste 1-2 h après — et recontrôle à 2-3 h.";
+    case "at_meal":
+      return es ? "Pon la insulina al empezar a comer." : "Fais l'insuline au moment de commencer à manger.";
+    case "after_meal":
+      return es
+        ? "Empieza a comer primero; la insulina de la comida solo DESPUÉS, cuando la subida ya haya empezado."
+        : "Commence à manger d'abord ; l'insuline du repas seulement APRÈS, une fois la remontée amorcée.";
+    default:
+      return "";
+  }
+}
+
+/** The full prospective answer to "if I eat this, how much do I take?" — code-owned, every number
+ *  from planMealDose. Leads with the dose (that is the question), then what the meal would do
+ *  unbolused (the reason the dose matters), then the timing. */
+export function mealPlanLine(plan: MealPlanResult, lang: string, profile: GuardProfile | null): string {
+  const es = lang === "es";
+  const rapid = profile?.rapidInsulin || (es ? "insulina rápida" : "insuline rapide");
+  const cubes = carbsCubes(plan.carbsG);
+  const cubesP = cubes ? (es ? `, ≈ ${cubes} terrón(es)` : `, ≈ ${cubes} sucre(s)`) : "";
+
+  if (plan.reason === "no_carbs") {
+    return es ? "Dime qué vas a comer (y la cantidad) para calcular la dosis." : "Dis-moi ce que tu vas manger (et la quantité) pour calculer la dose.";
+  }
+  if (plan.reason === "no_ratios") {
+    return es
+      ? `Para ~${plan.carbsG} g de carbohidratos${cubesP} — no puedo dar una dosis: falta tu ratio de carbohidratos en el perfil. Complétalo y te doy el número exacto.`
+      : `Pour ~${plan.carbsG} g de glucides${cubesP} — je ne peux pas donner de dose : ton ratio glucides manque dans le profil. Renseigne-le et je te donne le chiffre exact.`;
+  }
+
+  const parts: string[] = [];
+  if (plan.reason === "hypo_first") {
+    // Lead with the GRAMS. "Sucre d'abord" without a quantity is the one number that actually
+    // matters at that moment, and it was being dropped in favour of the meal's unit count.
+    parts.push(actionLine(plan.guard, lang, profile));
+    parts.push(es
+      ? `Después, para ~${plan.carbsG} g${cubesP}, la comida necesitará ${fmtUnits(plan.mealUnits)} u de ${rapid} — solo DESPUÉS de haber remontado.`
+      : `Ensuite, pour ~${plan.carbsG} g${cubesP}, le repas demandera ${fmtUnits(plan.mealUnits)} u de ${rapid} — seulement APRÈS être remonté.`);
+  } else {
+    let head = es
+      ? `Para ~${plan.carbsG} g de carbohidratos${cubesP}: ${fmtUnits(plan.totalUnits)} u de ${rapid}`
+      : `Pour ~${plan.carbsG} g de glucides${cubesP} : ${fmtUnits(plan.totalUnits)} u de ${rapid}`;
+    if (plan.correctionUnits > 0) {
+      head += es
+        ? ` en total (${fmtUnits(plan.mealUnits)} u para la comida + ${fmtUnits(plan.correctionUnits)} u de corrección).`
+        : ` au total (${fmtUnits(plan.mealUnits)} u pour le repas + ${fmtUnits(plan.correctionUnits)} u de correction).`;
+    } else {
+      head += es ? ` para la comida.` : ` pour le repas.`;
+    }
+    parts.push(head);
+  }
+
+  // WHY the dose matters: what these carbs do if they go uncovered. This is the forward-looking half
+  // — reacting to the glucose after the fact can never catch a rise this size. Skipped during a hypo:
+  // there the one thing that must land is "sugar first", and a "+292 mg/dL" beside it only competes
+  // with it (the food IS the treatment at that moment).
+  if (plan.reason !== "hypo_first" && plan.expectedRiseMgdl != null && plan.expectedRiseMgdl > 0) {
+    const capped = plan.projectedUncoveredMgdl != null && plan.projectedUncoveredMgdl >= PROJECTION_MAX_MGDL;
+    const land = plan.projectedUncoveredMgdl != null
+      ? (es
+        ? ` — te llevaría ${capped ? `por encima de ${PROJECTION_MAX_MGDL}` : `a ~${plan.projectedUncoveredMgdl}`} mg/dL`
+        : ` — ça t'emmènerait ${capped ? `au-delà de ${PROJECTION_MAX_MGDL}` : `vers ~${plan.projectedUncoveredMgdl}`} mg/dL`)
+      : "";
+    parts.push(es
+      ? `Sin insulina, esta comida sube ~${plan.expectedRiseMgdl} mg/dL${land}.`
+      : `Sans insuline, ce repas fait monter d'environ ${plan.expectedRiseMgdl} mg/dL${land}.`);
+  }
+
+  // Both the hypo head above and the low-before-meal warning below already state WHEN to inject, in
+  // stronger words. Emitting the generic timing line too would say the same thing twice in a row.
+  const t = (plan.lowBeforeMeal || plan.reason === "hypo_first") ? "" : mealTimingLine(plan.timing, lang);
+  if (t) parts.push(t);
+
+  // Heading low BEFORE the food can act — the dose is right for the carbs, the TIMING is what would
+  // hurt. Name the pending drop when insulin on board is the cause: "10 u" next to a silent 3 u still
+  // working is the exact situation where a correct number produces a hypo.
+  if (plan.lowBeforeMeal) {
+    const iobDriven = plan.floorMgdl != null && plan.floorMgdl < LOW_MGDL;
+    if (iobDriven) {
+      // The pending DROP, never the projected floor: current − iob × ISF goes negative exactly when
+      // the warning matters most, and "~-50 mg/dL" is nonsense on screen.
+      const drop = plan.pendingDropMgdl && plan.pendingDropMgdl > 0 ? plan.pendingDropMgdl : null;
+      const by = drop ? (es ? ` de ~${drop} mg/dL` : ` d'environ ${drop} mg/dL`) : "";
+      parts.push(es
+        ? `⚠️ La insulina que ya está activa aún hará bajar${by} antes incluso de que la comida actúe, hasta por debajo de 70: come primero y pon el bolo cuando la subida haya empezado, no ahora.`
+        : `⚠️ L'insuline déjà active va encore faire baisser${by} avant même que le repas agisse, jusque sous 70 : mange d'abord et fais le bolus une fois la remontée amorcée, pas maintenant.`);
+    } else {
+      parts.push(es
+        ? "⚠️ Estás bajo y bajando: come primero y pon la insulina cuando la subida haya empezado, no antes."
+        : "⚠️ Tu es bas et en train de descendre : mange d'abord et fais l'insuline une fois la remontée amorcée, pas avant.");
+    }
+  }
+
+  if (plan.fastFallCaution) {
+    parts.push(es
+      ? "Ojo: estás bajando RÁPIDO. Si este azúcar es para frenar la bajada y no una comida, no lo cubras con insulina."
+      : "Attention : tu descends VITE. Si ce sucre sert à freiner la baisse et n'est pas un repas, ne le couvre pas avec de l'insuline.");
+  }
+
+  if (plan.reason === "stale_no_correction") {
+    parts.push(es
+      ? "Los datos no están actualizados: esta dosis cubre solo la comida, sin corrección — recontrola la glucosa antes de añadir nada."
+      : "Données pas à jour : cette dose ne couvre que le repas, sans correction — recontrôle la glycémie avant d'ajouter quoi que ce soit.");
+  }
+  return parts.join(" ");
 }
