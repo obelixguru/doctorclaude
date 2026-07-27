@@ -1012,7 +1012,7 @@ internal fun alarmTitleBody(a: GlucoseAlert, lang: Lang, rescueRecent: Boolean =
         AlertKind.RAPID_FALL ->
             (if (es) "⚠ BAJADA RÁPIDA : ${a.value} mg/dL" else "⚠ CHUTE RAPIDE : ${a.value} mg/dL") to
                 (if (es) "Baja rápido. Ten azúcar a mano y vigila. Toca para saber más." else "Ça descend vite. Garde du sucre à portée et surveille. Touche pour en savoir plus.")
-        else -> "Doctor Claude" to ""
+        else -> "Dr Claude" to ""
     }
 }
 

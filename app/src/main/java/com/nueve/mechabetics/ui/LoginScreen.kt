@@ -73,7 +73,7 @@ fun LoginScreen(
         Spacer(Modifier.height(28.dp))
 
         Text(
-            if (addMode) s.addAccountTitle else "Doctor Claude",
+            if (addMode) s.addAccountTitle else "Dr Claude",
             color = InkPrimary,
             fontSize = 28.sp,
             fontWeight = FontWeight.Black,

@@ -192,7 +192,7 @@ class MonitorService : Service() {
                    else "Surveillance de la glycémie active"
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(android.R.drawable.ic_menu_view)
-            .setContentTitle("Doctor Claude")
+            .setContentTitle("Dr Claude")
             .setContentText(text)
             .setPriority(NotificationCompat.PRIORITY_LOW)
             .setCategory(NotificationCompat.CATEGORY_SERVICE)

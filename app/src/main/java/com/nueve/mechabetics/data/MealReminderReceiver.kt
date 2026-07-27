@@ -40,7 +40,7 @@ class MealReminderReceiver : BroadcastReceiver() {
         )
         val n = NotificationCompat.Builder(context, CHANNEL_ID)
             .setSmallIcon(android.R.drawable.ic_popup_reminder)
-            .setContentTitle("Doctor Claude")
+            .setContentTitle("Dr Claude")
             .setContentText(
                 if (es) "Hora de revisar la glucosa y registrar la comida."
                 else "C'est l'heure de vérifier la glycémie et de loguer le repas."
