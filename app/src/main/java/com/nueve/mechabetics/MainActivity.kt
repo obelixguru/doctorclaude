@@ -256,6 +256,13 @@ class MainActivity : ComponentActivity() {
         // The homepage is a 24h view: pull the last 24h of readings from the server (the CGM cloud
         // only serves a short live window) and merge with the live points for the graph + list.
         var history24 by remember { mutableStateOf<List<GlucoseReading>>(emptyList()) }
+        // Newest reading available from EITHER path — the phone's direct LibreLinkUp poll or the
+        // server's (history24). Whichever is more recent wins, so a blocked phone session degrades to
+        // the server's value instead of a NO SIGNAL card, and a server hiccup degrades to the phone's.
+        val liveCurrent: GlucoseReading? = remember(state.current?.timestampMs, history24) {
+            listOfNotNull(state.current, history24.maxByOrNull { it.timestampMs })
+                .maxByOrNull { it.timestampMs }
+        }
         // Re-fetch the 24h server history whenever a new live reading lands (not only at login), so
         // the homepage curve stays as fresh as the history screen instead of freezing at login time.
         LaunchedEffect(state.isLoggedIn, state.patientId, state.current?.timestampMs, dataVersion) {
@@ -487,8 +494,17 @@ class MainActivity : ComponentActivity() {
         var currentAlert by remember { mutableStateOf(GlucoseAlert(AlertKind.NONE, 0.0, 0)) }
         var firedAlert by remember { mutableStateOf(store.firedAlert) }
         var ackAlert by remember { mutableStateOf(store.ackAlert) }
-        LaunchedEffect(state.current?.timestampMs, state.current?.valueMgDl, recentInsulinIob, iobReady) {
-            val raw = GlucoseAlert.of(state.current, state.history)
+        // The alarm MUST read the same reading the dial shows. Feeding the dial from the server while
+        // leaving the alarm on the phone's dead path would produce the worst possible state: a screen
+        // that looks healthy and an alarm that never fires. Both now use the freshest reading, and the
+        // slope is measured over both histories merged (deduped per minute, oldest→newest) so a hypo
+        // arriving by the server path is detected exactly as if the phone had fetched it.
+        val alarmHistory: List<GlucoseReading> = remember(state.history, history24) {
+            (state.history + history24).associateBy { it.timestampMs / 60000L }.values
+                .sortedBy { it.timestampMs }
+        }
+        LaunchedEffect(liveCurrent?.timestampMs, liveCurrent?.valueMgDl, recentInsulinIob, iobReady) {
+            val raw = GlucoseAlert.of(liveCurrent, alarmHistory)
             // A HIGH only rings when there's actually something to DO (mirrors the dose guard's
             // "aucune insuline" cases), so the alarm never contradicts the analysis:
             //   - IOB not loaded yet (relaunch) -> wait, don't fire off a momentary IOB=0;
@@ -642,7 +658,7 @@ class MainActivity : ComponentActivity() {
                             patientId = state.patientId,
                             ai = ai,
                             lang = lang,
-                            lastUpdateMs = state.lastUpdateMs,
+                            lastUpdateMs = liveCurrent?.timestampMs ?: state.lastUpdateMs,
                             onToggleLang = {
                                 lang = if (lang == Lang.FR) Lang.ES else Lang.FR
                                 store.language = lang.code.lowercase()
@@ -678,9 +694,18 @@ class MainActivity : ComponentActivity() {
                         )
                     }
                     when (tab) {
+                        // The phone's OWN LibreLinkUp link and our server are two independent paths to
+                        // the same sensor, and only the second one survived tonight: Abbott rate-limited
+                        // the phone (HTTP 429) for hours while the server kept polling fine. The home
+                        // dial read only the phone's path, so it showed NO SIGNAL and a 16-hour-old
+                        // value while the History screen — which reads the server — was perfectly
+                        // up to date. The data was already in the app; the headline just refused to use
+                        // it. Take whichever of the two is NEWER, so one dead path can no longer black
+                        // out the screen. (`graph24` already holds the server's readings; it is what
+                        // draws the curve right under this card.)
                         Tab.GLUCOSE -> DashboardScreen(
                 patientName = state.patientName,
-                current = state.current,
+                current = liveCurrent,
                 alert = if (currentAlert.isUrgent && currentAlert.kind.name != ackAlert) currentAlert
                         else GlucoseAlert(AlertKind.NONE, 0.0, 0),
                 history = graph24,
