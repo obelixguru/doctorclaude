@@ -18,6 +18,12 @@ android {
     }
 
     buildTypes {
+        debug {
+            // Only change on this rollback branch: keeps the package the phone already has installed,
+            // so this replaces the current build in place instead of landing as a third app.
+            applicationIdSuffix = ".debug"
+            versionNameSuffix = "-rollback"
+        }
         release {
             isMinifyEnabled = false
             proguardFiles(
