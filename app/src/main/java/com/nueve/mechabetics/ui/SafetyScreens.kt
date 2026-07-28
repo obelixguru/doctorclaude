@@ -72,7 +72,7 @@ fun ConsentScreen(onAccept: () -> Unit) {
     ) {
         Spacer(Modifier.height(8.dp))
         Text(
-            "Doctor Claude",
+            "Dr Claude",
             color = InkPrimary,
             fontSize = 26.sp,
             fontWeight = FontWeight.Black,

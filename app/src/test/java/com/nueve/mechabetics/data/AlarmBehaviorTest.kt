@@ -133,4 +133,19 @@ class AlarmBehaviorTest {
         assertFalse(AlarmPolicy.inQuietWindow(12 * 60, 22 * 60, 7 * 60)) // 12:00 outside
         assertFalse(AlarmPolicy.inQuietWindow(8 * 60, 22 * 60, 7 * 60))  // 08:00 outside
     }
+
+    @Test
+    fun sittingHigh_neverReRingsOnTime_butDoesOnANewPalier() {
+        val fourHours = now + 4 * 60 * 60 * 1000L
+        assertFalse("same palier, however long", AlarmEngine.decide(alert(AlertKind.HIGH, 245), book("HIGH", now, 250), fourHours).ring)
+        assertFalse("drifting up inside the palier stays quiet", AlarmEngine.decide(alert(AlertKind.HIGH, 262), book("HIGH", now, 250), now + 60_000).ring)
+        assertTrue("crossing into the next 50 re-rings", AlarmEngine.decide(alert(AlertKind.HIGH, 302), book("HIGH", now, 250), now + 60_000).ring)
+        assertFalse("an improving hyper never re-rings", AlarmEngine.decide(alert(AlertKind.HIGH, 210), book("HIGH", now, 250), now + 60_000).ring)
+    }
+
+    @Test
+    fun lowKeepsItsTimeSnoozeAndFinerEscalation() {
+        assertFalse(AlarmEngine.decide(alert(AlertKind.LOW, 64), book("LOW", now, 65), now + 60_000).ring)
+        assertTrue(AlarmEngine.decide(alert(AlertKind.LOW, 55), book("LOW", now, 65), now + 60_000).ring)
+    }
 }

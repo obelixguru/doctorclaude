@@ -36,13 +36,25 @@ data class GlucoseAlert(
          *  minute and the official LibreLink flags signal loss within a few minutes, so 5 min (≈5
          *  missed readings, allowing for normal cloud lag) keeps us about as quick as LibreLink. We
          *  re-check it every poll (~60s) and every 30s on screen, so it can't lag behind reality. */
-        const val FRESHNESS_WINDOW_MS = 5 * 60_000L
+        // 15 min, aligned with STALE_MIN in supabase/functions/_shared/doseGuard.ts. At 5 min the
+        // window was under Abbott's own follower lag, so `of()` returned NONE and the hypo alarm was
+        // SILENTLY switched off on healthy data — while the server would still compute a dose on the
+        // very same reading. This only governs how old a reading may be; it changes nothing about how
+        // readings are fetched.
+        const val FRESHNESS_WINDOW_MS = 15 * 60_000L
 
         // ── Ring-policy constants — ONE source of truth, shared by the foreground UI alarm and the
         //    background MonitorService so the two can never disagree. ───────────────────────────────
         /** After a sound, the same ongoing episode stays quiet this long before it may sound again. */
         const val SNOOZE_MS = 20 * 60 * 1000L
-        /** A LOW that drops another this-many mg/dL since the last ring re-sounds despite the snooze. */
+        /**
+         * A HIGH re-sounds ONLY on crossing a new multiple of this further out (200, 250, 300), never
+         * on elapsed time — the Telegram monitor's rule. Sitting at 250 for two hours used to ring six
+         * times for a situation already known and already corrected.
+         */
+        const val PALIER = 50
+        /** A LOW that drops another this-many mg/dL since the last ring re-sounds despite the snooze.
+         *  Deliberately finer than the monitor's 15: a hypo is the acute emergency. */
         const val HYPO_ESCALATE_DROP = 10
         /** Crossing below this (severe hypo) re-sounds despite the snooze. */
         const val SEVERE_LOW = 54

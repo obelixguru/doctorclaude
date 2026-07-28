@@ -47,10 +47,23 @@ class SignalStalenessTest {
     }
 
     @Test
-    fun freshnessWindow_isFiveMinutes() {
-        // Fast signal-loss detection: ~5 missed minute-readings, so NO SIGNAL shows about as quickly
-        // as the official LibreLink instead of lagging up to 15 min behind it.
-        assertEquals(5 * 60_000L, GlucoseAlert.FRESHNESS_WINDOW_MS)
+    fun freshnessWindow_matchesTheServersStaleDefinition() {
+        // Was 5 min, assuming we could be as quick as LibreLink. We cannot: LibreLink reads the sensor
+        // directly, we read Abbott's follower cloud, already minutes behind. That window silently
+        // switched the hypo alarm OFF on healthy data, and disagreed 3x with the server's STALE_MIN.
+        assertEquals(15 * 60_000L, GlucoseAlert.FRESHNESS_WINDOW_MS)
+    }
+
+    @Test
+    fun aReadingLaggingSixMinutes_stillAlarmsOnAHypo() {
+        val lagging = GlucoseReading(timestampMs = ago(6), valueMgDl = 52, trend = Trend.FALLING)
+        assertEquals(AlertKind.LOW, GlucoseAlert.of(lagging, listOf(lagging), now).kind)
+    }
+
+    @Test
+    fun aGenuinelyLostSignal_stillGoesQuiet() {
+        val ancient = GlucoseReading(timestampMs = ago(20), valueMgDl = 52, trend = Trend.FALLING)
+        assertEquals(AlertKind.NONE, GlucoseAlert.of(ancient, listOf(ancient), now).kind)
     }
 
     @Test

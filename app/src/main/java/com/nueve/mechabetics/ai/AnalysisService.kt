@@ -133,8 +133,8 @@ class AnalysisService(private val context: Context) {
     /** Honest message when we can't even reach the backend (network down, timeout, Supabase paused,
      *  non-2xx). The glucose feed + alarms are INDEPENDENT (LibreLinkUp-direct), so we say so. */
     private fun transportMsg(lang: String): String =
-        if (lang == "es") "No se puede contactar con el servicio de Doctor Claude ahora. Tu glucosa y las alarmas siguen funcionando."
-        else "Service Doctor Claude injoignable pour le moment. Ta glycémie et les alarmes fonctionnent toujours."
+        if (lang == "es") "No se puede contactar con el servicio de Dr Claude ahora. Tu glucosa y las alarmas siguen funcionando."
+        else "Service Dr Claude injoignable pour le moment. Ta glycémie et les alarmes fonctionnent toujours."
 
     data class PastAnalysis(val ts: Long, val message: String, val glucose: Int?)
     data class InsulinDose(val ts: Long, val units: Double, val name: String?, val id: Long = 0, val kind: String? = null)

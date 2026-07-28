@@ -427,8 +427,8 @@ private fun DayStats(readings: List<GlucoseReading>) {
     val mn = values.min()
     val mx = values.max()
     Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-        MiniStat(s.average, "$avg", InkPrimary, Modifier.weight(1f))
         MiniStat("MIN", "$mn", colorFor(mn), Modifier.weight(1f))
+        MiniStat(s.average, "$avg", InkPrimary, Modifier.weight(1f))
         MiniStat("MAX", "$mx", colorFor(mx), Modifier.weight(1f))
     }
 }

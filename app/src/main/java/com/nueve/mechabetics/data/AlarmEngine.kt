@@ -51,7 +51,14 @@ object AlarmEngine {
             alert.value <= book.lastAlarmValue - GlucoseAlert.HYPO_ESCALATE_DROP ||
             (alert.value < GlucoseAlert.SEVERE_LOW && book.lastAlarmValue >= GlucoseAlert.SEVERE_LOW)
         )
-        val snoozed = !newEpisode && !worseningHypo && (nowMs - book.lastAlarmMs) < GlucoseAlert.SNOOZE_MS
+        // A HIGH escalates on VALUE, not on a timer: it re-sounds only on a new PALIER further out.
+        val worseningHigh = alert.kind == AlertKind.HIGH && book.lastAlarmValue > 0 &&
+            (alert.value / GlucoseAlert.PALIER) > (book.lastAlarmValue / GlucoseAlert.PALIER)
+        val snoozed = !newEpisode && when (alert.kind) {
+            AlertKind.HIGH -> !worseningHigh
+            AlertKind.LOW -> !worseningHypo && (nowMs - book.lastAlarmMs) < GlucoseAlert.SNOOZE_MS
+            else -> (nowMs - book.lastAlarmMs) < GlucoseAlert.SNOOZE_MS
+        }
         if (snoozed) return Decision(ring = false, book = book, recovered = false)
         return Decision(
             ring = true,

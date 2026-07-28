@@ -140,7 +140,7 @@ fun DashboardScreen(
     ) {
         item {
             AppHeader(
-                title = "Doctor Claude",
+                title = "Dr Claude",
                 subtitle = if (patientName.isNotBlank()) patientName else s.sensor,
                 lang = lang,
                 onToggleLang = onToggleLang,
@@ -262,7 +262,7 @@ fun DashboardScreen(
 
 @Composable
 // Shared app header — used on EVERY tab so the app feels harmonious (same top bar, same buttons).
-// Only the title changes per page (home = "Doctor Claude"; other tabs = the page name). The accent
+// Only the title changes per page (home = "Dr Claude"; other tabs = the page name). The accent
 // defaults to the brand green; the dashboard passes the live glucose-status colour instead.
 fun AppHeader(
     title: String,
