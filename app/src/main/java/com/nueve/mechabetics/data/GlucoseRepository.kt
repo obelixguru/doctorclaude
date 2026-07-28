@@ -55,15 +55,31 @@ class GlucoseRepository(
 
     fun bootstrap() {
         // Seed the graph from the on-device history (the CGM cloud only serves a ~12-24h window).
+        // localDb.recent() returns NEWEST FIRST (ORDER BY ts DESC) while refresh() publishes ASCENDING.
+        // Sort here so both paths hand the UI the same orientation — otherwise "the last element" means
+        // opposite things depending on which ran last, which is exactly how the dial came to announce
+        // the OLDEST reading as the current one ("signal perdu depuis 984 min" on healthy data).
         val seed = store.patientId?.let { localDb?.recent(it) }.orEmpty()
+            .sortedBy { it.timestampMs }
         // Restore the saved patientId into state RIGHT AWAY (not only after the first network
         // refresh) so the Profile/Insulin/Meals screens can load their server data immediately on
         // relaunch — otherwise patientId is null at launch and the profile shows blank until a poll
         // completes (or never, if offline), which read as "my profile data disappeared".
+        // Restore the newest stored reading as the CURRENT one too. Seeding `history` without
+        // `current` left the big dial showing "--" on every single launch — the graph was full while
+        // the headline value was blank — until a poll happened to return a live measurement. When
+        // LibreLinkUp momentarily serves no live value, it stayed blank indefinitely.
+        // `lastUpdateMs` comes from that reading rather than staying 0: at 0 the freshness check is
+        // skipped entirely, so a launch with hours-old data announced itself "En ligne" in green.
+        // Sourcing it from the reading makes NO SIGNAL tell the truth from the first frame.
+        // Pick the newest by VALUE COMPARISON, never by position: a positional guess is what broke it.
+        val last = seed.maxByOrNull { it.timestampMs }
         _state.value = _state.value.copy(
             isLoggedIn = store.token != null,
             patientId = store.patientId,
-            history = seed
+            history = seed,
+            current = last,
+            lastUpdateMs = last?.timestampMs ?: 0L
         )
     }
 
@@ -247,6 +263,15 @@ class GlucoseRepository(
                     patientName = "${first.firstName} ${first.lastName}".trim()
                 }
             }
+        } else if (_state.value.connections.isEmpty()) {
+            // The followed-people list lives only in memory, and it used to be fetched ONLY on the
+            // branch above — i.e. only when the active patient was still unknown. After any restart
+            // the saved patientId short-circuits that branch, so the list stayed empty and the
+            // Profile switcher (shown only when size > 1) silently vanished: a parent following two
+            // people lost access to the second one until they logged out and back in.
+            (client.listConnections() as? LibreResult.Success)?.let {
+                _state.value = _state.value.copy(connections = it.data)
+            }
         }
 
         when (val g = client.fetchGraph(patientId!!)) {
@@ -319,7 +344,19 @@ class GlucoseRepository(
     suspend fun startPolling(intervalMs: Long = 60_000L) {
         while (true) {
             if (_state.value.isLoggedIn) refresh()
-            delay(intervalMs)
+            // BACK OFF WHEN RATE-LIMITED. Abbott answers 429 once an account has made too many
+            // requests — which is easy to reach with several installs on one account, or a burst of
+            // logout/login attempts. Carrying on at 60 s then keeps the account pinned against the
+            // limit and the block never lifts: the app punishes itself. A 429 is not a lost session
+            // (401/403 are, and those DO trigger a re-login) — it is "stop asking for a while", so
+            // the only correct response is to wait.
+            val limited = _state.value.error?.contains("429") == true
+            delay(if (limited) RATE_LIMIT_BACKOFF_MS else intervalMs)
         }
+    }
+
+    companion object {
+        /** How long to stand down after an HTTP 429 before polling again. */
+        const val RATE_LIMIT_BACKOFF_MS = 10 * 60_000L
     }
 }

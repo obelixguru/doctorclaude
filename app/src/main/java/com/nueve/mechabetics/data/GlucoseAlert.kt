@@ -30,13 +30,28 @@ data class GlucoseAlert(
         const val LOW = 70
         const val HIGH = 180 // in-range ceiling (was 170 → alarm fatigue on the acceptable 171–180 band)
         const val RAPID_SLOPE = 2.0 // mg/dL per minute
-        /** A reading older than this is "signal lost": we can't know the current glucose, so we must
-         *  neither alarm on the stale value nor let it suppress a real alarm (the dashboard shows the
-         *  big red NO SIGNAL past this point). Deliberately SHORT — the Libre sends a value every
-         *  minute and the official LibreLink flags signal loss within a few minutes, so 5 min (≈5
-         *  missed readings, allowing for normal cloud lag) keeps us about as quick as LibreLink. We
-         *  re-check it every poll (~60s) and every 30s on screen, so it can't lag behind reality. */
-        const val FRESHNESS_WINDOW_MS = 5 * 60_000L
+        /**
+         * A reading older than this is "signal lost": we neither alarm on it nor let it suppress a
+         * real alarm, and the dashboard shows the big red NO SIGNAL.
+         *
+         * This was 5 minutes, justified by "LibreLink flags signal loss within a few minutes". That
+         * reasoning does not hold for us: LibreLink reads the sensor DIRECTLY, while we read Abbott's
+         * follower cloud, which is inherently several minutes behind — the server-side monitor's
+         * freshest value is routinely ~3 min old before we even fetch it. The 5-minute window
+         * therefore had almost no margin, and crossing it produced two failures at once:
+         *
+         *   - NO SIGNAL on the home badge while polling was perfectly healthy and the history kept
+         *     filling — telling the user to go re-scan a sensor that was never lost;
+         *   - far worse, [of] returned NONE, so the hypo and hyper alarms were SILENTLY SWITCHED OFF
+         *     for any reading past 5 minutes. A quiet alarm reads exactly like a safe glucose.
+         *
+         * 15 minutes matches STALE_MIN in supabase/functions/_shared/doseGuard.ts — the value the
+         * server already uses to refuse a dose on stale data. The two halves of the product disagreed
+         * by 3x: the server would compute a dose on a 12-minute-old reading that the app had already
+         * declared signal-lost. This aligns them on the project's own existing definition rather than
+         * inventing a new number, and it stays far under any insulin action time.
+         */
+        const val FRESHNESS_WINDOW_MS = 15 * 60_000L
 
         // ── Ring-policy constants — ONE source of truth, shared by the foreground UI alarm and the
         //    background MonitorService so the two can never disagree. ───────────────────────────────

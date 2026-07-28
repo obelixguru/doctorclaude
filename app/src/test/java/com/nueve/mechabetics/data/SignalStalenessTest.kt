@@ -47,10 +47,30 @@ class SignalStalenessTest {
     }
 
     @Test
-    fun freshnessWindow_isFiveMinutes() {
-        // Fast signal-loss detection: ~5 missed minute-readings, so NO SIGNAL shows about as quickly
-        // as the official LibreLink instead of lagging up to 15 min behind it.
-        assertEquals(5 * 60_000L, GlucoseAlert.FRESHNESS_WINDOW_MS)
+    fun freshnessWindow_matchesTheServersStaleDefinition() {
+        // Was 5 min, on the assumption we could be as quick as LibreLink. We cannot: LibreLink reads
+        // the sensor directly, we read Abbott's follower cloud, which is already minutes behind. That
+        // window silently switched the hypo alarm OFF on perfectly healthy data — and disagreed 3x
+        // with the server's own STALE_MIN = 15 in doseGuard.ts, which would still compute a dose on
+        // a reading the app had declared signal-lost. One definition of stale, shared by both halves.
+        assertEquals(15 * 60_000L, GlucoseAlert.FRESHNESS_WINDOW_MS)
+    }
+
+    @Test
+    fun aReadingLaggingSixMinutes_stillAlarmsOnAHypo() {
+        // THE BUG: Abbott's follower feed routinely runs several minutes behind, so a genuine hypo
+        // arriving 6 minutes old used to return NONE — no ring, no banner, indistinguishable from a
+        // safe glucose. This is the case that has to stay loud.
+        val lagging = GlucoseReading(timestampMs = ago(6), valueMgDl = 52, trend = Trend.FALLING)
+        assertEquals(AlertKind.LOW, GlucoseAlert.of(lagging, listOf(lagging), now).kind)
+        assertTrue(GlucoseAlert.of(lagging, listOf(lagging), now).ringsAlarm)
+    }
+
+    @Test
+    fun aGenuinelyLostSignal_stillGoesQuiet() {
+        // The safety half still holds: nothing is alarmed on truly ancient data.
+        val ancient = GlucoseReading(timestampMs = ago(20), valueMgDl = 52, trend = Trend.FALLING)
+        assertEquals(AlertKind.NONE, GlucoseAlert.of(ancient, listOf(ancient), now).kind)
     }
 
     @Test
