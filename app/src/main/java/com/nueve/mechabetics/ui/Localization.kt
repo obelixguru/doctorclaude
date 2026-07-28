@@ -23,22 +23,6 @@ fun langFromCode(code: String?): Lang = if (code == "es") Lang.ES else Lang.FR
  * lands here, so call sites keep saying `s.myString`. NEVER let either class approach 254.
  */
 data class StringsX(
-    val roleTitle: String,
-    val roleIntro: String,
-    val roleParentTitle: String,
-    val roleParentBody: String,
-    val roleChildTitle: String,
-    val roleChildBody: String,
-    val roleChildBodyNamed: String,
-    val roleChangeLater: String,
-    val roleBadgeTitle: String,
-    val roleBadgeParent: String,
-    val roleBadgeChild: String,
-    val roleBadgeChildNamed: String,
-    val roleBadgeParentNote: String,
-    val roleBadgeChildNote: String,
-    val roleChange: String,
-    val rolePatientsLocked: String,
     val serviceDownRate: String,
     val serviceDownAuth: String,
     val serviceDownAi: String,
@@ -318,22 +302,6 @@ data class Strings(
     val x: StringsX,
 ) {
     // Delegating accessors so splitting the class stayed invisible to every call site.
-    val roleTitle: String get() = x.roleTitle
-    val roleIntro: String get() = x.roleIntro
-    val roleParentTitle: String get() = x.roleParentTitle
-    val roleParentBody: String get() = x.roleParentBody
-    val roleChildTitle: String get() = x.roleChildTitle
-    val roleChildBody: String get() = x.roleChildBody
-    val roleChildBodyNamed: String get() = x.roleChildBodyNamed
-    val roleChangeLater: String get() = x.roleChangeLater
-    val roleBadgeTitle: String get() = x.roleBadgeTitle
-    val roleBadgeParent: String get() = x.roleBadgeParent
-    val roleBadgeChild: String get() = x.roleBadgeChild
-    val roleBadgeChildNamed: String get() = x.roleBadgeChildNamed
-    val roleBadgeParentNote: String get() = x.roleBadgeParentNote
-    val roleBadgeChildNote: String get() = x.roleBadgeChildNote
-    val roleChange: String get() = x.roleChange
-    val rolePatientsLocked: String get() = x.rolePatientsLocked
     // Each simply forwards to the same-named property on the overflow group.
     val serviceDownRate: String get() = x.serviceDownRate
     val serviceDownAuth: String get() = x.serviceDownAuth
@@ -603,22 +571,6 @@ val StringsFr = Strings(
     serviceDownReach = "⚠️ Service Dr Claude injoignable — historique, stats et analyses indisponibles. Ta glycémie et les alarmes fonctionnent toujours.",
     serviceDownCredits = "⚠️ IA indisponible : plus de crédits / quota atteint. Le suivi glycémie et les alarmes continuent.",
     x = StringsX(
-        roleTitle = "À qui est ce téléphone ?",
-        roleIntro = "Un même compte peut suivre plusieurs personnes. Dire à qui appartient ce téléphone évite qu'une insuline ou un repas soit enregistré sur le mauvais dossier.",
-        roleParentTitle = "Le téléphone du parent",
-        roleParentBody = "Accès à toutes les personnes suivies, avec possibilité de basculer de l'une à l'autre.",
-        roleChildTitle = "Le téléphone de la personne diabétique",
-        roleChildBody = "Ce téléphone restera sur un seul dossier. Impossible d'enregistrer par erreur sur celui de quelqu'un d'autre.",
-        roleChildBodyNamed = "Ce téléphone restera sur le dossier de %s. Impossible d'enregistrer par erreur sur celui de quelqu'un d'autre.",
-        roleChangeLater = "Modifiable à tout moment dans Profil.",
-        roleBadgeTitle = "CE TÉLÉPHONE",
-        roleBadgeParent = "Téléphone du parent",
-        roleBadgeChild = "Téléphone de la personne diabétique",
-        roleBadgeChildNamed = "Téléphone de %s",
-        roleBadgeParentNote = "Toutes les personnes suivies sont accessibles depuis ce téléphone.",
-        roleBadgeChildNote = "Verrouillé sur un seul dossier : aucun enregistrement ne peut partir sur celui de quelqu'un d'autre.",
-        roleChange = "Changer",
-        rolePatientsLocked = "Ce téléphone est verrouillé sur cette personne. Passe en téléphone du parent pour changer.",
         serviceDownRate = "⚠️ IA saturée (trop de requêtes) — réessaie dans un instant.",
         serviceDownAuth = "⚠️ Problème de clé IA — vérifie-la dans Profil (ou active le mode Hosted).",
         serviceDownAi = "⚠️ IA indisponible pour le moment. Le suivi glycémie et les alarmes continuent.",
@@ -879,22 +831,6 @@ val StringsEs = Strings(
     serviceDownReach = "⚠️ Servicio Dr Claude no disponible — historial, estadísticas y análisis no disponibles. Tu glucosa y las alarmas siguen funcionando.",
     serviceDownCredits = "⚠️ IA no disponible: sin créditos / cuota agotada. El seguimiento de glucosa y las alarmas continúan.",
     x = StringsX(
-        roleTitle = "¿De quién es este teléfono?",
-        roleIntro = "Una misma cuenta puede seguir a varias personas. Decir de quién es este teléfono evita que una insulina o una comida se guarde en el historial equivocado.",
-        roleParentTitle = "El teléfono del padre o de la madre",
-        roleParentBody = "Acceso a todas las personas seguidas, con la posibilidad de cambiar entre ellas.",
-        roleChildTitle = "El teléfono de la persona con diabetes",
-        roleChildBody = "Este teléfono se quedará en un solo historial. Imposible guardar por error en el de otra persona.",
-        roleChildBodyNamed = "Este teléfono se quedará en el historial de %s. Imposible guardar por error en el de otra persona.",
-        roleChangeLater = "Se puede cambiar en cualquier momento desde Perfil.",
-        roleBadgeTitle = "ESTE TELÉFONO",
-        roleBadgeParent = "Teléfono del padre o de la madre",
-        roleBadgeChild = "Teléfono de la persona con diabetes",
-        roleBadgeChildNamed = "Teléfono de %s",
-        roleBadgeParentNote = "Todas las personas seguidas son accesibles desde este teléfono.",
-        roleBadgeChildNote = "Bloqueado en un solo historial: nada puede guardarse en el de otra persona.",
-        roleChange = "Cambiar",
-        rolePatientsLocked = "Este teléfono está bloqueado en esta persona. Cambia a teléfono del padre para poder cambiarla.",
         serviceDownRate = "⚠️ IA saturada (demasiadas peticiones) — reinténtalo en un momento.",
         serviceDownAuth = "⚠️ Problema con la clave de IA — revísala en Perfil (o activa el modo Hosted).",
         serviceDownAi = "⚠️ IA no disponible ahora mismo. El seguimiento de glucosa y las alarmas continúan.",

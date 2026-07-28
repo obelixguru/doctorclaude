@@ -53,26 +53,6 @@ class CredentialsStore(context: Context) {
         get() = prefs.getString(KEY_LANG, "fr") ?: "fr"
         set(v) = prefs.edit().putString(KEY_LANG, v).apply()
 
-    /**
-     * Whose phone this is: [ROLE_PARENT], [ROLE_CHILD], or null while it has never been chosen.
-     *
-     * One LibreLinkUp account can follow several people, and the Profile tab lets you switch between
-     * them. On the child's own phone that switch is a hazard, not a feature: insulin and meals logged
-     * there landed on the parent's record. A child device is therefore PINNED to
-     * [lockedPatientId] — the person it was set up for — and cannot switch away.
-     */
-    var deviceRole: String?
-        get() = prefs.getString(KEY_DEVICE_ROLE, null)
-        set(v) = prefs.edit().putString(KEY_DEVICE_ROLE, v).apply()
-
-    /** The one patient a CHILD device may ever write to. Null on a parent device (no restriction). */
-    var lockedPatientId: String?
-        get() = prefs.getString(KEY_LOCKED_PATIENT, null)
-        set(v) = prefs.edit().putString(KEY_LOCKED_PATIENT, v).apply()
-
-    /** True when this phone must stay on a single patient — i.e. it is the child's own device. */
-    val isChildDevice: Boolean get() = deviceRole == ROLE_CHILD
-
     /** Meal-time reminders (08/12/16/20h) on/off. Default on. */
     var mealRemindersEnabled: Boolean
         get() = prefs.getBoolean(KEY_MEAL_REMINDERS, true)
@@ -427,12 +407,5 @@ class CredentialsStore(context: Context) {
         private const val KEY_LAST_REPORT_LANG = "last_report_lang"
         private const val KEY_ACCESS_TOKEN = "access_token"
         private const val KEY_ACCESS_TOKEN_PATIENT = "access_token_patient"
-        private const val KEY_DEVICE_ROLE = "device_role"
-        private const val KEY_LOCKED_PATIENT = "locked_patient"
-
-        /** This phone belongs to the carer: every followed patient is reachable and switchable. */
-        const val ROLE_PARENT = "parent"
-        /** This phone belongs to the person with diabetes: pinned to their own record only. */
-        const val ROLE_CHILD = "child"
     }
 }

@@ -63,9 +63,6 @@ fun ProfileScreen(
     onOpenNotifications: () -> Unit = {},
     patients: List<PatientChoice> = emptyList(),
     onSwitchPatient: (String) -> Unit = {},
-    /** This phone is pinned to a single person (see CredentialsStore.deviceRole). */
-    isChildDevice: Boolean = false,
-    onChangeRole: () -> Unit = {},
     onRefreshPatients: () -> Unit = {},
     header: @Composable () -> Unit = {}
 ) {
@@ -271,14 +268,6 @@ fun ProfileScreen(
             // --- Patients de ce compte : basculer entre plusieurs personnes suivies par le MÊME
             //     compte LibreLinkUp (ex. un parent qui suit deux diabétiques). Masqué s'il n'y en
             //     a qu'un. Les données sont isolées par patient côté serveur (subject = sha256(id)).
-            // Whose phone this is — always visible, so a pinned device is never a silent mode the
-            // user has to deduce from a missing button.
-            DeviceRoleBadge(
-                isChild = isChildDevice,
-                patientLabel = patients.firstOrNull { it.active }?.label,
-                onChange = onChangeRole
-            )
-
             if (patients.size > 1) {
                 val es = lang.code.equals("es", ignoreCase = true)
                 Surface(
@@ -297,12 +286,6 @@ fun ProfileScreen(
                             else "Basculez entre les personnes suivies par ce compte LibreLinkUp. Les données de chaque personne sont séparées.",
                             color = InkMuted, fontSize = 11.sp, lineHeight = 15.sp
                         )
-                        if (isChildDevice) {
-                            Text(
-                                LocalStrings.current.rolePatientsLocked,
-                                color = GlucoseStatus.WARNING.strong, fontSize = 11.sp, lineHeight = 15.sp
-                            )
-                        }
                         patients.forEach { p ->
                             Surface(
                                 color = if (p.active) AccentGreen.copy(alpha = 0.08f) else CardWhite,
@@ -310,7 +293,7 @@ fun ProfileScreen(
                                 border = BorderStroke(1.dp, if (p.active) AccentGreen else BorderLight),
                                 modifier = Modifier
                                     .fillMaxWidth()
-                                    .then(if (!p.active && !isChildDevice) Modifier.clickable { onSwitchPatient(p.patientId) } else Modifier)
+                                    .then(if (!p.active) Modifier.clickable { onSwitchPatient(p.patientId) } else Modifier)
                             ) {
                                 Row(
                                     modifier = Modifier.padding(start = 12.dp, end = 12.dp, top = 10.dp, bottom = 10.dp),
