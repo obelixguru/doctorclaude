@@ -582,7 +582,12 @@ class MainActivity : ComponentActivity() {
 
         // Periodic safety reminder: nudge the user not to follow the AI blindly.
         LaunchedEffect(state.isLoggedIn, consented) {
-            if (consented && state.isLoggedIn &&
+            // The weekly "Dr Claude can be wrong" reminder used to pop up over the dashboard on
+            // launch. Removed at the user's request: the full disclaimer is already accepted once on
+            // the consent screen, and every analysis carries DoseDisclaimer under it, so the warning
+            // is still present where a dose is actually read — just not as a recurring interruption.
+            // Flip this back on by restoring the condition below.
+            if (false && consented && state.isLoggedIn &&
                 System.currentTimeMillis() - store.lastSafetyPromptMs > Safety.SAFETY_PROMPT_INTERVAL_MS
             ) showSafety = true
         }
