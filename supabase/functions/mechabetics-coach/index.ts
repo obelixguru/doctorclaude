@@ -13,6 +13,8 @@ import {
   combinedActionLine,
   situationHint,
   stripInsulinNumbers,
+  noDoseDue,
+  softenCorrectionTalk,
   mealCarbSpeed,
   predictiveAdvice,
   predictiveLine,
@@ -518,7 +520,7 @@ function mealSpikeNote(meals: any[], sorted: { ts: number; value: number }[], no
   return "";
 }
 
-function buildPrompt(cur: number | null, s: any, lang: string, ctx: string, swing: string, pr: Record<string, string>, hint: string, recent: string, stability: { word: string; note: string }, signalLost: boolean, staleMin: number, sensorExpired: boolean): string {
+function buildPrompt(cur: number | null, s: any, lang: string, ctx: string, swing: string, pr: Record<string, string>, hint: string, recent: string, stability: { word: string; note: string }, signalLost: boolean, staleMin: number, sensorExpired: boolean, actionLine: string, noDose: boolean): string {
   const curMg = cur != null ? `${cur} mg/dL` : (lang === "es" ? "desconocida" : "inconnue");
   const evo = evoLine(s, lang);
   const quality = dayQuality(s, lang); // the day's VERDICT (from time-in-range), not the stability word
@@ -527,6 +529,15 @@ function buildPrompt(cur: number | null, s: any, lang: string, ctx: string, swin
   const tToday = s?.tir_today_cal ?? s?.tir_24h, aToday = s?.avg_today_cal ?? s?.avg_24h,
     hiToday = s?.pct_high_today_cal ?? s?.pct_high_24h, loToday = s?.pct_low_today_cal ?? s?.pct_low_24h,
     mxToday = s?.max_today_cal ?? s?.max_24h, mnToday = s?.min_today_cal ?? s?.min_24h;
+  // THE DECISION IS ALREADY MADE, and the model is told so before it writes a word. Without this it
+  // wrote the bilan blind and then had a code-owned action stapled underneath, which is how "une
+  // chute rapide à corriger" ended up above "rien à corriger". The reserved-vocabulary clause is the
+  // part that actually does the work: the model keeps its observations, the system keeps the verb.
+  const decided = actionLine
+    ? (lang === "es"
+      ? `ACCIÓN YA DECIDIDA POR EL SISTEMA (se mostrará TAL CUAL debajo de tu texto): «${actionLine}». Es la que manda: tu análisis NUNCA debe contradecirla.${noDose ? ` El sistema ha concluido que AHORA MISMO no hay NADA que tomar ni que corregir — así que no escribas en ningún campo que haya que corregir, resucar o inyectar. Un pico o una bajada de HOY se cuentan en pasado, como algo OBSERVADO y a vigilar, nunca como una consigna para ahora.` : ""} El verbo «corregir» y toda orden de actuar ahora pertenecen a esa línea de acción, no a ti.`
+      : `ACTION DÉJÀ DÉCIDÉE PAR LE SYSTÈME (elle sera affichée TELLE QUELLE sous ton texte) : «${actionLine}». C'est elle qui fait foi : ton analyse ne doit JAMAIS la contredire.${noDose ? ` Le système a conclu qu'il n'y a RIEN à prendre ni à corriger MAINTENANT — n'écris donc dans aucun champ qu'il faut corriger, resucrer ou injecter. Un pic ou une chute d'AUJOURD'HUI se racontent au passé, comme quelque chose d'OBSERVÉ et à surveiller, jamais comme une consigne pour maintenant.` : ""} Le verbe « corriger » et toute consigne d'agir maintenant appartiennent à cette ligne d'action, pas à toi.`)
+    : "";
   const noNumbers = lang === "es"
     ? `IMPORTANTE — DOSIS: NO escribas tú ningún número de dosis (unidades de insulina, gramos o terrones) en "display" ni "voice". El sistema calcula y añade la acción exacta. Tú haces el análisis del día y dices, sin cifras, qué tipo de acción toca.`
     : `IMPORTANT — DOSE : n'écris TOI-MÊME AUCUN chiffre de dose (unités d'insuline, grammes, morceaux) dans "display" ni "voice". Le système calcule et ajoute l'action exacte. Toi, tu fais l'analyse du jour et tu dis, sans chiffre, quel type d'action s'impose.`;
@@ -556,8 +567,9 @@ function buildPrompt(cur: number | null, s: any, lang: string, ctx: string, swin
       `COMPARACIÓN CON AYER: para decir si el día es mejor, peor o comparable a ayer, básate ÚNICAMENTE en el veredicto «Evolución» de arriba (compara el tiempo en objetivo). La palabra de ESTABILIDAD describe SOLO las oscilaciones de hoy: NUNCA escribas «más estable que ayer» ni «menos estable que ayer». Un día poco agitado pero a menudo por encima del objetivo es ESTABLE *y* PEOR que ayer — estabilidad (oscilaciones) y control (tiempo en objetivo) son cosas distintas. NO reescribas los porcentajes (de hoy ni de ayer): el sistema añade la comparación con cifras.`,
       swing,
       hint ? `SITUACIÓN (la calcula el sistema): ${hint}.` : "",
+      decided,
       `ESTRUCTURA: rellena CADA campo con UNA frase corta (el sistema los pone en líneas separadas) — "day" = opinión CUALITATIVA del día (bueno/difícil y por qué: picos, bajadas) SIN cifras (% / media — el sistema añade la línea con cifras); "hour" = la última hora (la tendencia); "now" = los últimos 10 minutos (dónde estamos); "tip" = un punto concreto a mejorar, deducido de los datos. La acción con cifras y lo que se ha tenido en cuenta se añaden aparte; no los escribas tú.`,
-      P(pr, "coach.rules", `REGLAS: habla del DÍA que acaba de pasar y enlázalo con los días previos. El objetivo es 70-180; lo más alto del día es un pico a corregir, no un techo aceptable. Tono directo, motivador, basado en cifras. Resalta los progresos. Sin falsas promesas de cura.`),
+      P(pr, "coach.rules", `REGLAS: habla del DÍA que acaba de pasar y enlázalo con los días previos. El objetivo es 70-180; lo más alto del día no es un techo aceptable — dilo como un pico OBSERVADO, a evitar los próximos días, no como una consigna para ahora. Tono directo, motivador, basado en cifras. Resalta los progresos. Sin falsas promesas de cura.`),
       `COMIDAS: la lista « Comidas de hoy » (arriba, con las horas) dice qué se ha COMIDO y cuándo — úsala para ligar las variaciones de glucosa a las comidas (un pico tras tal comida, etc.). NUNCA afirmes que no se registró ninguna comida si la lista contiene alguna.`,
       `VELOCIDAD DE LOS CARBOHIDRATOS: un azúcar rápido (zumo, refresco, dulces, pan blanco) sube la glucosa MUY RÁPIDO (pico ~15-45 min); los carbohidratos lentos (pasta, legumbres, integral) y las comidas grasas suben DESPACIO y TARDE (pico 2-3 h después). Tenlo en cuenta para EXPLICAR las variaciones y el momento de los picos, y para el TIMING del bolo (azúcar rápido → pre-bolo; lento/graso → más tarde o dividido).`,
       `AZÚCAR: para una hipo (<70), aconseja SOLO terrones de azúcar — nada de refrescos ni zumos (más fácil de dosificar, evita malos hábitos). Solo se toma azúcar por debajo de 70; si baja pero está en rango (70-180), di que tenga azúcar a mano y vigile, NO que lo tome ya. POR ENCIMA DE 180 (hiper), NO hables de azúcar — hace falta una corrección de insulina, no azúcar.`,
@@ -594,8 +606,12 @@ function buildPrompt(cur: number | null, s: any, lang: string, ctx: string, swin
     `COMPARAISON À HIER : pour dire si la journée est meilleure, moins bonne ou comparable à hier, fie-toi UNIQUEMENT au verdict « Évolution » ci-dessus (il compare le temps dans la cible). Le mot de STABILITÉ ne décrit QUE les oscillations d'aujourd'hui : n'écris JAMAIS « plus stable qu'hier » ni « moins stable qu'hier ». Une journée peu agitée mais souvent au-dessus de la cible est STABLE *et* MOINS BONNE qu'hier — la stabilité (les oscillations) et le contrôle (le temps dans la cible) sont deux choses distinctes. Ne réécris PAS les pourcentages (d'aujourd'hui ou d'hier) : le système ajoute la comparaison chiffrée.`,
     swing,
     hint ? `SITUATION (calculée par le système) : ${hint}.` : "",
+    decided,
     `STRUCTURE : remplis CHAQUE champ avec UNE phrase courte (le système les met sur des lignes séparées) — "day" = avis QUALITATIF sur la journée (bonne/difficile et pourquoi : pics, chutes) SANS chiffre (% / moyenne — le système ajoute la ligne chiffrée d'aujourd'hui) ; "hour" = la dernière heure (la tendance) ; "now" = les 10 dernières minutes (où on en est) ; "tip" = un point concret à améliorer, déduit des données. L'action chiffrée et ce qui a été pris en compte sont ajoutés séparément ; ne les écris pas toi-même.`,
-    P(pr, "coach.rules", `RÈGLES : parle de la JOURNÉE écoulée et relie-la aux jours précédents. La cible est 70-180 ; le point le plus haut du jour est un pic à corriger, pas un plafond acceptable. Ton direct, motivant, basé sur les chiffres. Souligne les progrès. Pas de fausse promesse de guérison.`),
+    // "un pic à corriger" removed from the default: it was the prompt itself pushing the model toward
+    // the exact wording that then contradicted "rien à corriger". Same meaning, stated as an
+    // observation about the day instead of an instruction for now.
+    P(pr, "coach.rules", `RÈGLES : parle de la JOURNÉE écoulée et relie-la aux jours précédents. La cible est 70-180 ; le point le plus haut du jour n'est pas un plafond acceptable — dis-le comme un pic OBSERVÉ, à éviter les prochains jours, pas comme une consigne pour maintenant. Ton direct, motivant, basé sur les chiffres. Souligne les progrès. Pas de fausse promesse de guérison.`),
     `REPAS : la liste « Repas d'aujourd'hui » (ci-dessus, avec les heures) dit ce qui a été MANGÉ et quand — sers-t'en pour relier les variations de glycémie aux repas (un pic après tel repas, etc.). N'affirme JAMAIS qu'aucun repas n'a été loggé si la liste en contient.`,
     `VITESSE DES GLUCIDES : un sucre rapide (jus, soda, bonbons, pain blanc) fait monter la glycémie TRÈS VITE (pic ~15-45 min) ; les glucides lents (pâtes, légumineuses, complet) et les repas gras la font monter LENTEMENT et TARD (pic 2-3 h après). Tiens-en compte pour EXPLIQUER les variations et le moment des pics, et pour le TIMING du bolus (sucre rapide → pré-bolus ; lent/gras → plus tard ou étalé).`,
     `SUCRE : pour une hypo (<70), conseille UNIQUEMENT des morceaux de sucre — pas de soda ni de jus (plus simple à doser, évite les mauvaises habitudes). On ne prend du sucre que sous 70 ; si ça descend mais reste dans la cible (70-180), dis de garder du sucre à portée et de surveiller, PAS d'en prendre tout de suite. Au-dessus de 180 (hyper), ne parle PAS de sucre — c'est une CORRECTION d'insuline qu'il faut, pas du sucre.`,
@@ -776,11 +792,28 @@ Deno.serve(async (req: Request) => {
     const stability = dayStability(stats, cv, lang);
     // Red-flag a meal that spiked the glucose (esp. a fatty one → delayed rise, split-bolus advice).
     const spikeNote = mealSpikeNote(meals ?? [], sorted, nowMs, lang);
+    // DECIDE THE ACTION BEFORE WRITING THE ANALYSIS. It used to be computed after the model had
+    // already written its bilan, so the model was describing the day with no idea what the app was
+    // about to tell the user to do — and the two collided: "bonne journée mais une chute rapide à
+    // corriger" printed directly above "Action : dans la cible, rien à corriger". Everything this
+    // needs is deterministic and available here, so the decision now leads and the prose follows it.
+    const actionLine = signalLost
+      ? (sensorExpired
+        ? (lang === "es"
+          ? "Sensor caducado: pon un sensor NUEVO lo antes posible (cuenta ~1 h de arranque); mientras tanto, decide solo con una punción capilar."
+          : "Capteur expiré : pose un NOUVEAU capteur dès que possible (compte ~1 h de démarrage) ; en attendant, décide uniquement avec un test au doigt.")
+        : (lang === "es"
+          ? "Señal perdida: reconecta el sensor (acerca el teléfono que lo escanea, vuelve a escanear); si no vuelve, hazte una punción capilar antes de cualquier decisión."
+          : "Signal perdu : reconnecte le capteur (rapproche le téléphone qui le scanne, re-scanne) ; s'il ne revient pas, fais un test au doigt avant toute décision."))
+      : guard.reason === "in_range"
+        ? inRangeActionLine(meals ?? [], insulin ?? [], sorted, nowMs, gp, lang)
+        : combinedActionLine(guard, 0, lang, gp);
     const pr = await loadPrompts(lang);
     const prompt = buildPrompt(
       cur, stats, lang,
       ctx + (mealNudgeNote ? " " + mealNudgeNote : "") + (spikeNote ? " " + spikeNote : ""),
       swing, pr, hint, recent, stability, signalLost, staleMin, sensorExpired,
+      actionLine, noDoseDue(guard),
     );
     let raw = "";
     try {
@@ -839,6 +872,16 @@ Deno.serve(async (req: Request) => {
     const insulinForbidden = guard.maxInsulinUnits === 0;
     if (insulinForbidden) { display = stripInsulinNumbers(display) || display; voice = stripInsulinNumbers(voice) || voice; }
 
+    // Last line of defence on the contradiction: the prompt tells the model the decision and reserves
+    // "corriger" for the system, but a model will still slip. When nothing is due, the narrative may
+    // not say anything is "to correct" — the observation stays, as something to WATCH. Deliberately
+    // here, BEFORE the action line is appended below, or it would rewrite the action's own
+    // "rien à corriger" into nonsense.
+    if (noDoseDue(guard) && !signalLost) {
+      display = softenCorrectionTalk(display, lang);
+      voice = softenCorrectionTalk(voice, lang);
+    }
+
     // Transparency: ALWAYS state what was accounted for (insulin on board + last meal) so the action
     // below is trustworthy — e.g. "no insulin now" reads as a decision (a dose is already working),
     // not an oversight — and the user knows to log a dose/meal when the system says none is recorded.
@@ -851,22 +894,12 @@ Deno.serve(async (req: Request) => {
     // range, keep monitoring"); otherwise the code-owned dose action (sugar / correction / wait).
     const showAction = signalLost || guard.reason !== "no_reading";
     if (showAction) {
-      // Signal lost → never append a dose off a value we don't trust; tell the user to fingerstick
-      // first (matches the screen's NO SIGNAL state and the guard's stale_data safety stance).
-      const line = signalLost
-        ? (sensorExpired
-          ? (lang === "es"
-            ? "Sensor caducado: pon un sensor NUEVO lo antes posible (cuenta ~1 h de arranque); mientras tanto, decide solo con una punción capilar."
-            : "Capteur expiré : pose un NOUVEAU capteur dès que possible (compte ~1 h de démarrage) ; en attendant, décide uniquement avec un test au doigt.")
-          : (lang === "es"
-            ? "Señal perdida: reconecta el sensor (acerca el teléfono que lo escanea, vuelve a escanear); si no vuelve, hazte una punción capilar antes de cualquier decisión."
-            : "Signal perdu : reconnecte le capteur (rapproche le téléphone qui le scanne, re-scanne) ; s'il ne revient pas, fais un test au doigt avant toute décision."))
-        : guard.reason === "in_range"
-          ? inRangeActionLine(meals ?? [], insulin ?? [], sorted, nowMs, gp, lang)
-          : combinedActionLine(guard, 0, lang, gp);
+      // The SAME string the model was shown above (signal loss included — never append a dose off a
+      // value we don't trust). Computed once, so what the analysis was told and what the user reads
+      // cannot drift apart.
       const label = lang === "es" ? "Acción" : "Action";
-      display = `${display}\n\n${label} : ${line}`;
-      voice = `${voice} ${line}`.trim();
+      display = `${display}\n\n${label} : ${actionLine}`;
+      voice = `${voice} ${actionLine}`.trim();
     }
 
     // A hypo while rapid insulin is STILL on board keeps falling — one rescue often won't hold (the

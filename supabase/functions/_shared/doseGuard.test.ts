@@ -15,6 +15,8 @@ import {
   iobSystemLine,
   combinedActionLine,
   stripInsulinNumbers,
+  noDoseDue,
+  softenCorrectionTalk,
   sugarTimingFact,
   hypoIobWarning,
   mealCarbSpeed,
@@ -396,6 +398,41 @@ test("inRangeActionLine: falling toward the low end, no meal → keep sugar near
 test("inRangeActionLine: stable in range, nothing pending → 'rien à corriger', ES mirrors", () => {
   assert.match(inRangeActionLine([], [], flat(120), NOW, prof, "fr"), /rien à corriger/);
   assert.match(inRangeActionLine([], [], flat(120), NOW, prof, "es"), /nada que corregir/);
+});
+
+// ---- The analysis must never contradict its own action line -------------------------------------
+// Reported: "bonne journée mais une chute rapide à corriger" printed directly above
+// "Action : dans la cible (70-180), rien à corriger". The narrative was talking about the past day
+// and the action about now, but together they just contradict each other — and the action, being
+// code-computed, is the one to trust.
+
+test("noDoseDue: true when nothing is to be injected or eaten, false for a real dose", () => {
+  assert.equal(noDoseDue(computeGuard({ ...base, glucoseMgdl: 120, trend: "stable" })), true);
+  const hypo = computeGuard({ ...base, glucoseMgdl: 55, trend: "falling" });
+  assert.equal(hypo.sugarGrams > 0, true);
+  assert.equal(noDoseDue(hypo), false);
+  const high = computeGuard({ ...base, glucoseMgdl: 280, trend: "rising" });
+  assert.equal(high.insulinUnits > 0, true);
+  assert.equal(noDoseDue(high), false);
+});
+
+test("softenCorrectionTalk: the observation survives, the pending-action reading does not", () => {
+  const fr = softenCorrectionTalk("Bonne journée, mais une chute rapide à corriger.", "fr");
+  assert.match(fr, /une chute rapide à surveiller/);
+  assert.doesNotMatch(fr, /à corriger/);
+  assert.match(fr, /Bonne journée/); // nothing else touched
+  const es = softenCorrectionTalk("Buen día, pero una bajada rápida a corregir.", "es");
+  assert.match(es, /una bajada rápida a vigilar/);
+  assert.doesNotMatch(es, /a corregir/);
+});
+
+test("softenCorrectionTalk: narrative + in-range action no longer contradict each other", () => {
+  const action = inRangeActionLine([], [], flat(120), NOW, prof, "fr");
+  const narrative = softenCorrectionTalk("Journée correcte, un pic à corriger ce soir.", "fr");
+  const shown = `${narrative}\n\nAction : ${action}`;
+  // Exactly one "corriger" left in the whole analysis: the code-owned "rien à corriger".
+  assert.equal(shown.match(/corriger/g)?.length, 1);
+  assert.match(shown, /rien à corriger/);
 });
 
 // ---- Planned (announced) meal: the bolus happens AT EATING TIME, never "now" --------------------

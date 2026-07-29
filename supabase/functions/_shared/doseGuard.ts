@@ -208,6 +208,39 @@ export function stripInsulinNumbers(text: string): string {
     .trim();
 }
 
+/** True when the code has decided that nothing is to be injected or eaten RIGHT NOW. Read off the
+ *  amounts rather than the reason codes so a new reason can't silently slip past it. */
+export function noDoseDue(g: GuardResult): boolean {
+  return !(g.insulinUnits > 0) && !(g.sugarGrams > 0);
+}
+
+/**
+ * Backstop against the analysis contradicting its own action line.
+ *
+ * The reported case: "bonne journée mais une chute rapide à corriger" sitting directly above
+ * "Action : dans la cible (70-180), rien à corriger". Both were right about different things — the
+ * narrative was commenting on a drop that happened during the DAY, the action is about NOW — but read
+ * together they simply contradict each other, and the user (correctly) trusts the action, which is
+ * code-computed, over the model's prose.
+ *
+ * The prompt now states the decided action and reserves "corriger" for the system, but a model will
+ * still slip, so this makes it deterministic: when the guard says nothing is due, the narrative may
+ * no longer say anything is "to correct". Only the *pending-action* reading is removed — "à corriger"
+ * becomes "à surveiller", so the observation itself survives, in the register the day summary should
+ * have used in the first place. Same shape as [stripInsulinNumbers]: tell the model, then enforce it.
+ *
+ * Run on the narrative ONLY, and BEFORE the code-owned action line is appended — otherwise it would
+ * rewrite the action's own "rien à corriger".
+ */
+export function softenCorrectionTalk(text: string, lang: string): string {
+  if (!text) return text;
+  // No \b before "à": JS word boundaries are ASCII-only, so \bà never matches after a space. The ES
+  // side keeps \b on purpose — it is what stops "azúcar para corregir una hipo" being rewritten.
+  return lang === "es"
+    ? text.replace(/\ba\s+corregir\b/gi, "a vigilar")
+    : text.replace(/à\s+corriger\b/gi, "à surveiller");
+}
+
 /** Clamp a model-proposed insulin dose to the guard. Returns the safe units + whether we overrode. */
 export function clampInsulin(modelUnits: number, g: GuardResult): { units: number; overridden: boolean } {
   const m = Number.isFinite(modelUnits) ? Math.max(0, modelUnits) : 0;
