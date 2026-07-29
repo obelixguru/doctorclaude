@@ -82,6 +82,7 @@ class LibreLinkUpClient(private val store: CredentialsStore) {
         return try {
             http.newCall(req).execute().use { res ->
                 val raw = res.body?.string().orEmpty()
+                if (res.code == 429) return rateLimited()
                 if (!res.isSuccessful) {
                     return LibreResult.Error("Login HTTP ${res.code}: ${raw.take(200)}")
                 }
@@ -168,12 +169,21 @@ class LibreLinkUpClient(private val store: CredentialsStore) {
                 if (res.code == 401 || res.code == 403) {
                     return@withContext LibreResult.Error("Session expirée", needsLogin = true)
                 }
+                if (res.code == 429) return@withContext rateLimited()
                 if (!res.isSuccessful) return@withContext LibreResult.Error("HTTP ${res.code}")
                 val root = JSONObject(raw)
                 val arr = root.optJSONArray("data")
                 if (arr == null) {
-                    Log.i("LLU", "connections HTTP=" + res.code + " AUCUN tableau data — compte sans patient partage")
-                    return@withContext LibreResult.Success(emptyList())
+                    // HTTP 200 but no `data` ARRAY. Two very different situations used to land here as
+                    // the same Success(emptyList()): an account that genuinely follows nobody, and a
+                    // body we simply didn't understand (Abbott maintenance/soft-throttle page, a shape
+                    // change, `data` sent as an object). GlucoseRepository reads an empty list as "the
+                    // sharing invitation was revoked" and says so in red — so an unparseable body
+                    // accused the user's account of a problem it did not have, right after a 429.
+                    // Only a real empty array means "nobody"; anything else is an error, which leaves
+                    // the already-shown data and the previous connection list untouched.
+                    Log.w("LLU", "connections HTTP=" + res.code + " — pas de tableau data (corps inattendu)")
+                    return@withContext LibreResult.Error("Réponse LibreLinkUp inattendue")
                 }
                 val out = mutableListOf<PatientConnection>()
                 for (i in 0 until arr.length()) {
@@ -208,6 +218,7 @@ class LibreLinkUpClient(private val store: CredentialsStore) {
                 if (res.code == 401 || res.code == 403) {
                     return@withContext LibreResult.Error("Session expirée", needsLogin = true)
                 }
+                if (res.code == 429) return@withContext rateLimited()
                 if (!res.isSuccessful) return@withContext LibreResult.Error("HTTP ${res.code}")
                 val data = JSONObject(raw).optJSONObject("data")
                     ?: return@withContext LibreResult.Error("Pas de données graph")
@@ -285,6 +296,18 @@ class LibreLinkUpClient(private val store: CredentialsStore) {
     companion object {
         private const val TAG = "LibreLinkUp"
         private val JSON_MEDIA = "application/json".toMediaType()
+
+        /**
+         * HTTP 429 from Abbott. Said in plain French because it goes straight into the red banner on
+         * the home screen: a bare "HTTP 429" reads like the app or the sensor broke, when in fact
+         * nothing is wrong and the data comes back on its own. Carries [LibreResult.Error.rateLimited]
+         * so the repository can stand down instead of hammering the account further.
+         */
+        fun rateLimited() = LibreResult.Error(
+            "LibreLinkUp limite temporairement les requêtes. Rien de cassé — les données reprennent " +
+                "toutes seules dans quelques minutes.",
+            rateLimited = true
+        )
         private val TIMESTAMP_PATTERNS = arrayOf(
             "M/d/yyyy h:mm:ss a",
             "MM/dd/yyyy hh:mm:ss a",

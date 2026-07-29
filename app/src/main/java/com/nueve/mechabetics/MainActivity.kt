@@ -725,7 +725,10 @@ class MainActivity : ComponentActivity() {
                     lang = if (lang == Lang.FR) Lang.ES else Lang.FR
                     store.language = lang.code.lowercase()
                 },
-                onRefresh = { lifecycleScope.launch { repo.refresh() } },
+                // refreshManual, not refresh: the automatic path skips a call that lands too soon
+                // after the last one (that spacing is what stops the launch burst earning a 429), and
+                // a button that silently does nothing is worse than a wasted request.
+                onRefresh = { lifecycleScope.launch { repo.refreshManual() } },
                 onLogout = {
                     MonitorService.stop(this@MainActivity)
                     ai.stopSpeaking()

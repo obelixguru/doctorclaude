@@ -61,5 +61,15 @@ data class GraphSnapshot(
 
 sealed class LibreResult<out T> {
     data class Success<T>(val data: T) : LibreResult<T>()
-    data class Error(val message: String, val needsLogin: Boolean = false) : LibreResult<Nothing>()
+    /**
+     * @param needsLogin  the session is gone (401/403) — re-login before retrying.
+     * @param rateLimited Abbott answered HTTP 429. A flag rather than a substring match on [message],
+     *   so the stand-down survives rewording the user-facing text (the old check looked for "429" in
+     *   the message, which silently stops working the moment that text becomes readable French).
+     */
+    data class Error(
+        val message: String,
+        val needsLogin: Boolean = false,
+        val rateLimited: Boolean = false
+    ) : LibreResult<Nothing>()
 }
