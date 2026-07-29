@@ -880,3 +880,70 @@ private val BgStringsEs = BgStrings(
 )
 
 fun bgStringsFor(lang: Lang): BgStrings = if (lang == Lang.ES) BgStringsEs else BgStringsFr
+
+/**
+ * Strings for the device-role screen, kept OUT of [Strings] on purpose.
+ *
+ * [Strings] sits at 252 constructor properties and a dex `invoke-range` tops out at 255 registers
+ * (254 arguments plus `this`). Adding these there would cross the ceiling and the app would refuse to
+ * launch at all — the class verifier rejects LocalizationKt.<clinit> with "invalid arg count (0)",
+ * which COMPILES fine and only fails on a device. Same pattern as [BgStrings] above.
+ */
+data class RoleStrings(
+    val title: String,
+    val intro: String,
+    val parentTitle: String,
+    val parentBody: String,
+    val childTitle: String,
+    val childBody: String,
+    val childBodyNamed: String,
+    val changeLater: String,
+    val badgeTitle: String,
+    val badgeParent: String,
+    val badgeChild: String,
+    val badgeChildNamed: String,
+    val badgeParentNote: String,
+    val badgeChildNote: String,
+    val change: String,
+    val patientsLocked: String,
+)
+
+private val RoleStringsFr = RoleStrings(
+    title = "À qui est ce téléphone ?",
+    intro = "Un même compte peut suivre plusieurs personnes. Dire à qui appartient ce téléphone évite qu'une insuline, un repas ou une analyse vocale se retrouve sur le mauvais dossier.",
+    parentTitle = "Mon téléphone (parent)",
+    parentBody = "Ton propre dossier, et l'accès aux autres personnes suivies pour les consulter. Rien n'est verrouillé.",
+    childTitle = "Le téléphone de la personne suivie",
+    childBody = "Ce téléphone restera sur un seul dossier. Aucun mélange possible avec quelqu'un d'autre.",
+    childBodyNamed = "Ce téléphone restera sur le dossier de %s. Aucun mélange possible avec quelqu'un d'autre.",
+    changeLater = "Modifiable à tout moment dans Profil.",
+    badgeTitle = "CE TÉLÉPHONE",
+    badgeParent = "Mon téléphone (parent)",
+    badgeChild = "Téléphone de la personne suivie",
+    badgeChildNamed = "Téléphone de %s",
+    badgeParentNote = "Ton dossier par défaut ; les autres personnes suivies restent consultables.",
+    badgeChildNote = "Verrouillé sur un seul dossier : rien ne peut partir sur celui de quelqu'un d'autre.",
+    change = "Changer",
+    patientsLocked = "Ce téléphone est verrouillé sur cette personne. Passe en téléphone parent pour changer.",
+)
+
+private val RoleStringsEs = RoleStrings(
+    title = "¿De quién es este teléfono?",
+    intro = "Una misma cuenta puede seguir a varias personas. Decir de quién es este teléfono evita que una insulina, una comida o un análisis de voz acabe en el historial equivocado.",
+    parentTitle = "Mi teléfono (padre o madre)",
+    parentBody = "Tu propio historial, y acceso a las demás personas seguidas para consultarlas. Nada queda bloqueado.",
+    childTitle = "El teléfono de la persona seguida",
+    childBody = "Este teléfono se quedará en un solo historial. Ninguna mezcla posible con otra persona.",
+    childBodyNamed = "Este teléfono se quedará en el historial de %s. Ninguna mezcla posible con otra persona.",
+    changeLater = "Se puede cambiar en cualquier momento desde Perfil.",
+    badgeTitle = "ESTE TELÉFONO",
+    badgeParent = "Mi teléfono (padre o madre)",
+    badgeChild = "Teléfono de la persona seguida",
+    badgeChildNamed = "Teléfono de %s",
+    badgeParentNote = "Tu historial por defecto; las demás personas seguidas siguen consultables.",
+    badgeChildNote = "Bloqueado en un solo historial: nada puede acabar en el de otra persona.",
+    change = "Cambiar",
+    patientsLocked = "Este teléfono está bloqueado en esta persona. Cambia a teléfono de padre para poder cambiarla.",
+)
+
+fun roleStringsFor(lang: Lang): RoleStrings = if (lang == Lang.ES) RoleStringsEs else RoleStringsFr

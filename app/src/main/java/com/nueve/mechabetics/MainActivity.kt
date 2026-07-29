@@ -40,6 +40,7 @@ import com.nueve.mechabetics.data.DEFAULT_INSULIN_ACTION_MIN
 import com.nueve.mechabetics.data.local.LocalHistoryDb
 import com.nueve.mechabetics.ui.AppHeader
 import com.nueve.mechabetics.ui.ConsentScreen
+import com.nueve.mechabetics.ui.DeviceRoleScreen
 import com.nueve.mechabetics.ui.DashboardScreen
 import com.nueve.mechabetics.ui.NetworkBanner
 import com.nueve.mechabetics.ui.ServiceHealthBanner
@@ -193,6 +194,9 @@ class MainActivity : ComponentActivity() {
         var stat24Low by remember { mutableStateOf<Int?>(null) }
         var addingAccount by remember { mutableStateOf(false) }
         var consented by remember { mutableStateOf(store.consentVersion >= Safety.CONSENT_VERSION) }
+        // Whose phone this is (parent / child). Null re-opens the one-time picker — that is also how
+        // "Changer" in Profile works, rather than a separate editing screen.
+        var deviceRole by remember { mutableStateOf(store.deviceRole) }
         var showSafety by remember { mutableStateOf(false) }
         // One-time prompt to whitelist the app from battery optimization so monitoring keeps polling
         // with the screen off (Doze). Shown once per install when logged in and not yet exempt.
@@ -598,6 +602,22 @@ class MainActivity : ComponentActivity() {
                 store.lastSafetyPromptMs = System.currentTimeMillis()
                 consented = true
             })
+        } else if (state.isLoggedIn && !addingAccount && deviceRole == null) {
+            // Asked ONCE, after the account is connected (we need the followed people to name the one
+            // a child device gets pinned to). Never defaulted: guessing wrong is the very error this
+            // prevents — a child logging insulin onto the parent's record.
+            DeviceRoleScreen(
+                lang = lang,
+                patientLabel = state.connections.firstOrNull { it.patientId == state.patientId }
+                    ?.let { "${it.firstName} ${it.lastName}".trim() }
+                    ?.takeIf { it.isNotBlank() },
+                onPick = { isParent ->
+                    store.deviceRole = if (isParent) CredentialsStore.ROLE_PARENT else CredentialsStore.ROLE_CHILD
+                    // Pin the child device to whoever is selected right now; a parent device keeps none.
+                    store.lockedPatientId = if (isParent) null else state.patientId
+                    deviceRole = store.deviceRole
+                }
+            )
         } else {
         if (state.isLoggedIn && !addingAccount) {
             Scaffold(bottomBar = {
@@ -824,17 +844,24 @@ class MainActivity : ComponentActivity() {
                                     active = c.patientId == state.patientId
                                 )
                             },
+                            isChildDevice = store.isChildDevice,
+                            onChangeRole = { deviceRole = null },
                             onSwitchPatient = { pid ->
-                                val nm = state.connections.firstOrNull { it.patientId == pid }
-                                    ?.let { "${it.firstName} ${it.lastName}".trim() }
-                                    .orEmpty()
-                                lifecycleScope.launch {
-                                    ai.stopSpeaking()
-                                    AlarmService.stop(this@MainActivity)
-                                    aiText = ""; aiLang = ""; autoGreeted = false
-                                    repo.switchPatient(pid, nm)
-                                    MonitorService.start(this@MainActivity)
-                                    tab = Tab.GLUCOSE
+                                // Belt to the UI's brace: a child device must never switch patient,
+                                // whatever path reaches this callback. This is the exact mistake the
+                                // role exists to prevent (insulin logged onto the parent's record).
+                                if (!store.isChildDevice) {
+                                    val nm = state.connections.firstOrNull { it.patientId == pid }
+                                        ?.let { "${it.firstName} ${it.lastName}".trim() }
+                                        .orEmpty()
+                                    lifecycleScope.launch {
+                                        ai.stopSpeaking()
+                                        AlarmService.stop(this@MainActivity)
+                                        aiText = ""; aiLang = ""; autoGreeted = false
+                                        repo.switchPatient(pid, nm)
+                                        MonitorService.start(this@MainActivity)
+                                        tab = Tab.GLUCOSE
+                                    }
                                 }
                             },
                             onRefreshPatients = {

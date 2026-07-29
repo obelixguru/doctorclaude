@@ -200,6 +200,7 @@ fun DashboardScreen(
         }
         item {
             AnalysisCard(
+                patientName = patientName,
                 aiText = aiText,
                 aiAt = aiAt,
                 now = now,
@@ -844,6 +845,7 @@ private const val ANALYSIS_TTL_MS = 20 * 60_000L
 
 @Composable
 private fun AnalysisCard(
+    patientName: String = "",
     aiText: String,
     aiAt: Long = 0L,
     now: Long = 0L,
@@ -916,7 +918,14 @@ private fun AnalysisCard(
             ) {
                 Column(Modifier.padding(16.dp)) {
                     Row(verticalAlignment = Alignment.CenterVertically) {
-                        Text(s.momTitle, color = accent, fontSize = 10.sp, fontWeight = FontWeight.Black, letterSpacing = 2.sp)
+                        // NAME the person this analysis is about. One account can follow several
+                        // people, and a spoken hypo analysis that reaches the wrong parent — or is read
+                        // while the other person's record is open — invites acting on the wrong body.
+                        // The title carries the name whenever there is one to carry.
+                        Text(
+                            if (patientName.isNotBlank()) "${s.momTitle} · ${patientName.uppercase()}" else s.momTitle,
+                            color = accent, fontSize = 10.sp, fontWeight = FontWeight.Black, letterSpacing = 2.sp
+                        )
                         if (aiAt > 0L) {
                             Spacer(Modifier.width(8.dp))
                             Text(

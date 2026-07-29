@@ -28,6 +28,9 @@ class GlucoseRepository(
     // Epoch-ms of the last EATEN (non-planned) carbs/sugar, pushed by the UI from the server history,
     // so the BACKGROUND MonitorService's LOW alarm can be rescue-aware (say "let it act" instead of
     // "take sugar now") exactly like the foreground banner + the spoken analysis. 0 = none known.
+    // True once we've asked Abbott for the followed-people list in THIS process. See refresh().
+    @Volatile private var connectionsTried: Boolean = false
+
     @Volatile private var lastRescueMs: Long = 0L
     fun setLastRescueMs(ms: Long) { lastRescueMs = ms }
     /** True if sugar was eaten within the rule-of-15 window — mirror of the dose guard's sugar_recent. */
@@ -68,6 +71,7 @@ class GlucoseRepository(
     }
 
     suspend fun login(email: String, password: String): Boolean {
+        connectionsTried = false
         _state.value = _state.value.copy(isLoading = true, error = null)
         val r = client.login(email, password)
         return when (r) {
@@ -143,6 +147,7 @@ class GlucoseRepository(
     /** Re-read the list of patients this account follows (for the Profile switcher), without touching
      *  the active patient/data. Best-effort: a failure keeps whatever list we already have. */
     suspend fun refreshConnections() {
+        connectionsTried = false
         if (store.token == null) return
         when (val conns = client.listConnections()) {
             is LibreResult.Success -> _state.value = _state.value.copy(connections = conns.data)
@@ -247,9 +252,61 @@ class GlucoseRepository(
                     patientName = "${first.firstName} ${first.lastName}".trim()
                 }
             }
+        } else if (_state.value.connections.isEmpty() && !connectionsTried) {
+            // ONE-SHOT, and that matters more than it looks. An earlier version also retried whenever
+            // the name was blank — but the name stays blank whenever the active patient isn't in the
+            // returned list, so the condition never cleared and this fired on EVERY 60 s poll. That
+            // doubles the call rate against Abbott's follower API and earns an HTTP 429 within a
+            // couple of app launches: the app rate-limits itself. Guarded by a flag so a genuinely
+            // empty list costs exactly one extra call per process, never a per-poll retry.
+            // The followed-people list lives only in memory and used to be fetched ONLY on the branch
+            // above — i.e. only while the active patient was still unknown. After any restart the saved
+            // patientId short-circuits it, so the list stayed empty and the name blank: the header read
+            // "Capteur FreeStyle" instead of the person, and the Profile switcher (shown only when
+            // size > 1) silently vanished — a parent following two people lost access to the second.
+            connectionsTried = true
+            (client.listConnections() as? LibreResult.Success)?.let { c ->
+                _state.value = _state.value.copy(connections = c.data)
+                c.data.firstOrNull { it.patientId == patientId }?.let { me ->
+                    patientName = "${me.firstName} ${me.lastName}".trim()
+                }
+            }
         }
 
-        when (val g = client.fetchGraph(patientId!!)) {
+        // SELF-HEAL A STALE PATIENT ID. Abbott answers HTTP 200 with an EMPTY graph — no points, no
+        // live measurement — when the id we ask for is no longer one of this account's connections.
+        // Nothing looks broken from the outside: no error, no 429, a perfectly successful call that
+        // simply contains nothing. The saved id then keeps being used forever, so the dial sits on
+        // NO SIGNAL, the header shows "Capteur FreeStyle" instead of the person, and the switcher
+        // disappears — while the server, which resolves the patient fresh every run, works fine.
+        // On an empty graph we re-read the connections once and adopt a valid patient.
+        var g0 = client.fetchGraph(patientId!!)
+        if (g0 is LibreResult.Success && g0.data.history.isEmpty() && g0.data.current == null) {
+            (client.listConnections() as? LibreResult.Success)?.let { c ->
+                _state.value = _state.value.copy(connections = c.data)
+                // NO connections at all: the account authenticates (every call answers 200) but nobody
+                // shares a sensor with it any more — a revoked or expired LibreLinkUp invitation. The
+                // graph is then legitimately empty forever, and "NO SIGNAL / rescan your sensor" sends
+                // the user chasing hardware that is working. Say the real cause instead.
+                if (c.data.isEmpty()) {
+                    _state.value = _state.value.copy(
+                        isLoading = false,
+                        error = "Aucun capteur partagé avec ce compte LibreLinkUp. Dans l'app LibreLink du téléphone qui scanne, vérifie que ce compte est bien accepté comme suiveur (invitation révoquée ou expirée)."
+                    )
+                    return
+                }
+                val valid = c.data.firstOrNull { it.patientId == patientId } ?: c.data.firstOrNull()
+                if (valid != null && valid.patientId != patientId) {
+                    store.patientId = valid.patientId
+                    patientId = valid.patientId
+                    patientName = ("" + valid.firstName + " " + valid.lastName).trim()
+                    g0 = client.fetchGraph(patientId)
+                } else if (valid != null && patientName.isBlank()) {
+                    patientName = ("" + valid.firstName + " " + valid.lastName).trim()
+                }
+            }
+        }
+        when (val g = g0) {
             is LibreResult.Error -> handleError(g, reloginTried)
             is LibreResult.Success -> {
                 val snapshot = g.data
@@ -319,7 +376,18 @@ class GlucoseRepository(
     suspend fun startPolling(intervalMs: Long = 60_000L) {
         while (true) {
             if (_state.value.isLoggedIn) refresh()
-            delay(intervalMs)
+            // BACK OFF ON 429. Abbott answers "too many requests" once an account has asked too often,
+            // and carrying on at 60 s then pins the account against its own limit so the block never
+            // lifts — the app punishes itself. A 429 is NOT a lost session (401/403 are, and those do
+            // trigger a re-login); it means stop asking for a while, so waiting is the only correct
+            // response.
+            val limited = _state.value.error?.contains("429") == true
+            delay(if (limited) RATE_LIMIT_BACKOFF_MS else intervalMs)
         }
+    }
+
+    companion object {
+        /** How long to stand down after an HTTP 429 before polling again. */
+        const val RATE_LIMIT_BACKOFF_MS = 10 * 60_000L
     }
 }

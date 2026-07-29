@@ -170,7 +170,11 @@ class LibreLinkUpClient(private val store: CredentialsStore) {
                 }
                 if (!res.isSuccessful) return@withContext LibreResult.Error("HTTP ${res.code}")
                 val root = JSONObject(raw)
-                val arr = root.optJSONArray("data") ?: return@withContext LibreResult.Success(emptyList())
+                val arr = root.optJSONArray("data")
+                if (arr == null) {
+                    Log.i("LLU", "connections HTTP=" + res.code + " AUCUN tableau data — compte sans patient partage")
+                    return@withContext LibreResult.Success(emptyList())
+                }
                 val out = mutableListOf<PatientConnection>()
                 for (i in 0 until arr.length()) {
                     val o = arr.getJSONObject(i)
@@ -182,6 +186,7 @@ class LibreLinkUpClient(private val store: CredentialsStore) {
                         current = current
                     )
                 }
+                Log.i("LLU", "connections HTTP=" + res.code + " count=" + out.size)
                 LibreResult.Success(out)
             }
         } catch (e: Exception) {
@@ -218,6 +223,13 @@ class LibreLinkUpClient(private val store: CredentialsStore) {
                 // freshly scanned). Fall back to the most recent graph point so the
                 // dashboard still shows a current value instead of "--".
                 val current = liveCurrent ?: history.lastOrNull()
+                // DIAGNOSTIC: HTTP status, how many points came back and how old the newest one is.
+                // Deliberately no glucose values, no patient id, no token — enough to tell "the call
+                // failed", "the call worked but returned nothing" and "the cloud itself is behind"
+                // apart, which is precisely what could not be distinguished from the outside.
+                val ageMin = if (current != null) (System.currentTimeMillis() - current.timestampMs) / 60000 else -1L
+                Log.i("LLU", "graph HTTP=" + res.code + " points=" + history.size +
+                    " live=" + (liveCurrent != null) + " newestAgeMin=" + ageMin)
                 // connection.sensor.a = the sensor's activation time (epoch SECONDS); a Libre
                 // sensor lives 14 days. Past that, readings stop — surfaced as CAPTEUR EXPIRÉ.
                 val sensorEndMs = connection?.optJSONObject("sensor")
