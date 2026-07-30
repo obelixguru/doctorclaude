@@ -845,13 +845,18 @@ class MainActivity : ComponentActivity() {
                             },
                             onClearLocalData = { repo.clearLocalData() },
                             onOpenNotifications = { showNotifSettings = true },
+                            // Sorted by NAME, not left in the order Abbott happened to return: that
+                            // order changes between two refreshes of the same account, so the rows
+                            // swap places under the finger. Tapping a switcher row is what decides
+                            // whose record the app is on — a list that reorders itself is a tap on
+                            // the wrong person.
                             patients = state.connections.map { c ->
                                 PatientChoice(
                                     patientId = c.patientId,
                                     label = "${c.firstName} ${c.lastName}".trim().ifBlank { c.patientId },
                                     active = c.patientId == state.patientId
                                 )
-                            },
+                            }.sortedBy { it.label.lowercase() },
                             isChildDevice = store.isChildDevice,
                             onChangeRole = { deviceRole = null },
                             onSwitchPatient = { pid ->
