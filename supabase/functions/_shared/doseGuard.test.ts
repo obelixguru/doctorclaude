@@ -993,3 +993,36 @@ test("the label outranks our own reference table, and no drink has a single glob
     assert.match(r, lang === "fr" ? /BAS de la fourchette/ : /parte BAJA/); // unknown -> under, not over
   }
 });
+
+test("the action line NAMES the meal it is dosing", () => {
+  // 23:59, reported live. The app said "1 u de Fiasp pour le repas"; the parent thought of the
+  // dinner three hours earlier and concluded the app was broken. It meant a can of 7up drunk 22
+  // minutes before, and it was right — it just never said which meal. A dose you cannot attach to a
+  // specific food is a dose you cannot check.
+  const child = { carbRatio: 16, correctionFactor: 58, targetMgdl: 120, weightKg: 40, rapidInsulin: "Fiasp" };
+  const now = new Date("2026-07-30T22:59:00Z").getTime();
+  const twoMeals = [
+    { ts: "2026-07-30T19:40:27+00:00", description: "entrecôte avec frites", carbs_g: 50, planned: true },
+    { ts: "2026-07-30T22:37:35+00:00", description: "canette 7up", carbs_g: 16, planned: false },
+  ];
+  const covered = [{ ts: "2026-07-30T19:19:23+00:00", units: 5.5, kind: "rapid", insulin_name: "Fiasp" }];
+  const plan = mealBolusPlan(twoMeals as any, covered as any, now, child);
+  // It picks the UNCOVERED one — the drink — not the dinner that was pre-bolused.
+  assert.equal(plan.units, 1);
+  assert.equal(plan.description, "canette 7up");
+  assert.equal(plan.carbsG, 16);
+
+  const g = computeGuard({ glucoseMgdl: 150, trend: "rising", staleMin: 1, iobUnits: 0, recentHypo: false, profile: child });
+  const line = combinedActionLine(g, plan.units, "fr", child, plan.planned,
+    { description: plan.description, carbsG: plan.carbsG, minutesAgo: plan.minutesAgo });
+  assert.match(line, /canette 7up/);
+  assert.match(line, /16 g/);
+  assert.match(line, /il y a \d+ min/);
+  assert.doesNotMatch(line, /pour le repas\./); // the anonymous wording is gone
+});
+
+test("an unidentified meal still gets a sentence", () => {
+  const g = computeGuard({ glucoseMgdl: 150, trend: "rising", staleMin: 1, iobUnits: 0, recentHypo: false, profile: prof });
+  assert.match(combinedActionLine(g, 2, "fr", prof, false, null), /pour le repas/);
+  assert.match(combinedActionLine(g, 2, "es", prof, false, null), /para la comida/);
+});

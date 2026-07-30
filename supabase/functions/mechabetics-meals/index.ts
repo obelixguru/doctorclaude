@@ -36,9 +36,16 @@ async function estimateCarbs(
     const raw = await chatJson(
       {
         system: `Tu estimes les glucides d'un aliment pour une personne diabétique.${where} ${carbEstimationRules("fr")}${fact ? " " + foodFactLine(fact, "fr") : ""} Réponds UNIQUEMENT en JSON {"carbsG":<grammes entiers de glucides pour TOUT ce qui est décrit>}. Pas de texte.`,
-        user: `Aliment : ${description}`,
+        user: fact
+          ? `Aliment : ${description}`
+          : `Aliment : ${description}${country ? ` — acheté/consommé en ${country}` : ""}. S'il s'agit d'un produit emballé d'une marque, CHERCHE sa valeur nutritionnelle officielle POUR CE PAYS (glucides pour 100 g ou 100 ml) avant de répondre, puis multiplie par la quantité décrite. Le même produit n'a pas la même recette selon le pays.`,
+        // SEARCH THE WORLD FOR A PACKAGED PRODUCT. A brand's carbohydrate content is a public fact
+        // that differs by country, not something to recall — which is how a Spanish 7UP became a
+        // global 35 g. Grounding is skipped when the barcode already gave us the label (nothing to
+        // look up) and it degrades to a plain call when unavailable, so it can only ever add.
+        search: !fact,
         temperature: 0,
-        maxTokens: 200,
+        maxTokens: fact ? 200 : 900,
       },
       { byokGeminiKey: byok, deepseekKey: DEEPSEEK_API_KEY, deepseekModel: DEEPSEEK_MODEL, geminiModel: GEMINI_TEXT_MODEL },
     );

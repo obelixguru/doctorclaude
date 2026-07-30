@@ -18,6 +18,10 @@
 // Pure fetch + Web APIs (no Deno/Node-only calls) so it imports cleanly in edge functions.
 
 export interface LlmRequest {
+  /** Ground the answer in Google Search (Gemini only). For facts that live in the world and change
+   *  by country — a packaged product's carbohydrate content — not for reasoning. Grounding forbids
+   *  responseMimeType=json, so the caller must tolerate JSON wrapped in prose. */
+  search?: boolean;
   system?: string;
   user: string;
   maxTokens?: number;
@@ -155,16 +159,20 @@ async function deepseekJson(req: LlmRequest, key: string, model: string): Promis
 
 async function geminiJson(req: LlmRequest, key: string, model: string): Promise<LlmResult> {
   const sys = req.system ? `${req.system}\n\n` : "";
-  const body = {
+  // Google Search grounding cannot be combined with a forced JSON mime type — the API rejects the
+  // pair — so a grounded call asks for JSON in the prompt instead and the caller digs it out.
+  const grounded = req.search === true;
+  const body: Record<string, unknown> = {
     contents: [{ role: "user", parts: [{ text: sys + req.user }] }],
+    ...(grounded ? { tools: [{ google_search: {} }] } : {}),
     generationConfig: {
       temperature: req.temperature ?? 0.3,
       maxOutputTokens: req.maxTokens ?? DEFAULT_MAX_TOKENS,
-      responseMimeType: "application/json",
+      ...(grounded ? {} : { responseMimeType: "application/json" }),
       // No chain-of-thought for a short JSON answer; thinking would just eat the token budget and
       // risk the same mid-word truncation we fight on the DeepSeek path. (Pro fallback may reject
       // budget 0 with 400 -> the loop simply moves to the next candidate, which accepts it.)
-      thinkingConfig: { thinkingBudget: 0 },
+      ...(grounded ? {} : { thinkingConfig: { thinkingBudget: 0 } }),
     },
   };
   // Try the requested model first, then fall back through known-good models if it 404s. This way
@@ -188,6 +196,26 @@ async function geminiJson(req: LlmRequest, key: string, model: string): Promise<
     lastBody = await r.text();
     lastStatus = r.status;
     lastErr = `Gemini ${r.status} (${m}): ${lastBody.slice(0, 160)}`;
+    // GROUNDING MUST NEVER COST US THE ANSWER. Search grounding is an enhancement — it makes a
+    // packaged product's carbs a looked-up fact instead of a recollection — but a model that does
+    // not support the tool, or an account without it enabled, answers 400. Retry the same model
+    // once WITHOUT the tool rather than losing the estimate entirely.
+    if (grounded && (r.status === 400 || r.status === 403)) {
+      const plain = { ...body };
+      delete (plain as Record<string, unknown>).tools;
+      (plain as any).generationConfig = {
+        ...(body.generationConfig as Record<string, unknown>),
+        responseMimeType: "application/json",
+        thinkingConfig: { thinkingBudget: 0 },
+      };
+      const r2 = await fetch(url, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(plain) });
+      if (r2.ok) {
+        const j2 = await r2.json();
+        const c2 = j2?.candidates?.[0];
+        const parts2 = c2?.content?.parts ?? [];
+        return { content: parts2.map((p: { text?: string }) => p?.text ?? "").join("").trim(), truncated: c2?.finishReason === "MAX_TOKENS" };
+      }
+    }
     if (r.status !== 404 && r.status !== 400) break;
   }
   throw new LlmError(classifyLlmError(lastStatus, lastBody), lastErr, lastStatus);

@@ -712,12 +712,38 @@ export function iobSystemLine(iobUnits: number | null | undefined, lang: string)
  * correction. Hypo dominates (sugar first, never bolus a low). When data is stale a meal bolus
  * is still allowed (it covers food) but no correction is added.
  */
+/** "la canette 7up (16 g, il y a 22 min)" — the food, its carbs and when. A bolus the parent cannot
+ *  attach to a specific thing eaten is a bolus they cannot sanity-check, and at 23:59 the difference
+ *  between "the dinner" and "the can of 7up" was the difference between dismissing the app and
+ *  trusting it. Falls back to the plain word when the meal isn't identified. */
+function mealLabel(
+  meal: { description?: string | null; carbsG?: number | null; minutesAgo?: number | null } | null | undefined,
+  lang: string,
+): string {
+  const es = lang === "es";
+  const generic = es ? "la comida" : "le repas";
+  const d = (meal?.description ?? "").trim();
+  if (!d) return generic;
+  const bits: string[] = [];
+  if (meal?.carbsG != null && meal.carbsG > 0) bits.push(`${Math.round(meal.carbsG)} g`);
+  const m = meal?.minutesAgo;
+  if (m != null && m >= 0) {
+    bits.push(m < 60
+      ? (es ? `hace ${m} min` : `il y a ${m} min`)
+      : (es ? `hace ${Math.round(m / 60)} h` : `il y a ${Math.round(m / 60)} h`));
+  }
+  const paren = bits.length ? ` (${bits.join(", ")})` : "";
+  return `«${d.slice(0, 48)}»${paren}`;
+}
+
 export function combinedActionLine(
   guard: GuardResult,
   mealUnits: number,
   lang: string,
   profile: GuardProfile | null,
   mealPlanned = false,
+  /** WHICH meal this bolus covers, so the line can name it. See [MealBolusPlan]. */
+  mealInfo?: { description?: string | null; carbsG?: number | null; minutesAgo?: number | null } | null,
 ): string {
   const rapid = profile?.rapidInsulin || (lang === "es" ? "insulina rápida" : "insuline rapide");
   // Sugar / no-ratios / sugar-already-taken: a meal bolus must NOT be stacked on top, so return the
@@ -742,29 +768,29 @@ export function combinedActionLine(
   // eat", and it is NEVER summed with the correction (they happen at different moments).
   if (mealPlanned && meal > 0) {
     if (lang === "es") {
-      if (corr > 0) return `ahora: ${fmtUnits(corr)} u de ${rapid} de corrección; al comer: ${fmtUnits(meal)} u para la comida prevista.`;
-      let l = `${fmtUnits(meal)} u de ${rapid} EN EL MOMENTO de comer, para cubrir la comida prevista (no antes de empezar).`;
+      if (corr > 0) return `ahora: ${fmtUnits(corr)} u de ${rapid} de corrección; al comer: ${fmtUnits(meal)} u para ${mealLabel(mealInfo, lang)}.`;
+      let l = `${fmtUnits(meal)} u de ${rapid} EN EL MOMENTO de comer, para cubrir ${mealLabel(mealInfo, lang)} (no antes de empezar).`;
       if (stale) l += ` Recontrola la glucosa antes de cualquier corrección.`;
       return l;
     }
-    if (corr > 0) return `maintenant : ${fmtUnits(corr)} u de ${rapid} en correction ; au moment de manger : ${fmtUnits(meal)} u pour le repas prévu.`;
-    let l = `${fmtUnits(meal)} u de ${rapid} AU MOMENT de manger, pour couvrir le repas prévu (pas avant de commencer).`;
+    if (corr > 0) return `maintenant : ${fmtUnits(corr)} u de ${rapid} en correction ; au moment de manger : ${fmtUnits(meal)} u pour ${mealLabel(mealInfo, lang)}.`;
+    let l = `${fmtUnits(meal)} u de ${rapid} AU MOMENT de manger, pour couvrir ${mealLabel(mealInfo, lang)} (pas avant de commencer).`;
     if (stale) l += ` Recontrôle la glycémie avant toute correction.`;
     return l;
   }
 
   if (lang === "es") {
     let line = (meal > 0 && corr === 0)
-      ? `${fmtUnits(total)} u de ${rapid} para la comida`
+      ? `${fmtUnits(total)} u de ${rapid} para ${mealLabel(mealInfo, lang)}`
       : `${fmtUnits(total)} u de ${rapid} ahora`;
-    if (meal > 0 && corr > 0) line += ` (${fmtUnits(meal)} u por la comida + ${fmtUnits(corr)} u de corrección)`;
+    if (meal > 0 && corr > 0) line += ` (${fmtUnits(meal)} u por ${mealLabel(mealInfo, lang)} + ${fmtUnits(corr)} u de corrección)`;
     if (stale && meal > 0) line += `; recontrola la glucosa antes de cualquier corrección`;
     return line + "." + unusualDoseNote(total, profile, lang);
   }
   let line = (meal > 0 && corr === 0)
-    ? `${fmtUnits(total)} u de ${rapid} pour le repas`
+    ? `${fmtUnits(total)} u de ${rapid} pour ${mealLabel(mealInfo, lang)}`
     : `${fmtUnits(total)} u de ${rapid} maintenant`;
-  if (meal > 0 && corr > 0) line += ` (${fmtUnits(meal)} u pour le repas + ${fmtUnits(corr)} u de correction)`;
+  if (meal > 0 && corr > 0) line += ` (${fmtUnits(meal)} u pour ${mealLabel(mealInfo, lang)} + ${fmtUnits(corr)} u de correction)`;
   if (stale && meal > 0) line += ` ; recontrôle la glycémie avant toute correction`;
   // The note belongs HERE above all: with the ceilings removed, the meal bolus is the unbounded half,
   // and "450 g" typed for "45 g" produces 37 u with nothing else to question it.
@@ -1234,6 +1260,12 @@ export interface MealBolusPlan {
   units: number;          // meal bolus to name (0 = nothing to cover, or no carb ratio)
   planned: boolean;       // true => due AT EATING TIME, not now
   carbsG: number | null;  // the carbs it covers
+  // WHICH meal. Without these the action line said "X u pour le repas" and the parent had to guess:
+  // at 23:59 the app meant a 7up drunk 22 minutes earlier, the parent read it as the dinner from
+  // three hours before, and concluded the app was broken — while the advice was in fact correct.
+  // A dose you cannot attach to a specific food is a dose you cannot check.
+  description?: string | null;
+  minutesAgo?: number | null;
 }
 
 /**
@@ -1256,7 +1288,10 @@ export function mealBolusPlan(
 ): MealBolusPlan {
   const uncovered = findUncoveredMeal(meals, doses, nowMs, profile);
   if (uncovered) {
-    return { units: mealBolusUnits(uncovered.carbsG, profile), planned: false, carbsG: uncovered.carbsG };
+    return {
+      units: mealBolusUnits(uncovered.carbsG, profile), planned: false, carbsG: uncovered.carbsG,
+      description: uncovered.description, minutesAgo: uncovered.minutesAgo,
+    };
   }
   // Most recently announced meal STILL AHEAD. One whose time has come and gone is an EATEN meal and
   // belongs to findUncoveredMeal above — which, if it returned nothing, means that meal is already
@@ -1270,6 +1305,7 @@ export function mealBolusPlan(
   // active, which alone had 195 mg/dL of fall left to deliver. He went to 63.
   let bestTs = -Infinity;
   let bestCarbs = 0;
+  let bestDesc: string | null = null;
   for (const m of meals || []) {
     if (!m || m.planned !== true) continue;
     const t = typeof m.ts === "number" ? m.ts : new Date(m.ts).getTime();
@@ -1279,10 +1315,14 @@ export function mealBolusPlan(
     const c = Number(m.carbs_g ?? m.carbsG ?? 0);
     bestTs = t;
     bestCarbs = Number.isFinite(c) && c > 0 ? c : 0;
+    bestDesc = (m.description ?? null) as string | null;
   }
-  if (bestTs === -Infinity) return { units: 0, planned: false, carbsG: null };
+  if (bestTs === -Infinity) return { units: 0, planned: false, carbsG: null, description: null, minutesAgo: null };
   const carbsG = bestCarbs > 0 ? Math.round(bestCarbs) : null;
-  return { units: mealBolusUnits(carbsG, profile), planned: true, carbsG };
+  return {
+    units: mealBolusUnits(carbsG, profile), planned: true, carbsG,
+    description: bestDesc, minutesAgo: Math.round((nowMs - bestTs) / 60000),
+  };
 }
 
 // ---- PROSPECTIVE meal dosing: "if I eat THIS, how much insulin?" --------------------------------

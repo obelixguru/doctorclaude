@@ -1015,7 +1015,8 @@ Deno.serve(async (req: Request) => {
         if (guard.reason === "in_range" && plan.units <= 0) {
           return inRangeActionLine(meals ?? [], insulin ?? [], sorted, nowMs, gp, lang, iob);
         }
-        return combinedActionLine(guard, plan.units, lang, gp, plan.planned);
+        return combinedActionLine(guard, plan.units, lang, gp, plan.planned,
+          { description: plan.description, carbsG: plan.carbsG, minutesAgo: plan.minutesAgo });
       })();
     const pr = await loadPrompts(lang);
     const prompt = buildPrompt(
