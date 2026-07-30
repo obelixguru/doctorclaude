@@ -865,15 +865,29 @@ Deno.serve(async (req: Request) => {
     // OLDEST 1000 and dropped everything recent, so `last` — the value the whole analysis calls
     // "glycémie actuelle" and the guard doses against — would have been hours stale. Descending makes
     // any truncation fall on the far end of history, where it costs nothing. Re-sorted below anyway.
-    const { data: storedReadings, error: histErr } = await db.from("mechabetics_readings")
-      .select("ts, value_mgdl").eq("subject", subject)
-      .gte("ts", histSinceIso).order("ts", { ascending: false }).limit(2000);
+    // PAGINATED, because `.limit()` does not lift PostgREST's server-side cap — this project's
+    // max_rows is 1000 and a day of readings is well past that. Asking for 24 h and being handed 1000
+    // rows looks exactly like a successful 24 h read, so the window would have quietly shrunk to
+    // whatever fits. Newest page first: any page we never reach is the far end of history, which
+    // costs context, while the recent end that decides the dose is always present.
+    const storedReadings: any[] = [];
+    let histErr: { message: string } | null = null;
+    for (let page = 0; page < 3; page++) {
+      const from = page * 1000;
+      const { data, error } = await db.from("mechabetics_readings")
+        .select("ts, value_mgdl").eq("subject", subject)
+        .gte("ts", histSinceIso).order("ts", { ascending: false }).range(from, from + 999);
+      if (error) { histErr = error; break; }
+      const rows = data ?? [];
+      storedReadings.push(...rows);
+      if (rows.length < 1000) break; // short page: that was the last of them
+    }
     // A silent failure here degrades cleanly back to the phone's payload — which is exactly the
     // holed series this merge exists to repair, so it must not degrade QUIETLY. A renamed column or
     // a broken policy would otherwise restore the old behaviour for ever with nothing to show for it.
     if (histErr) console.error("coach: stored-history read failed:", histErr.message);
     const byTs = new Map<number, number>();
-    for (const r of (storedReadings ?? []) as any[]) {
+    for (const r of storedReadings) {
       const t = new Date(r.ts).getTime();
       const v = Number(r.value_mgdl);
       if (Number.isFinite(t) && v > 0) byTs.set(t, v);
