@@ -7,6 +7,7 @@ import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
+import org.json.JSONArray
 import org.json.JSONObject
 import java.security.MessageDigest
 import java.text.SimpleDateFormat
@@ -155,7 +156,24 @@ class LibreLinkUpClient(private val store: CredentialsStore) {
         }
     }
 
-    suspend fun listConnections(): LibreResult<List<PatientConnection>> = withContext(Dispatchers.IO) {
+    /**
+     * Abbott's region redirect: `{"status":0,"data":{"redirect":true,"region":"xx"}}`, sent as HTTP 200.
+     *
+     * Only [loginInternal] used to understand it. An account whose data centre moves AFTER login —
+     * Abbott rebalances them — therefore kept being asked on the old host, which answers 200 to
+     * everything and carries no data: `/connections` came back with no `data` array (unreadable body →
+     * empty followed-people list → no patient name in the header, no patient switcher in Profile, no
+     * way to self-heal a stale patient id) and `/graph` parsed as a perfectly valid EMPTY graph, so
+     * glucose silently stopped updating while the dashboard kept showing its last known value with no
+     * error anywhere. Returns the region to switch to, or null when the body is not a redirect.
+     */
+    private fun redirectRegionOf(root: JSONObject): String? =
+        root.optJSONObject("data")
+            ?.takeIf { it.optBoolean("redirect", false) }
+            ?.optString("region", "")
+            ?.takeIf { it.isNotEmpty() }
+
+    suspend fun listConnections(redirectsLeft: Int = 1): LibreResult<List<PatientConnection>> = withContext(Dispatchers.IO) {
         if (store.token == null) return@withContext LibreResult.Error("Non connecté", needsLogin = true)
         val req = Request.Builder()
             .url("${baseUrl()}/llu/connections")
@@ -172,17 +190,42 @@ class LibreLinkUpClient(private val store: CredentialsStore) {
                 if (res.code == 429) return@withContext rateLimited()
                 if (!res.isSuccessful) return@withContext LibreResult.Error("HTTP ${res.code}")
                 val root = JSONObject(raw)
+                redirectRegionOf(root)?.let { region ->
+                    if (redirectsLeft <= 0) {
+                        return@withContext LibreResult.Error("Redirection de région LibreLinkUp en boucle")
+                    }
+                    store.region = region
+                    Log.i("LLU", "connections: redirection région → $region, on réessaie")
+                    return@withContext listConnections(redirectsLeft - 1)
+                }
+                // `data` normally IS the array of followed people. It is also legitimately sent as an
+                // OBJECT — a wrapper holding the array, or a single connection on its own — and reading
+                // only the array shape turned that into "unreadable body": the followed-people list
+                // stayed empty for the whole session, which silently costs the patient NAME in the
+                // header, the patient SWITCHER in Profile (shown only when size > 1), and the ability
+                // to self-heal a stale patient id. Accept every shape that actually carries people.
                 val arr = root.optJSONArray("data")
+                    ?: root.optJSONObject("data")?.let { d ->
+                        d.optJSONArray("connections")
+                            ?: d.optJSONArray("data")
+                            ?: d.optJSONArray("patients")
+                            // A lone connection object, not wrapped in any array.
+                            ?: if (d.has("patientId")) JSONArray().put(d) else null
+                    }
                 if (arr == null) {
-                    // HTTP 200 but no `data` ARRAY. Two very different situations used to land here as
-                    // the same Success(emptyList()): an account that genuinely follows nobody, and a
-                    // body we simply didn't understand (Abbott maintenance/soft-throttle page, a shape
-                    // change, `data` sent as an object). GlucoseRepository reads an empty list as "the
-                    // sharing invitation was revoked" and says so in red — so an unparseable body
-                    // accused the user's account of a problem it did not have, right after a 429.
-                    // Only a real empty array means "nobody"; anything else is an error, which leaves
-                    // the already-shown data and the previous connection list untouched.
-                    Log.w("LLU", "connections HTTP=" + res.code + " — pas de tableau data (corps inattendu)")
+                    // HTTP 200 and still nothing we recognise. Two very different situations used to
+                    // land here as the same Success(emptyList()): an account that genuinely follows
+                    // nobody, and a body we simply didn't understand (Abbott maintenance/soft-throttle
+                    // page, a shape change). GlucoseRepository reads an empty list as "the sharing
+                    // invitation was revoked" and says so in red — so an unparseable body accused the
+                    // user's account of a problem it did not have, right after a 429. Only a real empty
+                    // array means "nobody"; anything else is an error, which leaves the already-shown
+                    // data and the previous connection list untouched.
+                    //
+                    // Logged as a SHAPE, never as content: which top-level keys came back, what `data`
+                    // actually was, and Abbott's own status code. That is what a parser fix needs; a
+                    // dump of the body would put the followed people's names in logcat.
+                    Log.w("LLU", "connections HTTP=" + res.code + " — pas de tableau data. " + shapeOf(root, raw))
                     return@withContext LibreResult.Error("Réponse LibreLinkUp inattendue")
                 }
                 val out = mutableListOf<PatientConnection>()
@@ -204,7 +247,7 @@ class LibreLinkUpClient(private val store: CredentialsStore) {
         }
     }
 
-    suspend fun fetchGraph(patientId: String): LibreResult<GraphSnapshot> = withContext(Dispatchers.IO) {
+    suspend fun fetchGraph(patientId: String, redirectsLeft: Int = 1): LibreResult<GraphSnapshot> = withContext(Dispatchers.IO) {
         if (store.token == null) return@withContext LibreResult.Error("Non connecté", needsLogin = true)
         val req = Request.Builder()
             .url("${baseUrl()}/llu/connections/$patientId/graph")
@@ -220,7 +263,20 @@ class LibreLinkUpClient(private val store: CredentialsStore) {
                 }
                 if (res.code == 429) return@withContext rateLimited()
                 if (!res.isSuccessful) return@withContext LibreResult.Error("HTTP ${res.code}")
-                val data = JSONObject(raw).optJSONObject("data")
+                val root = JSONObject(raw)
+                // Checked BEFORE `data` is read as a graph: a redirect body has a perfectly valid
+                // `data` object, just one holding {redirect, region} instead of readings — it parsed
+                // straight through as "the sensor sent nothing", which is how a wrong-region host
+                // froze the dashboard on its last value without ever raising an error.
+                redirectRegionOf(root)?.let { region ->
+                    if (redirectsLeft <= 0) {
+                        return@withContext LibreResult.Error("Redirection de région LibreLinkUp en boucle")
+                    }
+                    store.region = region
+                    Log.i("LLU", "graph: redirection région → $region, on réessaie")
+                    return@withContext fetchGraph(patientId, redirectsLeft - 1)
+                }
+                val data = root.optJSONObject("data")
                     ?: return@withContext LibreResult.Error("Pas de données graph")
                 val connection = data.optJSONObject("connection")
                 val liveCurrent = connection?.optJSONObject("glucoseMeasurement")?.let(::parseMeasurement)
@@ -276,6 +332,24 @@ class LibreLinkUpClient(private val store: CredentialsStore) {
             isHigh = o.optBoolean("isHigh", false),
             isLow = o.optBoolean("isLow", false)
         )
+    }
+
+    /**
+     * Describes an unexpected response by its SHAPE, for logcat: the top-level keys, what `data`
+     * turned out to be (with its own keys when it is an object), Abbott's `status`, and the body
+     * length. Deliberately no values — the connections body carries the followed people's names, and
+     * a diagnostic must never be the thing that puts them in a log.
+     */
+    private fun shapeOf(root: JSONObject, raw: String): String {
+        fun keysOf(o: JSONObject) = o.keys().asSequence().toList().sorted().joinToString(",")
+        val dataType = when (val d = root.opt("data")) {
+            null, JSONObject.NULL -> "absent"
+            is JSONArray -> "array[" + d.length() + "]"
+            is JSONObject -> "object{" + keysOf(d) + "}"
+            else -> d.javaClass.simpleName
+        }
+        return "keys=[" + keysOf(root) + "] data=" + dataType +
+            " status=" + root.opt("status") + " len=" + raw.length
     }
 
     private fun parseTimestamp(s: String, utc: Boolean): Long? {
