@@ -277,8 +277,24 @@ fun ProfileScreen(
                 lang = lang,
                 isChild = isChildDevice,
                 patientLabel = patients.firstOrNull { it.active }?.label,
+                // Name the person whose record is open. The followed-people list is the good answer;
+                // when it is unavailable the profile's own nickname still identifies the record being
+                // shown and edited. Both blank → the badge says the person is unidentified rather than
+                // letting the role line ("mon téléphone (parent)") pass for one.
+                recordLabel = patients.firstOrNull { it.active }?.label
+                    ?: nickname.takeIf { it.isNotBlank() },
                 onChange = onChangeRole
             )
+
+            // An EMPTY list is not "this account follows one person" — it is "we don't know who this
+            // account follows". Both used to render as the same thing: no switcher at all, which reads
+            // as the other people having been dropped from the app.
+            if (patients.isEmpty()) {
+                Text(
+                    roleStringsFor(lang).patientsUnavailable,
+                    color = GlucoseStatus.WARNING.strong, fontSize = 11.sp, lineHeight = 15.sp
+                )
+            }
 
             if (patients.size > 1) {
                 val es = lang.code.equals("es", ignoreCase = true)

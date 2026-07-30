@@ -33,6 +33,7 @@ import androidx.compose.ui.unit.sp
 import com.nueve.mechabetics.ui.theme.AccentGreen
 import com.nueve.mechabetics.ui.theme.BorderLight
 import com.nueve.mechabetics.ui.theme.CardWhite
+import com.nueve.mechabetics.ui.theme.GlucoseStatus
 import com.nueve.mechabetics.ui.theme.InkDim
 import com.nueve.mechabetics.ui.theme.InkMuted
 import com.nueve.mechabetics.ui.theme.InkPrimary
@@ -117,9 +118,23 @@ private fun RoleCard(icon: ImageVector, title: String, body: String, onClick: ()
     }
 }
 
-/** Small badge shown in Profile so the current role is always visible, never a hidden mode. */
+/**
+ * Small badge shown in Profile so the current role is always visible, never a hidden mode.
+ *
+ * The role alone answers "whose PHONE is this?", and that was being read as an answer to "whose DATA
+ * am I looking at?" — a parent phone showed "Mon téléphone (parent)" directly above the child's
+ * glucose and the child's profile form. [recordLabel] answers the second question explicitly, and
+ * says so plainly when the person can't be identified (a connections list the app failed to read
+ * leaves the app showing a record it cannot name).
+ */
 @Composable
-fun DeviceRoleBadge(lang: Lang, isChild: Boolean, patientLabel: String?, onChange: () -> Unit) {
+fun DeviceRoleBadge(
+    lang: Lang,
+    isChild: Boolean,
+    patientLabel: String?,
+    recordLabel: String?,
+    onChange: () -> Unit
+) {
     val s = roleStringsFor(lang)
     Surface(
         color = CardWhite,
@@ -144,6 +159,12 @@ fun DeviceRoleBadge(lang: Lang, isChild: Boolean, patientLabel: String?, onChang
                     color = InkPrimary, fontSize = 13.sp, fontWeight = FontWeight.Medium
                 )
             }
+            Text(
+                if (!recordLabel.isNullOrBlank()) String.format(s.badgeRecord, recordLabel)
+                else s.badgeRecordUnknown,
+                color = if (recordLabel.isNullOrBlank()) GlucoseStatus.WARNING.strong else InkPrimary,
+                fontSize = 12.sp, fontWeight = FontWeight.Medium, lineHeight = 16.sp
+            )
             Text(
                 if (isChild) s.badgeChildNote else s.badgeParentNote,
                 color = InkMuted, fontSize = 11.sp, lineHeight = 15.sp

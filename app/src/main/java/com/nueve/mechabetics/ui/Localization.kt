@@ -906,13 +906,22 @@ data class RoleStrings(
     val badgeChildNote: String,
     val change: String,
     val patientsLocked: String,
+    /** "Dossier affiché : %s" — WHOSE data the app is showing, named. */
+    val badgeRecord: String,
+    /** Same line when the followed-people list could not be read, so the person can't be named. */
+    val badgeRecordUnknown: String,
+    /** Shown where the patient switcher would be when the followed-people list came back empty. */
+    val patientsUnavailable: String,
 )
 
 private val RoleStringsFr = RoleStrings(
     title = "À qui est ce téléphone ?",
     intro = "Un même compte peut suivre plusieurs personnes. Dire à qui appartient ce téléphone évite qu'une insuline, un repas ou une analyse vocale se retrouve sur le mauvais dossier.",
     parentTitle = "Mon téléphone (parent)",
-    parentBody = "Ton propre dossier, et l'accès aux autres personnes suivies pour les consulter. Rien n'est verrouillé.",
+    // NOT "ton propre dossier" : sur un téléphone parent, le dossier ouvert est celui de la personne
+    // suivie (l'enfant), jamais celui du parent. La formule d'avant décrivait l'inverse de ce que
+    // l'écran affichait juste en dessous.
+    parentBody = "Accès à toutes les personnes suivies par le compte, et bascule de l'une à l'autre. Rien n'est verrouillé.",
     childTitle = "Le téléphone de la personne suivie",
     childBody = "Ce téléphone restera sur un seul dossier. Aucun mélange possible avec quelqu'un d'autre.",
     childBodyNamed = "Ce téléphone restera sur le dossier de %s. Aucun mélange possible avec quelqu'un d'autre.",
@@ -921,17 +930,20 @@ private val RoleStringsFr = RoleStrings(
     badgeParent = "Mon téléphone (parent)",
     badgeChild = "Téléphone de la personne suivie",
     badgeChildNamed = "Téléphone de %s",
-    badgeParentNote = "Ton dossier par défaut ; les autres personnes suivies restent consultables.",
+    badgeParentNote = "Tu peux basculer entre les personnes suivies par ce compte.",
     badgeChildNote = "Verrouillé sur un seul dossier : rien ne peut partir sur celui de quelqu'un d'autre.",
     change = "Changer",
     patientsLocked = "Ce téléphone est verrouillé sur cette personne. Passe en téléphone parent pour changer.",
+    badgeRecord = "Dossier affiché : %s",
+    badgeRecordUnknown = "Dossier affiché : personne non identifiée — la liste des personnes suivies n'a pas pu être lue.",
+    patientsUnavailable = "Liste des personnes suivies indisponible : le compte n'a pas pu être interrogé. Impossible de basculer d'une personne à l'autre tant qu'elle ne revient pas.",
 )
 
 private val RoleStringsEs = RoleStrings(
     title = "¿De quién es este teléfono?",
     intro = "Una misma cuenta puede seguir a varias personas. Decir de quién es este teléfono evita que una insulina, una comida o un análisis de voz acabe en el historial equivocado.",
     parentTitle = "Mi teléfono (padre o madre)",
-    parentBody = "Tu propio historial, y acceso a las demás personas seguidas para consultarlas. Nada queda bloqueado.",
+    parentBody = "Acceso a todas las personas seguidas por la cuenta, y cambio de una a otra. Nada queda bloqueado.",
     childTitle = "El teléfono de la persona seguida",
     childBody = "Este teléfono se quedará en un solo historial. Ninguna mezcla posible con otra persona.",
     childBodyNamed = "Este teléfono se quedará en el historial de %s. Ninguna mezcla posible con otra persona.",
@@ -940,10 +952,13 @@ private val RoleStringsEs = RoleStrings(
     badgeParent = "Mi teléfono (padre o madre)",
     badgeChild = "Teléfono de la persona seguida",
     badgeChildNamed = "Teléfono de %s",
-    badgeParentNote = "Tu historial por defecto; las demás personas seguidas siguen consultables.",
+    badgeParentNote = "Puedes cambiar entre las personas seguidas por esta cuenta.",
     badgeChildNote = "Bloqueado en un solo historial: nada puede acabar en el de otra persona.",
     change = "Cambiar",
     patientsLocked = "Este teléfono está bloqueado en esta persona. Cambia a teléfono de padre para poder cambiarla.",
+    badgeRecord = "Historial mostrado: %s",
+    badgeRecordUnknown = "Historial mostrado: persona no identificada — no se ha podido leer la lista de personas seguidas.",
+    patientsUnavailable = "Lista de personas seguidas no disponible: no se ha podido consultar la cuenta. No se puede cambiar de persona mientras no vuelva.",
 )
 
 fun roleStringsFor(lang: Lang): RoleStrings = if (lang == Lang.ES) RoleStringsEs else RoleStringsFr
