@@ -978,3 +978,18 @@ test("in range is not the same as safe: the pending drop outranks 'rien à corri
   assert.match(line, /sucre à portée/i);
   assert.doesNotMatch(line, /rien à corriger/i);
 });
+
+test("the label outranks our own reference table, and no drink has a single global figure", () => {
+  // The 7UP report: the app answered 35 g for a 33 cl can whose label said 16 g. The model was
+  // obeying us — "1 canette de soda 33 cl ≈ 35 g" was written into these very rules. A brand's sugar
+  // varies up to twofold by country and by reformulation, so a single number can only ever be wrong
+  // somewhere, and being wrong HIGH means injecting too much.
+  for (const lang of ["fr", "es"]) {
+    const r = carbEstimationRules(lang);
+    assert.doesNotMatch(r, /33 cl ≈ 35 g/, `${lang}: the flat soda figure is back`);
+    assert.match(r, /100 ml/, `${lang}: drinks must be counted per 100 ml from the label`);
+    assert.match(r, lang === "fr" ? /ÉTIQUETTE FAIT FOI/ : /ETIQUETA MANDA/);
+    assert.match(r, lang === "fr" ? /4,8 g\/100 ml/ : /4,8 g\/100 ml/); // the reformulated case is named
+    assert.match(r, lang === "fr" ? /BAS de la fourchette/ : /parte BAJA/); // unknown -> under, not over
+  }
+});
