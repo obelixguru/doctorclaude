@@ -523,6 +523,45 @@ export function situationHint(guard: GuardResult, lang: string): string {
   }
 }
 
+/** How much lowering the rapid insulin already on board still has to deliver, in mg/dL. Null without
+ *  a correction factor to convert units into mg/dL. */
+export function pendingDropMgdl(iobUnits: number, profile: GuardProfile | null): number | null {
+  const isf = profile?.correctionFactor && profile.correctionFactor > 0 ? profile.correctionFactor : null;
+  return isf ? Math.max(0, iobUnits || 0) * isf : null;
+}
+
+/**
+ * Would a meal bolus land on top of a fall that is already happening?
+ *
+ * Carb counting alone says "50 g needs 3 u" and is right about the carbs — but insulin already on
+ * board keeps working regardless, and if it is going to take the glucose under 70 by itself then
+ * three more units is not a meal bolus, it is a hypo. The same test planMealDose applies internally
+ * (floor = glucose − iob × ISF), lifted out so the eaten-meal path gets it too: that path went
+ * straight to combinedActionLine, which sums units and has never seen a glucose or an IOB.
+ */
+export function mealBolusHeldByIob(
+  glucoseMgdl: number | null,
+  iobUnits: number,
+  profile: GuardProfile | null,
+): boolean {
+  const drop = pendingDropMgdl(iobUnits, profile);
+  if (drop == null || glucoseMgdl == null || !Number.isFinite(glucoseMgdl) || glucoseMgdl <= 0) return false;
+  return glucoseMgdl - drop < LOW_MGDL;
+}
+
+/** Why no meal bolus is due right now, in the user's language. */
+export function mealBolusHeldLine(
+  glucoseMgdl: number,
+  iobUnits: number,
+  profile: GuardProfile | null,
+  lang: string,
+): string {
+  const drop = Math.round(pendingDropMgdl(iobUnits, profile) ?? 0);
+  return lang === "es"
+    ? `ninguna insulina para la comida ahora: la insulina que sigue activa aún tiene ~${drop} mg/dL de bajada por delante y te llevaría por debajo de 70. Vigila, ten azúcar a mano, y recontrola en 15 min.`
+    : `aucune insuline pour le repas maintenant : l'insuline encore active a ~${drop} mg/dL de baisse à délivrer et t'emmènerait sous 70. Surveille, garde du sucre à portée, et recontrôle dans 15 min.`;
+}
+
 /** Meal bolus = carbs / carb-ratio, rounded to 0.5 u. Carb counting doesn't need fresh glucose.
  *  UNBOUNDED on purpose: 45 sugar cubes are 45 sugar cubes, and clipping the answer would hand back
  *  a number the user cannot distinguish from a computed one. See [unusualDoseNote]. */
@@ -1095,11 +1134,24 @@ export function inRangeActionLine(
   nowMs: number,
   profile: GuardProfile | null,
   lang: string,
+  iobUnits = 0,
 ): string {
   const es = lang === "es";
   const uncovered = findUncoveredMeal(meals, doses, nowMs, profile);
   const recentMeal = uncovered && uncovered.minutesAgo <= 45 ? uncovered : null;
   const pred = predictiveAdvice(readings, nowMs);
+
+  // IN RANGE IS NOT THE SAME AS SAFE. The insulin already in keeps working whatever the number on
+  // screen says: 85 mg/dL with 3.4 u still active has ~195 mg/dL of fall still owed, and "dans la
+  // cible, rien à corriger" is a dangerous thing to read there. This outranks everything below,
+  // including an uncovered meal — you do not bolus into a drop that is already coming.
+  const cur = readings && readings.length ? readings[readings.length - 1].value : null;
+  if (mealBolusHeldByIob(cur, iobUnits, profile)) {
+    const drop = Math.round(pendingDropMgdl(iobUnits, profile) ?? 0);
+    return es
+      ? `la insulina que sigue activa aún tiene ~${drop} mg/dL de bajada por delante — vas hacia una hipoglucemia. Ten azúcar a mano AHORA, recontrola en 15 min, y ninguna insulina más (tampoco para una comida) mientras no haya vuelto a subir.`
+      : `l'insuline encore active a ~${drop} mg/dL de baisse à délivrer — tu vas vers une hypo. Garde du sucre à portée MAINTENANT, recontrôle dans 15 min, et aucune insuline en plus (repas compris) tant que ce n'est pas remonté.`;
+  }
   const falling = pred.kind === "watch_fall";
   const rising = pred.kind === "watch_rise" || pred.kind === "high_soon";
 
@@ -1206,14 +1258,23 @@ export function mealBolusPlan(
   if (uncovered) {
     return { units: mealBolusUnits(uncovered.carbsG, profile), planned: false, carbsG: uncovered.carbsG };
   }
-  // Most recently announced meal STILL AHEAD (or just passed) — one whose time has come and gone is
-  // handled as an eaten meal by findUncoveredMeal above, not announced again.
+  // Most recently announced meal STILL AHEAD. One whose time has come and gone is an EATEN meal and
+  // belongs to findUncoveredMeal above — which, if it returned nothing, means that meal is already
+  // covered and there is nothing left to inject for it.
+  //
+  // This is where the reported incident came from. The test was `t < nowMs - 180 min`, i.e. "skip
+  // meals older than three hours" — so any meal still flagged `planned` (nothing ever clears that
+  // flag) was re-announced as upcoming for three hours after it was eaten. A child's 50 g dinner,
+  // pre-bolused correctly with 5.5 u twenty minutes beforehand, was still being answered with "3 u de
+  // Fiasp au moment de manger" an hour and forty minutes later — at 85 mg/dL, with 3.4 u still
+  // active, which alone had 195 mg/dL of fall left to deliver. He went to 63.
   let bestTs = -Infinity;
   let bestCarbs = 0;
   for (const m of meals || []) {
     if (!m || m.planned !== true) continue;
     const t = typeof m.ts === "number" ? m.ts : new Date(m.ts).getTime();
-    if (!Number.isFinite(t) || t < nowMs - announcedWindowMin * 60000) continue;
+    // Still ahead, and not so far ahead that it is tomorrow's dinner.
+    if (!Number.isFinite(t) || t <= nowMs || t > nowMs + announcedWindowMin * 60000) continue;
     if (t <= bestTs) continue;
     const c = Number(m.carbs_g ?? m.carbsG ?? 0);
     bestTs = t;

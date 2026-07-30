@@ -38,6 +38,8 @@ import {
   unusualDoseNote,
   enforceInsulinCeiling,
   overCeilingUnits,
+  mealBolusHeldByIob,
+  mealBolusHeldLine,
 } from "./doseGuard.ts";
 
 const prof = { carbRatio: 12, correctionFactor: 50, targetMgdl: 110, weightKg: 38, rapidInsulin: "NovoRapid" };
@@ -924,4 +926,55 @@ test("an ordinary dose carries no note at all", () => {
   assert.equal(unusualDoseNote(g.insulinUnits, prof, "fr"), "");
   assert.doesNotMatch(actionLine(g, "fr", prof), /inhabituellement/i);
   assert.equal(mealBolusUnits(60, prof), 5); // 60 / 12
+});
+
+// ─── The dinner incident, 30 July 2026. A child's 50 g meal, pre-bolused correctly with 5.5 u twenty
+// minutes beforehand, was still answered with "3 u de Fiasp au moment de manger" an hour and forty
+// minutes later — at 85 mg/dL, with 3.4 u still active. He went to 63. ─────────────────────────────
+
+const ryan = { carbRatio: 16, correctionFactor: 58, targetMgdl: 120, weightKg: 40, rapidInsulin: "Fiasp" };
+const DINNER = new Date("2026-07-30T19:40:27Z").getTime();
+const NOW_AFTER = new Date("2026-07-30T21:23:00Z").getTime();      // 103 min later
+const dinnerMeal = [{ ts: "2026-07-30T19:40:27+00:00", description: "entrecôte avec frites", carbs_g: 50, planned: true }];
+const preBolus = [
+  { ts: "2026-07-30T19:19:23+00:00", units: 5.5, kind: "rapid", insulin_name: "Fiasp" },
+  { ts: "2026-07-30T18:45:41+00:00", units: 2, kind: "rapid", insulin_name: "Fiasp" },
+];
+
+test("a meal whose time has PASSED is never announced again", () => {
+  // `planned` is written once and nothing ever clears it, so the announced branch must go by the
+  // clock. It used to accept anything less than three hours old — i.e. re-announce every eaten meal.
+  const plan = mealBolusPlan(dinnerMeal as any, preBolus as any, NOW_AFTER, ryan);
+  assert.equal(plan.units, 0);
+  assert.equal(plan.planned, false);
+});
+
+test("...while a meal genuinely still ahead is announced", () => {
+  const beforeDinner = DINNER - 20 * 60_000; // 20 min before the stated time
+  const plan = mealBolusPlan(dinnerMeal as any, [], beforeDinner, ryan);
+  assert.equal(plan.planned, true);
+  assert.equal(plan.units, 3); // 50 / 16
+});
+
+test("a covered meal leaves nothing to inject", () => {
+  assert.equal(findUncoveredMeal(dinnerMeal as any, preBolus as any, NOW_AFTER, ryan), null);
+});
+
+test("no meal bolus while the insulin already in is about to take you low", () => {
+  const iob = activeIob(preBolus as any, NOW_AFTER, 240);
+  assert.ok(iob > 3, `expected insulin still active, got ${iob}`); // 3.36 u on the night
+  // 85 - 3.4*58 is far under 70: three more units here is not a meal bolus, it is a hypo.
+  assert.equal(mealBolusHeldByIob(85, iob, ryan), true);
+  assert.match(mealBolusHeldLine(85, iob, ryan, "fr"), /aucune insuline pour le repas/i);
+  // ...and it does not fire on an ordinary in-range value with nothing on board.
+  assert.equal(mealBolusHeldByIob(120, 0, ryan), false);
+});
+
+test("in range is not the same as safe: the pending drop outranks 'rien à corriger'", () => {
+  const iob = activeIob(preBolus as any, NOW_AFTER, 240);
+  const readings = [{ ts: NOW_AFTER - 10 * 60_000, value: 95 }, { ts: NOW_AFTER, value: 85 }];
+  const line = inRangeActionLine(dinnerMeal as any, preBolus as any, readings, NOW_AFTER, ryan, "fr", iob);
+  assert.match(line, /vers une hypo/i);
+  assert.match(line, /sucre à portée/i);
+  assert.doesNotMatch(line, /rien à corriger/i);
 });

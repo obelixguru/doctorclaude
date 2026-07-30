@@ -27,6 +27,8 @@ import {
   uncoveredMealWarning,
   inRangeActionLine,
   mealBolusPlan,
+  mealBolusHeldByIob,
+  mealBolusHeldLine,
   planMealDose,
   mealPlanLine,
   plannedMealNote,
@@ -996,6 +998,13 @@ Deno.serve(async (req: Request) => {
         // "in range, nothing to correct".
         const plan = mealBolusPlan(meals ?? [], insulin ?? [], nowMs, gp);
         proseDoseCeiling = guard.maxInsulinUnits + Math.max(0, plan.units || 0) + contextUnits;
+        // A MEAL BOLUS IS NOT DUE WHEN THE INSULIN ALREADY IN IS ABOUT TO TAKE THE GLUCOSE LOW.
+        // planMealDose has always checked this; the eaten-meal branch below goes to
+        // combinedActionLine, which sums units and has never seen a glucose or an IOB. That is how
+        // "3 u de Fiasp" was answered at 85 mg/dL with 3.4 u still working.
+        if (plan.units > 0 && mealBolusHeldByIob(cur, iob, gp)) {
+          return mealBolusHeldLine(cur as number, iob, gp, lang);
+        }
         if (plan.planned && plan.carbsG != null) {
           return mealPlanLine(planMealDose({
             glucoseMgdl: cur, trend, staleMin, iobUnits: iob,
@@ -1004,7 +1013,7 @@ Deno.serve(async (req: Request) => {
           }), lang, gp, true); // concise: the ANALYSE card is a summary + ONE action line
         }
         if (guard.reason === "in_range" && plan.units <= 0) {
-          return inRangeActionLine(meals ?? [], insulin ?? [], sorted, nowMs, gp, lang);
+          return inRangeActionLine(meals ?? [], insulin ?? [], sorted, nowMs, gp, lang, iob);
         }
         return combinedActionLine(guard, plan.units, lang, gp, plan.planned);
       })();
