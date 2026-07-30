@@ -348,8 +348,11 @@ Deno.serve(async (req: Request) => {
     if (insulinForbidden) { reply = stripInsulinNumbers(reply) || reply; voice = stripInsulinNumbers(voice) || voice; }
     // Insulin allowed: the answer still may not name MORE units than the system decided (correction
     // plus the meal bolus for the scanned food). Previously unchecked.
+    // Plus whatever insulin the context legitimately names (active insulin, a dose logged earlier):
+    // echoing one is not proposing one, and judging against the bolus alone gutted correct answers.
     else {
-      const ceiling = { ...guard, maxInsulinUnits: guard.maxInsulinUnits + Math.max(0, mealUnits || 0) };
+      const ctxUnits = Math.max(iob || 0, 0);
+      const ceiling = { ...guard, maxInsulinUnits: guard.maxInsulinUnits + Math.max(0, mealUnits || 0) + ctxUnits };
       reply = enforceInsulinCeiling(reply, ceiling) || reply;
       voice = enforceInsulinCeiling(voice, ceiling) || voice;
     }

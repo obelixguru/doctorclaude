@@ -437,8 +437,13 @@ Deno.serve(async (req: Request) => {
     if (insulinForbidden) { reply = stripInsulinNumbers(reply) || reply; voice = stripInsulinNumbers(voice) || voice; }
     // Insulin allowed: the answer still may not name MORE units than the system decided (correction
     // plus the meal bolus, which is the legitimate total here). Previously unchecked.
+    // Must clear the doses the question and the context legitimately contain — the user says "j'ai
+    // fait 6 unités", the prompt states the active insulin, and the honest answer echoes both.
+    // Judged against the bolus alone, "tes 6 unités couvrent bien les 60 g" came out as "tes
+    // couvrent bien les 60 g". Reporting a dose is not proposing one.
     else {
-      const ceiling = { ...guardForAction, maxInsulinUnits: guardForAction.maxInsulinUnits + Math.max(0, mealUnits || 0) };
+      const ctxUnits = Math.max(iob || 0, ...((insulinDoses ?? []) as any[]).map((d) => Number(d?.units) || 0), 0);
+      const ceiling = { ...guardForAction, maxInsulinUnits: guardForAction.maxInsulinUnits + Math.max(0, mealUnits || 0) + ctxUnits };
       reply = enforceInsulinCeiling(reply, ceiling) || reply;
       voice = enforceInsulinCeiling(voice, ceiling) || voice;
     }

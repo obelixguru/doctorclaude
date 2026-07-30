@@ -36,6 +36,8 @@ import {
   mealBolusPlan,
   actionLine,
   unusualDoseNote,
+  enforceInsulinCeiling,
+  overCeilingUnits,
 } from "./doseGuard.ts";
 
 const prof = { carbRatio: 12, correctionFactor: 50, targetMgdl: 110, weightKg: 38, rapidInsulin: "NovoRapid" };
@@ -741,31 +743,95 @@ test("a rescue is never treated as a meal to bolus", () => {
 // 190 -> 237 mg/dL was told "aucune insuline" twice on the way UP, because the old two-point slope
 // read sensor noise as a direction and a sensor gap as an emergency stop. ────────────────────────
 
+const T0 = 1_700_000_000_000;
+/** One reading a minute, oldest first, ending now. */
+const perMinute = (vals: number[]) => vals.map((value, i) => ({ ts: T0 + i * 60_000, value }));
+const lastTs = (r: { ts: number }[]) => r[r.length - 1].ts;
+
 test("sensor noise inside a climb must not read as falling (the child's real series)", () => {
-  // 234, 236, 232, 232, 232, 233 — one high sample among flat ones, sampled once a minute.
-  const t0 = 1_700_000_000_000;
-  const vals = [234, 236, 232, 232, 232, 233];
-  const readings = vals.map((value, i) => ({ ts: t0 + i * 60_000, value }));
-  const now = readings[readings.length - 1].ts;
-  const trend = trendFromReadings(readings, now);
+  // The measured shape: a slow climb around 230 with one high sample among flat ones. The old
+  // two-point slope fitted 234 -> 232 and answered "falling", which BLOCKS the correction — on a
+  // glucose that was on its way up from 190.
+  const r = perMinute([230, 231, 231, 232, 234, 238, 233, 233, 234, 234, 235, 236, 236, 237, 238]);
+  const trend = trendFromReadings(r, lastTs(r));
   assert.notEqual(trend, "falling");
   assert.notEqual(trend, "falling_fast");
-  // ...and the correction it was blocking is offered again.
-  const g = computeGuard({ ...base, glucoseMgdl: 233, trend });
+  const g = computeGuard({ ...base, glucoseMgdl: 238, trend });
   assert.equal(g.kind, "correction");
   assert.ok(g.insulinUnits > 0);
 });
 
 test("a genuine ramp is still detected, despiking must not flatten it", () => {
-  const t0 = 1_700_000_000_000;
-  const readings = [150, 160, 170, 180, 190, 200].map((value, i) => ({ ts: t0 + i * 60_000, value }));
-  assert.equal(trendFromReadings(readings, readings[5].ts), "rising_fast");
+  const r = perMinute([150, 155, 160, 165, 170, 175, 180, 185, 190, 195, 200, 205]);
+  assert.equal(trendFromReadings(r, lastTs(r)), "rising_fast");
 });
 
 test("a real fall is still detected", () => {
-  const t0 = 1_700_000_000_000;
-  const readings = [200, 190, 180, 170, 160, 150].map((value, i) => ({ ts: t0 + i * 60_000, value }));
-  assert.equal(trendFromReadings(readings, readings[5].ts), "falling_fast");
+  const r = perMinute([200, 195, 190, 185, 180, 175, 170, 165, 160, 155, 150, 145]);
+  assert.equal(trendFromReadings(r, lastTs(r)), "falling_fast");
+});
+
+test("a time base under 10 minutes claims no direction at all", () => {
+  // Readings resuming dense after a blackout describe nothing yet. "unknown" blocks the correction,
+  // which is the honest answer — the coach merges stored history so this stays rare.
+  const r = perMinute([237, 235, 233, 231, 229]);
+  assert.equal(trendFromReadings(r, lastTs(r)), "unknown");
+});
+
+test("a recent crash is not averaged away by the rest of the window", () => {
+  // Flat for fifteen minutes, then 40 mg/dL gone in five. A fit over the whole window calls that a
+  // gentle slope; the person is crashing. Falls are judged on the most alarming evidence available.
+  const r = perMinute([220, 220, 220, 220, 220, 220, 220, 220, 220, 220, 220, 212, 204, 196, 188, 180]);
+  assert.equal(trendFromReadings(r, lastTs(r)), "falling_fast");
+});
+
+test("15-minute cloud buckets: a real drop in the last bucket still reads as falling", () => {
+  // The followed patient's shape. Widening the window to 45 min averaged this away and handed back a
+  // correction the old code blocked — the regression this guards against.
+  const r = [
+    { ts: T0, value: 280 },
+    { ts: T0 + 15 * 60_000, value: 275 },
+    { ts: T0 + 30 * 60_000, value: 274 },
+    { ts: T0 + 45 * 60_000, value: 250 },
+  ];
+  const trend = trendFromReadings(r, lastTs(r));
+  assert.ok(trend === "falling" || trend === "falling_fast", `expected a fall, got ${trend}`);
+  assert.equal(computeGuard({ ...base, glucoseMgdl: 250, trend }).maxInsulinUnits, 0);
+});
+
+test("a line is never drawn across a long sensor gap", () => {
+  // 150 forty minutes ago, then a dense burst in the 230s that is coming DOWN. Fitting through the
+  // hole produced "rising_fast" and offered insulin during a fall.
+  const r = [
+    { ts: T0, value: 150 },
+    { ts: T0 + 38 * 60_000, value: 231.5 },
+    { ts: T0 + 39 * 60_000, value: 231 },
+    { ts: T0 + 40 * 60_000, value: 230 },
+  ];
+  const trend = trendFromReadings(r, lastTs(r));
+  assert.notEqual(trend, "rising");
+  assert.notEqual(trend, "rising_fast");
+  assert.equal(computeGuard({ ...base, glucoseMgdl: 230, trend }).maxInsulinUnits, 0);
+});
+
+test("a dose the text merely REPORTS is not treated as one it proposes", () => {
+  // The prompt itself tells the model to quote the active insulin in units, and active insulin is
+  // routinely larger than the correction left after subtracting it. Judged against the bare guard
+  // ceiling, a compliant sentence came out gutted.
+  const g = computeGuard({ ...base, glucoseMgdl: 250, trend: "stable", iobUnits: 2 });
+  const txt = "l'insuline encore active (≈ 2 u) va en absorber une partie.";
+  const ceiling = { ...g, maxInsulinUnits: g.maxInsulinUnits + 2 }; // + what the context legitimately holds
+  assert.equal(enforceInsulinCeiling(txt, ceiling), txt);
+  // An invented, larger dose is still removed.
+  assert.ok(!enforceInsulinCeiling("prends plutôt 12 u tout de suite.", ceiling).includes("12"));
+});
+
+test("the dose sniffer knows the French medical 'UI'", () => {
+  const g = { kind: "correction", reason: "high_correction", insulinUnits: 2, maxInsulinUnits: 2, sugarGrams: 0, sugarCubes: 0 } as const;
+  assert.ok(!enforceInsulinCeiling("fais 6 UI maintenant.", g).includes("6"));
+  assert.equal(overCeilingUnits("fais 6 UI maintenant.", 2), 6);
+  // ...and does not mistake carbs, hours or weights for doses.
+  assert.equal(overCeilingUnits("45 g de glucides, dans 2 h, 38 kg", 2), null);
 });
 
 test("a reading isolated by a sensor gap has no knowable direction", () => {

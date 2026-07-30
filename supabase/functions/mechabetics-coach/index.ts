@@ -758,7 +758,7 @@ Deno.serve(async (req: Request) => {
     const { data: prof0 } = await db.from("mechabetics_profiles").select("updated_at").eq("subject", subject).maybeSingle();
     const profUpdatedMs = (prof0 as any)?.updated_at ? new Date((prof0 as any).updated_at).getTime() : 0;
     const { data: lastLog } = await db.from("mechabetics_coach_log")
-      .select("message, ts, lang").eq("subject", subject)
+      .select("message, ts, lang, glucose_at_time").eq("subject", subject)
       .order("ts", { ascending: false }).limit(1).maybeSingle();
     if (!force && lastLog?.message && lastLog.lang === lang) {
       const logMs = new Date(lastLog.ts).getTime();
@@ -769,11 +769,27 @@ Deno.serve(async (req: Request) => {
       // every automatic refresh. Only an explicit tap on ANALYSE forced a recompute, which is the one
       // moment a parent is least likely to be looking. A rapid drop counts too: the analysis it was
       // built on no longer describes what is happening.
-      const sinceCache = (readings as any[])
-        .map((r) => ({ ts: Number(r?.ts), value: Number(r?.value) }))
+      // FROM THE DATABASE AS WELL AS THE PHONE, and that distinction is the whole point. Built on the
+      // payload alone this check missed precisely the case it exists for: the father has his own
+      // record on screen, so the phone is not polling the son at all, while the 24/7 monitor has been
+      // writing the son's 62 mg/dL to this table for six minutes. The son's dashboard would then
+      // refresh and replay a ten-minute-old "tout va bien" with its action line. Bounded to the cache
+      // age, so it is a handful of rows.
+      const { data: dbSince } = await db.from("mechabetics_readings")
+        .select("ts, value_mgdl").eq("subject", subject)
+        .gt("ts", lastLog.ts).order("ts", { ascending: false }).limit(60);
+      const sinceCache = [
+        ...(readings as any[]).map((r) => ({ ts: Number(r?.ts), value: Number(r?.value) })),
+        ...((dbSince ?? []) as any[]).map((r) => ({ ts: new Date(r.ts).getTime(), value: Number(r.value_mgdl) })),
+      ]
         .filter((r) => Number.isFinite(r.ts) && r.value > 0 && r.ts > logMs)
         .sort((a, b) => a.ts - b.ts);
-      const wentLow = sinceCache.some((r) => r.value < LOW_MGDL);
+      // A low the cached text ALREADY describes must not re-bill an LLM call on every refresh — an
+      // hour-long hypo is exactly when the parent reloads most. Only a low that is NEW relative to
+      // what the cache was written on invalidates it.
+      const cachedGlucose = Number((lastLog as any).glucose_at_time);
+      const cachedWasLow = Number.isFinite(cachedGlucose) && cachedGlucose > 0 && cachedGlucose < LOW_MGDL;
+      const wentLow = !cachedWasLow && sinceCache.some((r) => r.value < LOW_MGDL);
       const droppedFast = sinceCache.length >= 2 &&
         (Math.max(...sinceCache.map((r) => r.value)) - sinceCache[sinceCache.length - 1].value) >= 40;
       if (ageMs < 10 * 60 * 1000 && logMs >= profUpdatedMs && !wentLow && !droppedFast) {
@@ -849,9 +865,13 @@ Deno.serve(async (req: Request) => {
     // OLDEST 1000 and dropped everything recent, so `last` — the value the whole analysis calls
     // "glycémie actuelle" and the guard doses against — would have been hours stale. Descending makes
     // any truncation fall on the far end of history, where it costs nothing. Re-sorted below anyway.
-    const { data: storedReadings } = await db.from("mechabetics_readings")
+    const { data: storedReadings, error: histErr } = await db.from("mechabetics_readings")
       .select("ts, value_mgdl").eq("subject", subject)
       .gte("ts", histSinceIso).order("ts", { ascending: false }).limit(2000);
+    // A silent failure here degrades cleanly back to the phone's payload — which is exactly the
+    // holed series this merge exists to repair, so it must not degrade QUIETLY. A renamed column or
+    // a broken policy would otherwise restore the old behaviour for ever with nothing to show for it.
+    if (histErr) console.error("coach: stored-history read failed:", histErr.message);
     const byTs = new Map<number, number>();
     for (const r of (storedReadings ?? []) as any[]) {
       const t = new Date(r.ts).getTime();
@@ -918,7 +938,7 @@ Deno.serve(async (req: Request) => {
         : "INDICE : la glycémie monte sans repas loggé ; suggère gentiment de logger ce qui a été mangé (n'invente aucune dose).")
       : "";
 
-    const swing = swingNote(readings, lang);
+    const swing = swingNote(sorted, lang); // merged series: swings hidden inside a follow-gap were invisible
     const recent = signalLost ? "" : recentWindowNote(sorted, nowMs, lang); // a stale "now: X rising" reads as live — drop it
     // CODE owns the stability verdict (variability + rapid swings) so the model can't call a
     // 21-swing day "stable". Fed authoritatively to the prompt + reused in the fallback summary.
@@ -935,7 +955,19 @@ Deno.serve(async (req: Request) => {
     // only, so it cannot be used raw: on a day with a meal to bolus, a perfectly correct "12 u for
     // the meal" in the prose would read as an overshoot against a 2 u correction ceiling. Raised to
     // the real total as soon as a meal plan is computed, just below.
-    let proseDoseCeiling = guard.maxInsulinUnits;
+    //
+    // It must also clear every dose the prompt ITSELF put in front of the model. insulinContext feeds
+    // it "6,5 u Fiasp il y a 80 min", and iobSystemLine orders it to quote the active insulin in
+    // units — both routinely larger than a correction, since the correction is what's LEFT after
+    // subtracting them. Judged against the bare guard ceiling, a model doing exactly as told had its
+    // sentence gutted: "l'insuline encore active (≈ ) va en absorber une partie". Reporting a dose is
+    // not proposing one; only a figure above everything legitimately in play is an invention.
+    const contextUnits = Math.max(
+      iob || 0,
+      ...((insulin ?? []) as any[]).map((d) => Number(d?.units) || 0),
+      0,
+    );
+    let proseDoseCeiling = guard.maxInsulinUnits + contextUnits;
     const actionLine = signalLost
       ? (sensorExpired
         ? (lang === "es"
@@ -949,7 +981,7 @@ Deno.serve(async (req: Request) => {
         // could never name a dose for food: 120 g logged and unbolused at 175 mg/dL came back as
         // "in range, nothing to correct".
         const plan = mealBolusPlan(meals ?? [], insulin ?? [], nowMs, gp);
-        proseDoseCeiling = guard.maxInsulinUnits + Math.max(0, plan.units || 0);
+        proseDoseCeiling = guard.maxInsulinUnits + Math.max(0, plan.units || 0) + contextUnits;
         if (plan.planned && plan.carbsG != null) {
           return mealPlanLine(planMealDose({
             glucoseMgdl: cur, trend, staleMin, iobUnits: iob,
@@ -1071,10 +1103,15 @@ Deno.serve(async (req: Request) => {
       // cannot drift apart.
       const label = lang === "es" ? "Acción" : "Action";
       display = `${display}\n\n${label} : ${actionLine}`;
+      // SPOKEN TOO. This line had drifted into the `else if (tip)` branch below, which inverted it
+      // completely: on every ordinary analysis the screen carried the action and the audio did not —
+      // a parent driving, listening to their child's analysis, never heard "15 g de sucre rapide tout
+      // de suite". And in the one case the branch did fire, the voice announced a dose the screen
+      // never showed. The action belongs to whoever is being told there IS an action.
+      voice = `${voice} ${actionLine}`.trim();
     } else if (tip) {
       // Nothing to act on: the improvement tip becomes the closing line instead of a blank ending.
       display = `${display}\n\n${tip}`;
-      voice = `${voice} ${actionLine}`.trim();
     }
 
     // A hypo while rapid insulin is STILL on board keeps falling — one rescue often won't hold (the

@@ -163,16 +163,19 @@ export const TREND_WINDOW_MIN = 20;
 // stitched from 15-min cloud buckets, or after a sensor gap), look further back rather than giving up
 // — "unknown" BLOCKS the correction, so reaching for it early costs the user a real dose.
 export const TREND_FALLBACK_MIN = 45;
-// Enough of a time base that the fit isn't dividing by nothing. Kept SMALL on purpose: the noise
-// deadband below, not this, is what stops a short span being over-read. Setting it high was itself a
-// bug — after a sensor gap the readings resume dense (one a minute), so an 8-minute floor turned nine
-// perfectly good readings into "unknown" and blocked the dose for eight more minutes.
-export const TREND_MIN_SPAN_MIN = 3;
-// Sensor noise floor. A Libre reading around 230 carries several mg/dL of noise, so a fitted change
-// smaller than this is NOT a direction — it is the sensor breathing. Without this, an isolated 236
-// among 232s was enough to fit a downward line and answer "falling", which BLOCKS the correction.
-// The real case: a child climbing 190 -> 237 was told "no insulin" twice, on the way UP.
-export const TREND_NOISE_MGDL = 8;
+// Minimum time base before any direction is claimed. Three minutes of readings after a sensor
+// blackout describe nothing, and pretending otherwise is how a fit gets built on noise. "unknown"
+// blocks the correction, which is the honest answer here — and the coach now merges 24 h of stored
+// readings before asking, so a window this thin is rare in practice rather than routine.
+export const TREND_MIN_SPAN_MIN = 10;
+// Widening across a hole is only allowed while the hole is small. Beyond this, the pre-gap point is
+// not context, it is a different situation: fitting 150 mg/dL from forty minutes ago to a burst of
+// 230s produced "rising_fast" on a glucose that was actually coming down.
+export const TREND_MAX_GAP_MIN = 20;
+// A fall is judged on the MOST ALARMING evidence available, a rise on the whole window. The costs are
+// not symmetric: missing a fall lets insulin go in on top of one, while a cautious "falling" only
+// withholds a correction for a few minutes. So the recent segment gets a veto on the downside only.
+export const TREND_RECENT_MIN = 10;
 
 /** Median-of-3 despike. Rejects a single outlying sample without moving a genuine ramp — a real rise
  *  keeps every point above its predecessor, so the median passes it through unchanged. */
@@ -221,24 +224,41 @@ export function robustSlope(
   const last = pts[pts.length - 1];
   if (pts.length < 2) return { slope: null, spanMin: 0, current: last.v };
 
-  // Points close enough to the newest reading to describe where it is heading. Widen once when the
-  // primary window can't carry a fit, instead of declaring the direction unknown.
+  // Points close enough to the newest reading to describe where it is heading.
   let win = pts.filter((p) => p.t >= last.t - TREND_WINDOW_MIN * 60000);
-  if (win.length < 3 || (last.t - win[0].t) / 60000 < TREND_MIN_SPAN_MIN) {
+  // Widen ONLY when the primary window cannot carry a fit at all. Widening whenever it merely looked
+  // thin was a safety bug: with a followed patient's 15-minute cloud buckets the primary window holds
+  // two points, and pulling in 45 minutes averaged a genuine 24 mg/dL drop in the last bucket down to
+  // nothing — the guard then offered a correction the old code had blocked.
+  if (win.length < 2 || (last.t - win[0].t) / 60000 < TREND_MIN_SPAN_MIN) {
     const wider = pts.filter((p) => p.t >= last.t - TREND_FALLBACK_MIN * 60000);
     if (wider.length > win.length) win = wider;
   }
   const spanMin = win.length >= 2 ? (last.t - win[0].t) / 60000 : 0;
   if (win.length < 2 || spanMin < TREND_MIN_SPAN_MIN) return { slope: null, spanMin, current: last.v };
 
-  const smoothed = despike(win.map((p) => p.v));
-  const slope = slopePerMin(win.map((p, i) => ({ t: p.t, v: smoothed[i] })));
-  // Movement smaller than the sensor's own noise over this span is not a direction.
-  return {
-    slope: Math.abs(slope * spanMin) < TREND_NOISE_MGDL ? 0 : slope,
-    spanMin,
-    current: last.v,
+  // A HOLE IS NOT A PLATEAU. Anything can have happened inside a long gap — a rescue, an unlogged
+  // dose, a rebound — so a line drawn across it is invention, not measurement.
+  for (let i = 1; i < win.length; i++) {
+    if ((win[i].t - win[i - 1].t) / 60000 > TREND_MAX_GAP_MIN) return { slope: null, spanMin, current: last.v };
+  }
+
+  const fit = (seg: { t: number; v: number }[]) => {
+    if (seg.length < 2) return null;
+    const sm = despike(seg.map((p) => p.v));
+    return slopePerMin(seg.map((p, i) => ({ t: p.t, v: sm[i] })));
   };
+  const whole = fit(win) ?? 0;
+
+  // The recent segment gets a veto, but ONLY downwards. A crash that started five minutes ago is
+  // averaged away by a twenty-minute fit — the regression is right about the window and wrong about
+  // the person. Taking the steeper of the two whenever the recent one is falling keeps the safe
+  // direction reachable without letting a short noisy segment manufacture a rise.
+  const recent = win.filter((p) => p.t >= last.t - TREND_RECENT_MIN * 60000);
+  const recentSlope = recent.length >= 2 && (last.t - recent[0].t) / 60000 >= 3 ? fit(recent) : null;
+  const slope = recentSlope != null && recentSlope < whole ? recentSlope : whole;
+
+  return { slope, spanMin, current: last.v };
 }
 
 /** Recent trend from readings ({ ts: ms, value: mg/dL }). Safety-biased: an unreadable series is
@@ -406,7 +426,7 @@ export function stripInsulinNumbers(text: string): string {
   // Collapse only HORIZONTAL whitespace ([ \t]) — NOT newlines — so paragraph breaks (\n\n) added
   // for readability survive this strip (it runs on every in-range/blocked analysis).
   return (text || "")
-    .replace(/\d+(?:[.,]\d+)?\s*(?:u\b|unit[ée]s?\b|unidad(?:es)?\b)/gi, "")
+    .replace(/\d+(?:[.,]\d+)?\s*(?:ui\b|u\b|unit[ée]s?\b|unidad(?:es)?\b)/gi, "")
     .replace(/[ \t]{2,}/g, " ")
     .replace(/[ \t]+([.,;:!?])/g, "$1")
     .trim();
@@ -449,7 +469,7 @@ export function softenCorrectionTalk(text: string, lang: string): string {
  *  null when everything the model wrote is within the ceiling. Matches the same shapes as
  *  [stripInsulinNumbers]: "2 u", "1,5 unités", "3 unidades". */
 export function overCeilingUnits(text: string, maxUnits: number): number | null {
-  const re = /(\d+(?:[.,]\d+)?)\s*(?:u\b|unit[ée]s?\b|unidad(?:es)?\b)/gi;
+  const re = /(\d+(?:[.,]\d+)?)\s*(?:ui\b|u\b|unit[ée]s?\b|unidad(?:es)?\b)/gi;
   let m: RegExpExecArray | null;
   let worst: number | null = null;
   while ((m = re.exec(text || "")) !== null) {
@@ -700,13 +720,16 @@ export function combinedActionLine(
       : `${fmtUnits(total)} u de ${rapid} ahora`;
     if (meal > 0 && corr > 0) line += ` (${fmtUnits(meal)} u por la comida + ${fmtUnits(corr)} u de corrección)`;
     if (stale && meal > 0) line += `; recontrola la glucosa antes de cualquier corrección`;
-    return line + ".";
+    return line + "." + unusualDoseNote(total, profile, lang);
   }
   let line = (meal > 0 && corr === 0)
     ? `${fmtUnits(total)} u de ${rapid} pour le repas`
     : `${fmtUnits(total)} u de ${rapid} maintenant`;
   if (meal > 0 && corr > 0) line += ` (${fmtUnits(meal)} u pour le repas + ${fmtUnits(corr)} u de correction)`;
   if (stale && meal > 0) line += ` ; recontrôle la glycémie avant toute correction`;
+  // The note belongs HERE above all: with the ceilings removed, the meal bolus is the unbounded half,
+  // and "450 g" typed for "45 g" produces 37 u with nothing else to question it.
+  line += unusualDoseNote(total, profile, lang);
   return line + ".";
 }
 
