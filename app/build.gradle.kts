@@ -4,11 +4,11 @@ plugins {
 }
 
 android {
-    namespace = "com.nueve.mechabetics"
+    namespace = "com.drclaude"
     compileSdk = 36
 
     defaultConfig {
-        applicationId = "com.nueve.mechabetics"
+        applicationId = "com.drclaude"
         minSdk = 26
         targetSdk = 36
         versionCode = 1
@@ -22,7 +22,7 @@ android {
             // Only change on this rollback branch: keeps the package the phone already has installed,
             // so this replaces the current build in place instead of landing as a third app.
             applicationIdSuffix = ".debug"
-            versionNameSuffix = "-rollback"
+            versionNameSuffix = "-debug"
         }
         release {
             isMinifyEnabled = false

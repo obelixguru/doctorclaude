@@ -2,14 +2,14 @@ import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "jsr:@supabase/supabase-js@2";
 import { Resvg, initWasm } from "https://esm.sh/@resvg/resvg-wasm@2.6.2";
 import { buildGlucoseSvg } from "../_shared/glucoseChart.ts";
+import { alertMessage } from "../_shared/alertZones.ts";
 
 // ── 24/7 hypo/hyper monitor for Mechabetics ──────────────────────────────
-// Logs into LibreLinkUp (follower creds in secrets), reads the latest value, and
-// alerts the Telegram GROUP only when glucose crosses a NEW multiple-of-10 step
-// vs the LAST reading we saw — remembered in `mechabetics_monitor_state`, so there
-// are no repeats within the same ten (the old "stateless" version compared against
-// a stale graph point and re-alerted every run). Plus one "back to normal" when it
-// crosses back over LOW (70) / HIGH (170) after being red. Secrets: MECHABETICS_*.
+// Logs into LibreLinkUp (follower creds in secrets), reads the latest value, and alerts the Telegram
+// GROUP following the shared zone rules in _shared/alertZones.ts — the same ones the phone alarm
+// obeys, so both fire at the same moments. Each reading is compared against the LAST one we saw,
+// remembered in `mechabetics_monitor_state` (the old "stateless" version compared against a stale
+// graph point and re-alerted every run). Secrets: MECHABETICS_*.
 
 const db = createClient(
   Deno.env.get("SUPABASE_URL")!,
@@ -21,12 +21,15 @@ const LLU_EMAIL = Deno.env.get("MECHABETICS_LLU_EMAIL") ?? "";
 const LLU_PASSWORD = Deno.env.get("MECHABETICS_LLU_PASSWORD") ?? "";
 const TG_TOKEN = Deno.env.get("MECHABETICS_TELEGRAM_BOT_TOKEN") ?? "";
 const TG_CHAT = Deno.env.get("MECHABETICS_TELEGRAM_CHAT_ID") ?? "";
-const LOW = Number(Deno.env.get("MECHABETICS_LOW") ?? "70"); // hypo floor (normal range = LOW..HIGH)
-// Default aligned to the in-app HIGH (180). NOTE: the LIVE value is the MECHABETICS_HIGH secret,
-// currently 240 — i.e. the parent's Telegram high-alert only fires above 240, NOT 180. Change the
-// secret (not just this default) if you want the push alert to match the app's 180 threshold.
-const HIGH = Number(Deno.env.get("MECHABETICS_HIGH") ?? "180"); // hyper ceiling (see note above)
-const VERY_LOW = Number(Deno.env.get("MECHABETICS_VERY_LOW") ?? "50"); // 🚨 wording below this
+// ALERT ZONES: thresholds and re-alerting rules come from _shared/alertZones.ts — the SAME five
+// zones the app uses (ALARM_* in data/GlucoseAlert.kt), so the phone alarm and the Telegram message
+// fire at the same moments. They are constants, NOT env vars: MECHABETICS_LOW / MECHABETICS_HIGH /
+// MECHABETICS_VERY_LOW were overridable and the live MECHABETICS_HIGH secret had drifted to 240, so
+// the parent's Telegram alerts fired 60 mg/dL later than the phone's. Those three secrets are now
+// unused and can be deleted from the project.
+// A reading older than this can't be alerted on: it is not the current glucose. Mirrors the app's
+// FRESHNESS_WINDOW_MS and the guard's STALE_MIN.
+const STALE_MIN = 15;
 
 function H(extra: Record<string, string> = {}) {
   return {
@@ -164,26 +167,8 @@ async function telegramPhoto(png: Uint8Array, caption: string): Promise<boolean>
   return false;
 }
 
-// True if a multiple-of-10 boundary lies between the two readings.
-function tensCrossed(a: number, b: number): boolean {
-  return Math.floor(a / 10) !== Math.floor(b / 10);
-}
-
-// Alert only on a NEW 10 mg/dL step while out of range, + "back to normal" on return. `name` is the
-// patient's OWN first name (from LibreLinkUp) so an account following several people never mislabels
-// a value — e.g. sending the father's glucose under the son's name.
-function alertFor(prev: number, cur: number, name: string): string | null {
-  if (prev < LOW && cur >= LOW && cur <= HIGH) return `✅ <b>Glycémie de ${name} revenue à la normale</b> : ${cur} mg/dL`;
-  if (prev > HIGH && cur <= HIGH && cur >= LOW) return `✅ <b>Glycémie de ${name} revenue à la normale</b> : ${cur} mg/dL`;
-  if (cur < LOW && tensCrossed(prev, cur)) {
-    if (cur <= VERY_LOW) return `🚨 <b>Glycémie de ${name} : ${cur} mg/dL — TRÈS BASSE</b>\nResucrage immédiat (15 g de sucre rapide).`;
-    return `🔻 <b>Glycémie de ${name} : ${cur} mg/dL — basse</b>`;
-  }
-  if (cur > HIGH && tensCrossed(prev, cur)) {
-    return `🔺 <b>Glycémie de ${name} : ${cur} mg/dL — haute</b>`;
-  }
-  return null;
-}
+// The zone rules themselves live in _shared/alertZones.ts (imported above as alertMessage) so they
+// are unit-tested and stay identical to the app's alarm engine.
 
 async function login(): Promise<{ host: string; token: string; uid: string } | null> {
   let host = "api.libreview.io";
@@ -379,7 +364,16 @@ async function processPatient(
     }
     const prev = st?.last_value ?? 100; // mid-normal anchor on first run OR on a read blip (logged above)
 
-    const msg = alertFor(prev, cur, name);
+    // Never alert on a reading that is no longer the current glucose. Without this the monitor could
+    // send "🚨 basse" for a value measured an hour ago, and — worse — a stale value re-entering the
+    // comparison could fire a spurious alert once the signal returned. The sensor-expiry path above
+    // already had this check; the hypo/hyper path did not.
+    const newestTs = [...(g?.data?.graphData ?? []), ...(liveM ? [liveM] : [])].reduce(
+      (mx: number, x: any) => { const t = Date.parse(tsOf(x)); return Number.isFinite(t) && t > mx ? t : mx; },
+      0,
+    );
+    const staleMin = newestTs ? (nowMs0 - newestTs) / 60000 : Number.POSITIVE_INFINITY;
+    const msg = staleMin > STALE_MIN ? null : alertMessage(prev, cur, name);
 
     await db.from("mechabetics_monitor_state").upsert({
       subject,

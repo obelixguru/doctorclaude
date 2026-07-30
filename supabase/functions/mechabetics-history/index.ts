@@ -95,12 +95,15 @@ Deno.serve(async (req: Request) => {
     // Recent meals (EATEN carbs / hypo rescues) — like insulin, so the client can mirror the
     // server's minutesSinceLastRescue and stop telling the user to take MORE sugar when they just
     // did (the dashboard LOW banner reads `planned` + `ts`; planned = not-yet-eaten = not on board).
+    // `id` and `quantity` travel with them so the chart can open THE meal a marker stands for —
+    // without the id a green/red dot is unidentifiable and can only fall back to the whole history.
     const { data: mealRows } = await db.from("mechabetics_meals")
-      .select("ts, planned, description, carbs_g").eq("subject", subject).gte("ts", since)
+      .select("id, ts, planned, description, carbs_g, quantity").eq("subject", subject).gte("ts", since)
       .order("ts", { ascending: false }).limit(100);
     const meals = (mealRows ?? []).map((m: any) => ({
-      ts: new Date(m.ts).getTime(), planned: !!m.planned,
+      id: m.id, ts: new Date(m.ts).getTime(), planned: !!m.planned,
       description: m.description ?? null, carbs_g: m.carbs_g ?? null,
+      quantity: m.quantity ?? 1,
     }));
 
     // 24h stats (avg / TIR / %high / %low) here too, so the dashboard's average + time-in-range

@@ -3,6 +3,7 @@ import { createClient } from "jsr:@supabase/supabase-js@2";
 import { accessSubject } from "../_shared/access.ts";
 import {
   computeGuard,
+  STALE_MIN,
   trendFromReadings,
   recentHypoFrom,
   activeIob,
@@ -12,6 +13,7 @@ import {
   situationHint,
   minutesSinceLastRescue,
   stripInsulinNumbers,
+  enforceInsulinCeiling,
   carbsCubesPhrase,
   carbEstimationRules,
   mealCarbSpeed,
@@ -212,11 +214,13 @@ async function visionComplete(sys: string, userText: string, imageBase64: string
       await new Promise((r) => setTimeout(r, 600)); // let a momentary rate-spike clear
       res = await anthropicVision(sys, userText, imageBase64, mime);
       if (!res.error) return res;
-      // Still failing → try the server's own Gemini vision key as a SECOND provider.
-      if (GEMINI_API_KEY) {
-        const g = await geminiVision(sys, userText, imageBase64, mime, GEMINI_API_KEY);
-        if (!g.error) return g;
-      }
+    }
+    // Fall back to the server's own Gemini vision key on ANY Anthropic failure, not just a transient
+    // one. A renamed/retired model id answers 404 — not "transient" — and used to kill the scan
+    // outright while a perfectly good second provider sat configured and unused.
+    if (GEMINI_API_KEY) {
+      const g = await geminiVision(sys, userText, imageBase64, mime, GEMINI_API_KEY);
+      if (!g.error) return g;
     }
     return res; // surface the classified Anthropic error
   }
@@ -244,12 +248,23 @@ Deno.serve(async (req: Request) => {
     if (!byokGeminiKey && body.hosted === false) {
       return json({ text: lang === "es"
         ? "Para usar el escáner: activa el modo Hosted o añade tu clave Gemini en Perfil."
-        : "Pour utiliser le scan : active le mode Hosted ou ajoute ta clé Gemini dans Profil.", isError: true });
+        : "Pour utiliser le scan : active le mode Hosted ou ajoute ta clé Gemini dans Profil.",
+        isError: true, errorKind: "auth" });
     }
     if (!ANTHROPIC_API_KEY && !GEMINI_API_KEY && !byokGeminiKey) {
-      return json({ text: lang === "es"
-        ? "Escáner de fotos no configurado: añade tu clave Gemini (BYOK) en Perfil, o activa el modo Hosted."
-        : "Scan photo non configuré : ajoute ta clé Gemini (BYOK) dans Profil, ou active le mode Hosted.", isError: true });
+      // NOT the user's problem when they ARE in hosted mode: the scan is the only feature that needs
+      // a VISION key (the others run on DeepSeek), so it can be unconfigured server-side while
+      // everything else works. Telling a hosted user to "activate hosted mode" — which they already
+      // did — is the reported bug; own the failure instead.
+      const hostedCaller = body.hosted !== false;
+      return json({ text: hostedCaller
+        ? (lang === "es"
+          ? "El escáner de fotos no está disponible ahora mismo (configuración del servidor). No es culpa de tus ajustes: el modo Hosted sigue activo. Añade la comida a mano, o vuelve a intentarlo más tarde."
+          : "Le scan photo n'est pas disponible pour le moment (configuration du serveur). Ce n'est pas tes réglages : le mode Hosted est bien actif. Ajoute le repas à la main, ou réessaie plus tard.")
+        : (lang === "es"
+          ? "Escáner de fotos no configurado: añade tu clave Gemini (BYOK) en Perfil, o activa el modo Hosted."
+          : "Scan photo non configuré : ajoute ta clé Gemini (BYOK) dans Profil, ou active le mode Hosted."),
+        isError: true, errorKind: "auth" });
     }
 
     const nowMs = Date.now();
@@ -265,7 +280,7 @@ Deno.serve(async (req: Request) => {
     const staleMin = hasTs ? Math.round((nowMs - (lastR as any).ts) / 60000) : 999;
     // Match the client's 5-min NO SIGNAL window: a reading older than that means the LIVE glucose is
     // unknown, so we must not append a dose/sugar action off it (the guard's STALE_MIN=15 is laxer).
-    const signalLost = cur != null && (!hasTs || (nowMs - (lastR as any).ts) > 5 * 60000);
+    const signalLost = cur != null && (!hasTs || (nowMs - (lastR as any).ts) > STALE_MIN * 60000);
     const trend = hasTs ? trendFromReadings(rds, nowMs) : "unknown";
 
     let profile: any = null;
@@ -280,8 +295,11 @@ Deno.serve(async (req: Request) => {
         .order("ts", { ascending: false }).limit(8);
       insulinDoses = ins ?? [];
       // Recent meals → so a low that was JUST treated isn't told to take MORE sugar (rule of 15).
+      // description + carbs_g are REQUIRED: minutesSinceLastRescue only counts an actual rescue
+      // (small fast sugar), which it reads off those two fields. Windowed for the same reason as ask.
       const { data: ml } = await db.from("mechabetics_meals")
-        .select("ts, planned").eq("subject", subject)
+        .select("ts, description, carbs_g, planned").eq("subject", subject)
+        .gte("ts", new Date(nowMs - 26 * 60 * 60 * 1000).toISOString())
         .order("ts", { ascending: false }).limit(6);
       meals = ml ?? [];
     }
@@ -328,6 +346,13 @@ Deno.serve(async (req: Request) => {
     // NO SIGNAL state contradicts.
     const insulinForbidden = signalLost || (guard.maxInsulinUnits === 0 && mealUnits === 0);
     if (insulinForbidden) { reply = stripInsulinNumbers(reply) || reply; voice = stripInsulinNumbers(voice) || voice; }
+    // Insulin allowed: the answer still may not name MORE units than the system decided (correction
+    // plus the meal bolus for the scanned food). Previously unchecked.
+    else {
+      const ceiling = { ...guard, maxInsulinUnits: guard.maxInsulinUnits + Math.max(0, mealUnits || 0) };
+      reply = enforceInsulinCeiling(reply, ceiling) || reply;
+      voice = enforceInsulinCeiling(voice, ceiling) || voice;
+    }
     const showAction = signalLost || mealUnits > 0 || !(guard.reason === "in_range" || guard.reason === "no_reading");
     let text = reply;
     let voiceText = voice;
@@ -347,8 +372,11 @@ Deno.serve(async (req: Request) => {
       const cn = lang === "es"
         ? `${mealCarbs} g de carbohidratos (${carbsCubesPhrase(mealCarbs, "es")}).`
         : `${mealCarbs} g de glucides (${carbsCubesPhrase(mealCarbs, "fr")}).`;
+      const cnVoice = lang === "es"
+        ? `${mealCarbs} g de carbohidratos, ${carbsCubesPhrase(mealCarbs, "es", true)}.`
+        : `${mealCarbs} g de glucides, ${carbsCubesPhrase(mealCarbs, "fr", true)}.`;
       text = `${text}\n\n${cn}`;
-      voiceText = `${voiceText} ${cn}`.trim();
+      voiceText = `${voiceText} ${cnVoice}`.trim();
     }
 
     // A STARCHY food (potato, bread, rice, pasta…) isn't sweet but IS high-carb → explain it, so the
@@ -360,10 +388,12 @@ Deno.serve(async (req: Request) => {
     // rise, recheck later — fatty also gets the split-bolus note). Skip during a hypo rescue
     // (guard "sugar"): a "pre-bolus next time" line would contradict "take sugar now".
     if (parsed.meal && typeof parsed.meal === "object" && guard.kind !== "sugar") {
-      const adv = carbSpeedAdvice(mealCarbSpeed(parsed.meal.description), lang);
+      const speed = mealCarbSpeed(parsed.meal.description);
+      const adv = carbSpeedAdvice(speed, lang);
       if (adv) {
         text = `${text}\n\n${adv}`;
-        voiceText = `${voiceText} ${adv}`.trim();
+        // Spoken variant without the food examples (they are heard as "what you ate").
+        voiceText = `${voiceText} ${carbSpeedAdvice(speed, lang, false, true)}`.trim();
       }
     }
 

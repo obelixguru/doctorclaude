@@ -3,6 +3,9 @@ import { createClient } from "jsr:@supabase/supabase-js@2";
 import { accessSubject } from "../_shared/access.ts";
 import {
   computeGuard,
+  STALE_MIN,
+  LOW_MGDL,
+  SEVERE_LOW_MGDL,
   trendFromReadings,
   recentHypoFrom,
   minutesSinceLastRescue,
@@ -13,6 +16,7 @@ import {
   combinedActionLine,
   situationHint,
   stripInsulinNumbers,
+  enforceInsulinCeiling,
   noDoseDue,
   softenCorrectionTalk,
   mealCarbSpeed,
@@ -22,10 +26,24 @@ import {
   hypoIobWarning,
   uncoveredMealWarning,
   inRangeActionLine,
+  mealBolusPlan,
+  planMealDose,
+  mealPlanLine,
   plannedMealNote,
   type GuardProfile,
 } from "../_shared/doseGuard.ts";
 import { chatJson, llmErrorKind, llmErrorMessage } from "../_shared/llm.ts";
+
+// How far back the STORED history is merged into the series the analysis reads. The phone only polls
+// the patient on screen, so a followed patient's payload has real holes; the 24/7 monitor has been
+// filling this table for every patient regardless.
+//
+// A FULL DAY, on purpose. Everything downstream windows itself to the question it is asking — the
+// trend and the projection fit the last 20-45 min, the "last hour" note filters an hour, the meal
+// spike detector looks around each meal — so a longer series can only ADD context, never blur a
+// short-term answer. What it fixes is the opposite failure: variability, swings and the day's shape
+// were being computed from whatever few hours the phone happened to be holding.
+const TREND_HISTORY_HOURS = 24;
 
 // Doctor Claude coach (FR/ES). Saves glucose history pseudonymously, then writes a short
 // coaching message about the PAST DAY (last 24h) — and the EXACT next action, which is
@@ -395,9 +413,56 @@ function dayStatsLine(s: any, lang: string): string {
     else if (tir <= tPrev - 5) cmp = es ? ` — menos bien que ayer (ayer ${tPrev}%)` : ` — moins bien qu'hier (hier ${tPrev}%)`;
     else cmp = es ? ` — como ayer (ayer ${tPrev}%)` : ` — comme hier (hier ${tPrev}%)`;
   }
+  // THE LOW HALF OF THE DAY, ALWAYS. This line is the ONLY place a number reaches the screen (the
+  // model is forbidden from writing figures), and it used to carry time-in-target and the average
+  // and nothing else. So the day's low side — "6% of today under 70, lowest 52" — had no route to
+  // the user at all, which is exactly how a day with three hypos got announced as "better than
+  // yesterday". Shown even when it is zero: "0% under 70" is information worth having.
+  const lo = s.pct_low_today_cal ?? s.pct_low_24h;
+  const mn = s.min_today_cal ?? s.min_24h;
+  let lows = "";
+  if (lo != null) {
+    lows = es
+      ? ` Por debajo de 70: ${lo}% del tiempo${mn != null ? `, mínimo ${mn} mg/dL` : ""}.`
+      : ` Sous 70 : ${lo}% du temps${mn != null ? `, plus bas ${mn} mg/dL` : ""}.`;
+  }
   return es
-    ? `Hoy (de 8 h a 8 h): ${tir}% del tiempo en objetivo, media ${avg} mg/dL${cmp}.`
-    : `Aujourd'hui (de 8 h à 8 h) : ${tir}% du temps dans la cible, moyenne ${avg} mg/dL${cmp}.`;
+    ? `Hoy (de 8 h a 8 h): ${tir}% del tiempo en objetivo, media ${avg} mg/dL${cmp}.${lows}`
+    : `Aujourd'hui (de 8 h à 8 h) : ${tir}% du temps dans la cible, moyenne ${avg} mg/dL${cmp}.${lows}`;
+}
+
+// Clinical consensus targets for time below range: under 4% of the day below 70, under 1% below 54.
+// Past those, the day is not a good day whatever the time-in-target says.
+const LOW_TIME_WARN_PCT = 4;
+const LOW_TIME_BAD_PCT = 10;
+
+/** Did the day go low, and how badly? Read once by the verdict and once by the prompt so the two
+ *  can't disagree. */
+function dayLows(stats: any): { pct: number | null; min: number | null; any: boolean; severe: boolean } {
+  const pctRaw = Number(stats?.pct_low_today_cal ?? stats?.pct_low_24h);
+  const minRaw = Number(stats?.min_today_cal ?? stats?.min_24h);
+  const pct = Number.isFinite(pctRaw) ? pctRaw : null;
+  const min = Number.isFinite(minRaw) && minRaw > 0 ? minRaw : null;
+  return {
+    pct, min,
+    any: (pct != null && pct > 0) || (min != null && min < LOW_MGDL),
+    severe: (min != null && min < SEVERE_LOW_MGDL) || (pct != null && pct >= LOW_TIME_BAD_PCT),
+  };
+}
+
+/** Code-owned sentence about the day's lows, injected into the prompt. Empty when the day stayed
+ *  above 70 — so its mere presence tells the model the subject may not be skipped. */
+function hypoDayNote(stats: any, lang: string): string {
+  const l = dayLows(stats);
+  if (!l.any) return "";
+  const es = lang === "es";
+  const parts = [
+    l.pct != null && l.pct > 0 ? (es ? `${l.pct}% del día por debajo de 70` : `${l.pct}% de la journée sous 70`) : "",
+    l.min != null ? (es ? `mínimo ${l.min} mg/dL` : `minimum ${l.min} mg/dL`) : "",
+  ].filter(Boolean).join(", ");
+  return es
+    ? `HIPOGLUCEMIAS DE HOY (calculado por el sistema): ${parts}. Es OBLIGATORIO mencionarlas en tu frase — sin cifras, el sistema ya las añade. Un día con pasos por debajo de 70 NO es un "buen día" ni un día "tranquilo", por muy alto que sea el tiempo en objetivo.`
+    : `HYPOS D'AUJOURD'HUI (calculé par le système) : ${parts}. Tu DOIS les mentionner dans ta phrase — sans chiffre, le système ajoute déjà la ligne chiffrée. Une journée avec des passages sous 70 n'est PAS une « bonne journée » ni une journée « tranquille », quel que soit le temps dans la cible.`;
 }
 
 /** Coefficient of variation (SD / mean, in %) — the clinical measure of glucose variability.
@@ -437,9 +502,18 @@ function dayQuality(stats: any, lang: string): string {
   const tir = Number(stats?.tir_today_cal ?? stats?.tir_24h);
   const es = lang === "es";
   if (!Number.isFinite(tir)) return es ? "irregular" : "en demi-teinte";
-  if (tir >= 70) return es ? "buena" : "bonne";
-  if (tir >= 50) return es ? "regular" : "moyenne";
-  return es ? "difícil" : "difficile";
+  let level = tir >= 70 ? 0 : tir >= 50 ? 1 : 2;
+
+  // LOWS OUTRANK TIME-IN-TARGET. Time in target alone made this verdict blind to the one thing that
+  // actually hurts on the day it happens: an hour spent at 55 mg/dL costs about 4% of the day, so a
+  // day with three hypos still scored "bonne" — and, worse, was announced as "better than yesterday"
+  // than a day with none. A hypo is not a rounding error in a percentage.
+  const l = dayLows(stats);
+  if (l.severe) level = 2;                                        // under 54, or lows all day
+  else if (l.pct != null && l.pct >= LOW_TIME_WARN_PCT) level = Math.max(level, 2);
+  else if (l.any) level = Math.max(level, 1);                     // any dip under 70 caps at "moyenne"
+
+  return es ? ["buena", "regular", "difícil"][level] : ["bonne", "moyenne", "difficile"][level];
 }
 
 /** Compact "last hour" + "last 10 minutes" snapshot so the bilan can layer 24h → hour → now. */
@@ -561,15 +635,16 @@ function buildPrompt(cur: number | null, s: any, lang: string, ctx: string, swin
         : "",
       day,
       recent,
-      `VEREDICTO DEL DÍA (lo calcula el sistema según el TIEMPO EN OBJETIVO): día ${quality} (${tToday ?? "?"}% en objetivo hoy, desde las 8 h). ESE es el balance del día — EMPIEZA por esa palabra. NO escribas tú el porcentaje (el sistema añade la línea con cifras).`,
-      `ESTABILIDAD (SOLO las oscilaciones): ${stability.word} (${stability.note}). Describe ÚNICAMENTE si la curva está calmada o agitada, NO si el día fue bueno. NUNCA digas "día estable" como balance del día: un día plano pero a menudo por encima del objetivo es un día DIFÍCIL — el tiempo en objetivo manda sobre la regularidad.`,
+      hypoDayNote(s, lang),
+      `VEREDICTO DEL DÍA (lo calcula el sistema según el TIEMPO EN OBJETIVO **y los pasos por debajo de 70**): día ${quality} (${tToday ?? "?"}% en objetivo hoy, desde las 8 h). ESE es el balance del día — EMPIEZA por esa palabra. NO escribas tú el porcentaje (el sistema añade la línea con cifras).`,
+      `ESTABILIDAD (SOLO las oscilaciones): ${stability.word} (${stability.note}). Describe ÚNICAMENTE si la curva está calmada o agitada, NO si el día fue bueno. NUNCA digas "día estable" como balance del día: un día plano pero a menudo por encima del objetivo es un día DIFÍCIL — el tiempo en objetivo manda sobre la regularidad. SIMÉTRICAMENTE, e igual de importante: un día con pasos por debajo de 70 no es "bueno" ni "tranquilo", aunque la curva parezca calmada — una hipoglucemia larga y plana no genera ni variación rápida ni variabilidad alta, así que es INVISIBLE en la palabra de estabilidad. Si arriba existe la línea HIPOGLUCEMIAS, tu frase debe nombrarlas.`,
       `Evolución: ${evo}`,
       `COMPARACIÓN CON AYER: para decir si el día es mejor, peor o comparable a ayer, básate ÚNICAMENTE en el veredicto «Evolución» de arriba (compara el tiempo en objetivo). La palabra de ESTABILIDAD describe SOLO las oscilaciones de hoy: NUNCA escribas «más estable que ayer» ni «menos estable que ayer». Un día poco agitado pero a menudo por encima del objetivo es ESTABLE *y* PEOR que ayer — estabilidad (oscilaciones) y control (tiempo en objetivo) son cosas distintas. NO reescribas los porcentajes (de hoy ni de ayer): el sistema añade la comparación con cifras.`,
       swing,
       hint ? `SITUACIÓN (la calcula el sistema): ${hint}.` : "",
       decided,
       `ESTRUCTURA: rellena CADA campo con UNA frase corta (el sistema los pone en líneas separadas) — "day" = opinión CUALITATIVA del día (bueno/difícil y por qué: picos, bajadas) SIN cifras (% / media — el sistema añade la línea con cifras); "hour" = la última hora (la tendencia); "now" = los últimos 10 minutos (dónde estamos); "tip" = un punto concreto a mejorar, deducido de los datos. La acción con cifras y lo que se ha tenido en cuenta se añaden aparte; no los escribas tú.`,
-      P(pr, "coach.rules", `REGLAS: habla del DÍA que acaba de pasar y enlázalo con los días previos. El objetivo es 70-180; lo más alto del día no es un techo aceptable — dilo como un pico OBSERVADO, a evitar los próximos días, no como una consigna para ahora. Tono directo, motivador, basado en cifras. Resalta los progresos. Sin falsas promesas de cura.`),
+      P(pr, "coach.rules", `REGLAS: habla del DÍA que acaba de pasar y enlázalo con los días previos. El objetivo es 70-180; lo más alto del día no es un techo aceptable — dilo como un pico OBSERVADO, a evitar los próximos días, no como una consigna para ahora. Tono directo, motivador, basado en cifras. Resalta los progresos REALES — pero nunca "resaltes" un progreso callando una hipoglucemia: señalar un paso por debajo de 70 va ANTES que el tono alentador. Sin falsas promesas de cura.`),
       `COMIDAS: la lista « Comidas de hoy » (arriba, con las horas) dice qué se ha COMIDO y cuándo — úsala para ligar las variaciones de glucosa a las comidas (un pico tras tal comida, etc.). NUNCA afirmes que no se registró ninguna comida si la lista contiene alguna.`,
       `VELOCIDAD DE LOS CARBOHIDRATOS: un azúcar rápido (zumo, refresco, dulces, pan blanco) sube la glucosa MUY RÁPIDO (pico ~15-45 min); los carbohidratos lentos (pasta, legumbres, integral) y las comidas grasas suben DESPACIO y TARDE (pico 2-3 h después). Tenlo en cuenta para EXPLICAR las variaciones y el momento de los picos, y para el TIMING del bolo (azúcar rápido → pre-bolo; lento/graso → más tarde o dividido).`,
       `AZÚCAR: para una hipo (<70), aconseja SOLO terrones de azúcar — nada de refrescos ni zumos (más fácil de dosificar, evita malos hábitos). Solo se toma azúcar por debajo de 70; si baja pero está en rango (70-180), di que tenga azúcar a mano y vigile, NO que lo tome ya. POR ENCIMA DE 180 (hiper), NO hables de azúcar — hace falta una corrección de insulina, no azúcar.`,
@@ -578,7 +653,7 @@ function buildPrompt(cur: number | null, s: any, lang: string, ctx: string, swin
       noNumbers,
       `UNIDADES: en "display", glucosa en mg/dL. En "voice", di la glucosa SIN UNIDAD — solo el número (« 78 », « 218 »), NUNCA digas « mg/dL ».`,
       `REDACCIÓN: escribe frases completas; cuando des una cifra, di SIEMPRE qué cuenta ("11 bajadas rápidas", nunca "11" a secas). Responde en español.`,
-      `Responde SOLO en JSON. Rellena POR SEPARADO los 5 campos, UNA frase cada uno, dando tu OPINIÓN (no solo cifras: di si está bien o hay que vigilar, y POR QUÉ). NO uses un campo "display". Glucosa en mg/dL, SIN ninguna cifra de dosis: {"day":"<tu opinión CUALITATIVA del día: bueno o difícil y POR QUÉ (picos, bajadas rápidas) — SIN porcentaje, SIN media, SIN comparación numérica: el sistema añade la línea con cifras de hoy y la comparación con ayer>","hour":"<tu opinión sobre la ÚLTIMA HORA: sube/baja/estable, tranquilizador o a vigilar y por qué>","now":"<dónde estamos ahora y qué implica>","tip":"<un consejo concreto a mejorar>","voice":"<1-2 frases habladas, lo esencial>"}`,
+      `Responde SOLO en JSON. El campo "summary" es el ÚNICO texto que se muestra: UNA SOLA frase, recapitulativa, que diga a la vez cómo va el día Y dónde estamos ahora, con tu OPINIÓN (bien / a vigilar, y por qué). Sin porcentaje, sin media, sin comparación numérica — el sistema ya añade la línea con cifras. NO uses un campo "display". Glucosa en mg/dL, SIN ninguna cifra de dosis: {"summary":"<UNA frase: el día + dónde estamos + tu opinión>","tip":"<un consejo concreto a mejorar, se muestra solo si no hay nada que hacer>","voice":"<1-2 frases habladas, lo esencial>"}`,
     ].filter(Boolean).join(" ");
   }
 
@@ -600,18 +675,20 @@ function buildPrompt(cur: number | null, s: any, lang: string, ctx: string, swin
       : "",
     day,
     recent,
-    `VERDICT DE LA JOURNÉE (calculé par le système d'après le TEMPS DANS LA CIBLE) : journée ${quality} (${tToday ?? "?"}% dans la cible aujourd'hui, depuis 8 h). C'EST le bilan de la journée — COMMENCE par ce mot. Ne cite PAS le pourcentage toi-même (le système ajoute la ligne chiffrée).`,
-    `STABILITÉ (les oscillations UNIQUEMENT) : ${stability.word} (${stability.note}). Ça décrit SEULEMENT si la courbe est calme ou agitée, PAS si la journée est bonne. NE dis JAMAIS « journée stable » comme bilan : une journée plate mais souvent au-dessus de la cible est une journée DIFFICILE — le temps dans la cible prime sur la régularité.`,
+    hypoDayNote(s, lang),
+    `VERDICT DE LA JOURNÉE (calculé par le système d'après le TEMPS DANS LA CIBLE **et les passages sous 70**) : journée ${quality} (${tToday ?? "?"}% dans la cible aujourd'hui, depuis 8 h). C'EST le bilan de la journée — COMMENCE par ce mot. Ne cite PAS le pourcentage toi-même (le système ajoute la ligne chiffrée).`,
+    `STABILITÉ (les oscillations UNIQUEMENT) : ${stability.word} (${stability.note}). Ça décrit SEULEMENT si la courbe est calme ou agitée, PAS si la journée est bonne. NE dis JAMAIS « journée stable » comme bilan : une journée plate mais souvent au-dessus de la cible est une journée DIFFICILE — le temps dans la cible prime sur la régularité. SYMÉTRIQUEMENT, et c'est tout aussi important : une journée avec des passages sous 70 n'est ni « bonne » ni « tranquille », même si la courbe a l'air calme — une hypo longue et plate ne fait ni variation rapide ni variabilité élevée, elle est donc INVISIBLE dans le mot de stabilité. Si la ligne HYPOS ci-dessus existe, ta phrase doit les nommer.`,
     `Évolution : ${evo}`,
     `COMPARAISON À HIER : pour dire si la journée est meilleure, moins bonne ou comparable à hier, fie-toi UNIQUEMENT au verdict « Évolution » ci-dessus (il compare le temps dans la cible). Le mot de STABILITÉ ne décrit QUE les oscillations d'aujourd'hui : n'écris JAMAIS « plus stable qu'hier » ni « moins stable qu'hier ». Une journée peu agitée mais souvent au-dessus de la cible est STABLE *et* MOINS BONNE qu'hier — la stabilité (les oscillations) et le contrôle (le temps dans la cible) sont deux choses distinctes. Ne réécris PAS les pourcentages (d'aujourd'hui ou d'hier) : le système ajoute la comparaison chiffrée.`,
     swing,
     hint ? `SITUATION (calculée par le système) : ${hint}.` : "",
     decided,
-    `STRUCTURE : remplis CHAQUE champ avec UNE phrase courte (le système les met sur des lignes séparées) — "day" = avis QUALITATIF sur la journée (bonne/difficile et pourquoi : pics, chutes) SANS chiffre (% / moyenne — le système ajoute la ligne chiffrée d'aujourd'hui) ; "hour" = la dernière heure (la tendance) ; "now" = les 10 dernières minutes (où on en est) ; "tip" = un point concret à améliorer, déduit des données. L'action chiffrée et ce qui a été pris en compte sont ajoutés séparément ; ne les écris pas toi-même.`,
+    `LONGUEUR : le texte affiché fait AU TOTAL 4 phrases — la ligne chiffrée (ajoutée par le système), TA phrase de synthèse, la ligne « pris en compte » (système) et l'action (système). Ta part est donc UNE phrase. Sois dense, pas bavard.`,
+    `STRUCTURE (rappel, le système compose l'affichage) : ANCIEN format à ne plus utiliser — UNE phrase courte (le système les met sur des lignes séparées) — "day" = avis QUALITATIF sur la journée (bonne/difficile et pourquoi : pics, chutes) SANS chiffre (% / moyenne — le système ajoute la ligne chiffrée d'aujourd'hui) ; "hour" = la dernière heure (la tendance) ; "now" = les 10 dernières minutes (où on en est) ; "tip" = un point concret à améliorer, déduit des données. L'action chiffrée et ce qui a été pris en compte sont ajoutés séparément ; ne les écris pas toi-même.`,
     // "un pic à corriger" removed from the default: it was the prompt itself pushing the model toward
     // the exact wording that then contradicted "rien à corriger". Same meaning, stated as an
     // observation about the day instead of an instruction for now.
-    P(pr, "coach.rules", `RÈGLES : parle de la JOURNÉE écoulée et relie-la aux jours précédents. La cible est 70-180 ; le point le plus haut du jour n'est pas un plafond acceptable — dis-le comme un pic OBSERVÉ, à éviter les prochains jours, pas comme une consigne pour maintenant. Ton direct, motivant, basé sur les chiffres. Souligne les progrès. Pas de fausse promesse de guérison.`),
+    P(pr, "coach.rules", `RÈGLES : parle de la JOURNÉE écoulée et relie-la aux jours précédents. La cible est 70-180 ; le point le plus haut du jour n'est pas un plafond acceptable — dis-le comme un pic OBSERVÉ, à éviter les prochains jours, pas comme une consigne pour maintenant. Ton direct, motivant, basé sur les chiffres. Souligne les progrès RÉELS — mais ne « souligne » jamais un progrès en taisant une hypo : signaler un passage sous 70 passe AVANT le ton encourageant. Pas de fausse promesse de guérison.`),
     `REPAS : la liste « Repas d'aujourd'hui » (ci-dessus, avec les heures) dit ce qui a été MANGÉ et quand — sers-t'en pour relier les variations de glycémie aux repas (un pic après tel repas, etc.). N'affirme JAMAIS qu'aucun repas n'a été loggé si la liste en contient.`,
     `VITESSE DES GLUCIDES : un sucre rapide (jus, soda, bonbons, pain blanc) fait monter la glycémie TRÈS VITE (pic ~15-45 min) ; les glucides lents (pâtes, légumineuses, complet) et les repas gras la font monter LENTEMENT et TARD (pic 2-3 h après). Tiens-en compte pour EXPLIQUER les variations et le moment des pics, et pour le TIMING du bolus (sucre rapide → pré-bolus ; lent/gras → plus tard ou étalé).`,
     `SUCRE : pour une hypo (<70), conseille UNIQUEMENT des morceaux de sucre — pas de soda ni de jus (plus simple à doser, évite les mauvaises habitudes). On ne prend du sucre que sous 70 ; si ça descend mais reste dans la cible (70-180), dis de garder du sucre à portée et de surveiller, PAS d'en prendre tout de suite. Au-dessus de 180 (hyper), ne parle PAS de sucre — c'est une CORRECTION d'insuline qu'il faut, pas du sucre.`,
@@ -620,7 +697,7 @@ function buildPrompt(cur: number | null, s: any, lang: string, ctx: string, swin
     noNumbers,
     `UNITÉS : dans "display", glycémie en mg/dL. Dans "voice", dis la glycémie SANS UNITÉ — juste le nombre (« 78 », « 218 »), JAMAIS « mg/dL » ni « grammes par litre ».`,
     `RÉDACTION : écris des phrases complètes ; quand tu donnes un nombre, dis TOUJOURS ce qu'il compte (« 11 chutes rapides », jamais « 11 » tout seul). Réponds en français.`,
-    `Réponds UNIQUEMENT en JSON. Remplis SÉPARÉMENT les 5 champs, UNE phrase chacun, en donnant ton AVIS (pas juste des chiffres : dis si c'est bien ou à surveiller, et POURQUOI). N'utilise PAS de champ "display". Glycémie en mg/dL, AUCUN chiffre de dose : {"day":"<ton avis QUALITATIF sur la journée : bonne ou difficile et POURQUOI (pics, chutes rapides) — SANS pourcentage, SANS moyenne, SANS comparaison chiffrée : le système ajoute la ligne chiffrée d'aujourd'hui et la comparaison à hier>","hour":"<ton avis sur la DERNIÈRE HEURE : ça monte/descend/stable, est-ce rassurant ou à surveiller et pourquoi>","now":"<où on en est maintenant et ce que ça implique>","tip":"<un conseil concret à améliorer>","voice":"<1-2 phrases parlées, l'essentiel>"}`,
+    `Réponds UNIQUEMENT en JSON. Le champ "summary" est le SEUL texte affiché : UNE SEULE phrase, récapitulative, qui dit à la fois comment va la journée ET où on en est maintenant, avec ton AVIS (bien / à surveiller, et pourquoi). Pas de pourcentage, pas de moyenne, pas de comparaison chiffrée — le système ajoute déjà la ligne chiffrée. N'utilise PAS de champ "display". Glycémie en mg/dL, AUCUN chiffre de dose : {"summary":"<UNE phrase : la journée + là où on en est + ton avis>","tip":"<un conseil concret à améliorer, affiché seulement s'il n'y a rien à faire>","voice":"<1-2 phrases parlées, l'essentiel>"}`,
   ].filter(Boolean).join(" ");
 }
 
@@ -686,7 +763,20 @@ Deno.serve(async (req: Request) => {
     if (!force && lastLog?.message && lastLog.lang === lang) {
       const logMs = new Date(lastLog.ts).getTime();
       const ageMs = Date.now() - logMs;
-      if (ageMs < 10 * 60 * 1000 && logMs >= profUpdatedMs) {
+      // A NEW LOW SINCE THE CACHED TEXT WAS WRITTEN INVALIDATES IT, always. The cache only ever
+      // watched for a newer meal or a profile edit — so glucose could fall from 140 to 58 and the
+      // dashboard would keep replaying a ten-minute-old "tout va bien", ACTION LINE INCLUDED, on
+      // every automatic refresh. Only an explicit tap on ANALYSE forced a recompute, which is the one
+      // moment a parent is least likely to be looking. A rapid drop counts too: the analysis it was
+      // built on no longer describes what is happening.
+      const sinceCache = (readings as any[])
+        .map((r) => ({ ts: Number(r?.ts), value: Number(r?.value) }))
+        .filter((r) => Number.isFinite(r.ts) && r.value > 0 && r.ts > logMs)
+        .sort((a, b) => a.ts - b.ts);
+      const wentLow = sinceCache.some((r) => r.value < LOW_MGDL);
+      const droppedFast = sinceCache.length >= 2 &&
+        (Math.max(...sinceCache.map((r) => r.value)) - sinceCache[sinceCache.length - 1].value) >= 40;
+      if (ageMs < 10 * 60 * 1000 && logMs >= profUpdatedMs && !wentLow && !droppedFast) {
         const { data: newerMeal } = await db.from("mechabetics_meals")
           .select("id").eq("subject", subject).gt("created_at", lastLog.ts).limit(1).maybeSingle();
         if (!newerMeal) {
@@ -739,9 +829,42 @@ Deno.serve(async (req: Request) => {
     const ctx = profileContext(profile, meals ?? [], lang, nowMs)
       + (insCtx ? " " + insCtx : "")
       + (actCtx ? " " + actCtx : "");
-    const sorted = [...readings]
-      .map((r: any) => ({ ts: Number(r.ts), value: Number(r.value) }))
-      .filter((r) => r.value > 0)
+    // THE TREND READS THE DATABASE, NOT JUST THIS PHONE'S PAYLOAD.
+    //
+    // `readings` is whatever the phone happened to be holding. The phone only polls the patient
+    // currently ON SCREEN, so a followed patient's series is stitched from sparse cloud buckets with
+    // real holes in it — 49, 56 and 75-minute gaps were measured on a live device. A hole straddling
+    // the trend window makes trendFromReadings answer "unknown", and "unknown" above 180 BLOCKS the
+    // correction: a child sat at 234 mg/dL and was told "aucune insuline" because of a gap, not
+    // because of their glucose.
+    //
+    // Meanwhile the 24/7 monitor has been writing every patient's readings to this very table all
+    // along. The history exists; it simply was not being read back. Merging it in costs one indexed
+    // query and closes the holes for the non-active patient — which is exactly who was being hurt.
+    // Union, dedupe per timestamp, phone value wins (it is the freshest source for the live point).
+    const histSinceIso = new Date(nowMs - TREND_HISTORY_HOURS * 3600 * 1000).toISOString();
+    // NEWEST FIRST + AN EXPLICIT LIMIT, and it matters enormously. PostgREST caps a response at a
+    // server-side default (commonly 1000 rows) whether or not you ask for a limit — and 24 h of
+    // once-a-minute readings is ~1440. Ordered ASCENDING, the cap would have silently returned the
+    // OLDEST 1000 and dropped everything recent, so `last` — the value the whole analysis calls
+    // "glycémie actuelle" and the guard doses against — would have been hours stale. Descending makes
+    // any truncation fall on the far end of history, where it costs nothing. Re-sorted below anyway.
+    const { data: storedReadings } = await db.from("mechabetics_readings")
+      .select("ts, value_mgdl").eq("subject", subject)
+      .gte("ts", histSinceIso).order("ts", { ascending: false }).limit(2000);
+    const byTs = new Map<number, number>();
+    for (const r of (storedReadings ?? []) as any[]) {
+      const t = new Date(r.ts).getTime();
+      const v = Number(r.value_mgdl);
+      if (Number.isFinite(t) && v > 0) byTs.set(t, v);
+    }
+    for (const r of readings as any[]) {
+      const t = Number(r?.ts);
+      const v = Number(r?.value);
+      if (Number.isFinite(t) && v > 0) byTs.set(t, v); // phone wins on a tie
+    }
+    const sorted = [...byTs.entries()]
+      .map(([ts, value]) => ({ ts, value }))
       .sort((a, b) => a.ts - b.ts);
     const last = sorted[sorted.length - 1];
     // Current glucose = the LATEST READING only. It used to fall back to the 24 h average, so a
@@ -753,7 +876,7 @@ Deno.serve(async (req: Request) => {
     // Match the client's NO SIGNAL window (GlucoseAlert.FRESHNESS_WINDOW_MS = 5 min): once the last
     // reading is older than that, the LIVE value is UNKNOWN. The analysis/voice must SAY "signal
     // perdu" and speak of the LAST KNOWN glucose — never assert "tu es à X" as if it were current.
-    const signalLost = lastTs > 0 && (nowMs - lastTs) > 5 * 60000;
+    const signalLost = lastTs > 0 && (nowMs - lastTs) > STALE_MIN * 60000;
     // The CLIENT knows the sensor's expiry (LibreLinkUp activation + 14 d). When it flags it AND the
     // signal is indeed gone, the lost signal has a known cause: a finished sensor → advise a NEW one
     // (not "move the phone closer / re-scan", which can't revive it).
@@ -762,6 +885,17 @@ Deno.serve(async (req: Request) => {
     // ----- CODE OWNS THE DOSE ----- (gp / iob computed above, before the insulin context)
     const trend = lastTs ? trendFromReadings(sorted, nowMs) : "unknown";
     const recentHypo = recentHypoFrom(sorted, nowMs);
+    // recentHypo was DEAD WEIGHT: computed here, handed to computeGuard, and never read by it (the
+    // post-hypo correction block was deliberately removed, but the parameter stayed wired to
+    // nothing). So a low forty minutes ago reached neither the dose nor a single word of the text.
+    // It cannot go back into the dose — correcting a genuine high after a low is the intended
+    // behaviour — but the narrative must know: coming up from a hypo is the whole context of the
+    // hour that follows, and it explains a rebound the model would otherwise read as a random spike.
+    const recentHypoNote = recentHypo
+      ? (lang === "es"
+        ? `HIPOGLUCEMIA RECIENTE (calculado por el sistema): hubo un valor por debajo de 70 en los últimos 75 minutos. Tenlo en cuenta al explicar lo que pasa ahora (un rebote después de un resucarado es esperable) y menciónalo.`
+        : `HYPO RÉCENTE (calculé par le système) : il y a eu une valeur sous 70 dans les 75 dernières minutes. Prends-le en compte pour expliquer ce qui se passe maintenant (un rebond après un resucrage est attendu) et mentionne-le.`)
+      : "";
     const minSinceRescue = minutesSinceLastRescue(meals ?? [], nowMs);
     const guard = computeGuard({ glucoseMgdl: cur, trend, staleMin, iobUnits: iob, recentHypo, minSinceRescue, profile: gp });
     const hint = situationHint(guard, lang);
@@ -797,6 +931,11 @@ Deno.serve(async (req: Request) => {
     // about to tell the user to do — and the two collided: "bonne journée mais une chute rapide à
     // corriger" printed directly above "Action : dans la cible, rien à corriger". Everything this
     // needs is deterministic and available here, so the decision now leads and the prose follows it.
+    // What the NARRATIVE is allowed to name, in units. The guard's own ceiling covers the CORRECTION
+    // only, so it cannot be used raw: on a day with a meal to bolus, a perfectly correct "12 u for
+    // the meal" in the prose would read as an overshoot against a 2 u correction ceiling. Raised to
+    // the real total as soon as a meal plan is computed, just below.
+    let proseDoseCeiling = guard.maxInsulinUnits;
     const actionLine = signalLost
       ? (sensorExpired
         ? (lang === "es"
@@ -805,13 +944,29 @@ Deno.serve(async (req: Request) => {
         : (lang === "es"
           ? "Señal perdida: reconecta el sensor (acerca el teléfono que lo escanea, vuelve a escanear); si no vuelve, hazte una punción capilar antes de cualquier decisión."
           : "Signal perdu : reconnecte le capteur (rapproche le téléphone qui le scanne, re-scanne) ; s'il ne revient pas, fais un test au doigt avant toute décision."))
-      : guard.reason === "in_range"
-        ? inRangeActionLine(meals ?? [], insulin ?? [], sorted, nowMs, gp, lang)
-        : combinedActionLine(guard, 0, lang, gp);
+      : (() => {
+        // WHICH meal to dose, and when — the ANALYSE button used to pass a hardcoded 0 here, so it
+        // could never name a dose for food: 120 g logged and unbolused at 175 mg/dL came back as
+        // "in range, nothing to correct".
+        const plan = mealBolusPlan(meals ?? [], insulin ?? [], nowMs, gp);
+        proseDoseCeiling = guard.maxInsulinUnits + Math.max(0, plan.units || 0);
+        if (plan.planned && plan.carbsG != null) {
+          return mealPlanLine(planMealDose({
+            glucoseMgdl: cur, trend, staleMin, iobUnits: iob,
+            carbsG: plan.carbsG, description: null,
+            minSinceRescue, recentHypo, profile: gp,
+          }), lang, gp, true); // concise: the ANALYSE card is a summary + ONE action line
+        }
+        if (guard.reason === "in_range" && plan.units <= 0) {
+          return inRangeActionLine(meals ?? [], insulin ?? [], sorted, nowMs, gp, lang);
+        }
+        return combinedActionLine(guard, plan.units, lang, gp, plan.planned);
+      })();
     const pr = await loadPrompts(lang);
     const prompt = buildPrompt(
       cur, stats, lang,
-      ctx + (mealNudgeNote ? " " + mealNudgeNote : "") + (spikeNote ? " " + spikeNote : ""),
+      ctx + (mealNudgeNote ? " " + mealNudgeNote : "") + (spikeNote ? " " + spikeNote : "")
+        + (recentHypoNote ? " " + recentHypoNote : ""),
       swing, pr, hint, recent, stability, signalLost, staleMin, sensorExpired,
       actionLine, noDoseDue(guard),
     );
@@ -845,7 +1000,17 @@ Deno.serve(async (req: Request) => {
       if (typeof v === "string" && v.trim()) return v.trim();
       return extractStr(raw, k)?.trim() ?? "";
     };
-    let display = [field("day"), field("hour"), field("now"), field("tip")].filter(Boolean).join("\n\n");
+    // TWO sentences of narrative, then the numbers line, then ONE action — the analysis card is a
+    // SUMMARY. Four separate sentences (day / hour / now / tip) plus the stats line, the accounting
+    // line and the action produced a wall of text nobody reads to the end, which is exactly what the
+    // action at the bottom needs people to read. "hour" is dropped (it repeats "now" with a wider
+    // window) and "tip" is kept only when there is no action to give, so the card never ends on two
+    // competing instructions.
+    const tip = field("tip");
+    // ONE narrative sentence. With the code-owned stats line, the "pris en compte" line and the
+    // action, the card totals four — which is what makes it readable to the end.
+    let display = field("summary");
+    if (!display) display = [field("day"), field("now")].filter(Boolean).join(" "); // older/cached shapes
     if (!display) {
       // Legacy single "display" field, else a complete deterministic summary (never a half-sentence).
       const legacy = field("display");
@@ -871,6 +1036,13 @@ Deno.serve(async (req: Request) => {
     // append the code-computed authoritative action (only when a dose is actually relevant).
     const insulinForbidden = guard.maxInsulinUnits === 0;
     if (insulinForbidden) { display = stripInsulinNumbers(display) || display; voice = stripInsulinNumbers(voice) || voice; }
+    // ...and when insulin IS allowed, the narrative may still not name a BIGGER dose than the system
+    // decided. Until now nothing checked that: the strip above only covered the forbidden case.
+    else {
+      const ceiling = { ...guard, maxInsulinUnits: proseDoseCeiling };
+      display = enforceInsulinCeiling(display, ceiling) || display;
+      voice = enforceInsulinCeiling(voice, ceiling) || voice;
+    }
 
     // Last line of defence on the contradiction: the prompt tells the model the decision and reserves
     // "corriger" for the system, but a model will still slip. When nothing is due, the narrative may
@@ -899,6 +1071,9 @@ Deno.serve(async (req: Request) => {
       // cannot drift apart.
       const label = lang === "es" ? "Acción" : "Action";
       display = `${display}\n\n${label} : ${actionLine}`;
+    } else if (tip) {
+      // Nothing to act on: the improvement tip becomes the closing line instead of a blank ending.
+      display = `${display}\n\n${tip}`;
       voice = `${voice} ${actionLine}`.trim();
     }
 

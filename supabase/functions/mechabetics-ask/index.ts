@@ -3,6 +3,7 @@ import { createClient } from "jsr:@supabase/supabase-js@2";
 import { accessSubject } from "../_shared/access.ts";
 import {
   computeGuard,
+  STALE_MIN,
   trendFromReadings,
   recentHypoFrom,
   minutesSinceLastRescue,
@@ -13,6 +14,7 @@ import {
   combinedActionLine,
   situationHint,
   stripInsulinNumbers,
+  enforceInsulinCeiling,
   carbsCubesPhrase,
   carbEstimationRules,
   mealCarbSpeed,
@@ -21,6 +23,8 @@ import {
   hypoIobWarning,
   starchyCarbNote,
   plannedMealNote,
+  planMealDose,
+  mealPlanLine,
   type GuardProfile,
 } from "../_shared/doseGuard.ts";
 import { chatJson, llmErrorKind, llmErrorMessage } from "../_shared/llm.ts";
@@ -201,6 +205,8 @@ function buildSystem(lang: string, p: any, cur: number | null, series: string, m
       `COMIDA FUTURA: si dice que VA a comer algo («voy a comer un McDonald's», «esta noche pasta»), rellena "meal" con "planned":true y tu mejor estimación de carbohidratos — el sistema añadirá la consigna de ponerse la insulina al comer.`,
       `SENSOR: si dice que su sensor está caducado / terminado o que acaba de cambiarlo, tenlo en cuenta (un sensor nuevo tarda ~1 h en arrancar) y aconseja punción capilar mientras tanto — no le digas que «vuelva a escanear» un sensor terminado.`,
       `TIEMPO: si dice CUÁNDO lo comió o se inyectó («hace 3 horas», «esta mañana», «a las 14h»), calcula los minutos transcurridos y ponlos en "minutesAgo" (0 si es ahora o no lo dice). No lo inventes.`,
+      `TIEMPO — FUTURO: si anuncia algo POR VENIR («voy a comer dentro de 10 minutos», «como a las 20h», «me pongo la insulina dentro de media hora»), pon "minutesAgo" NEGATIVO = los minutos que faltan (dentro de 10 minutos → -10; dentro de una hora → -60). Es lo que permite al sistema preparar la dosis ANTES de la comida.`,
+      `ALIMENTOS: NUNCA nombres un alimento que él no haya dicho y que no esté en COMIDAS RECIENTES — no inventes ejemplos de alimentos ni completes una comida con lo que «podría» haber comido. Si no sabes qué comió, pregúntaselo.`,
       `Si menciona ejercicio o deporte (hecho o previsto), rellena "activity".`,
       `Si dice que YA se puso una dosis (rellena "insulin"), NO propongas otra inyección; si parece mucha insulina, aconseja vigilar una hipo y tener azúcar a mano. Nunca aconsejes más insulina sobre una dosis ya puesta.`,
       carbEstimationRules(lang),
@@ -210,7 +216,7 @@ function buildSystem(lang: string, p: any, cur: number | null, series: string, m
       sugarTiming,
       sugarTimingFact(lang),
       `Es un consejo, no un dispositivo médico.`,
-      `Responde SOLO en JSON: {"scope":"diabetes|general","reply":"<respuesta mostrada en mg/dL — 2-3 frases para diabetes, completa y libre para una pregunta general — SIN número de dosis>","voice":"<lo que se lee en voz alta: para una pregunta general, la respuesta completa; para diabetes, una frase. SIN número de dosis; di la glucosa SIN unidad, solo el número (ej 78, 218)>","meal":{"description":"<comida>","carbsG":<numero>,"planned":<true si futura, false si ya comida>,"basis":"stated|estimated","minutesAgo":<minutos desde que comió, 0 si ahora>}|null,"insulin":{"units":<numero>,"name":"<insulina>","minutesAgo":<minutos desde la inyección, 0 si ahora>}|null,"activity":{"kind":"<tipo>","description":"<texto>","intensity":"low|moderate|high","planned":<true|false>,"minutesAgo":<minutos, 0 si ahora>}|null}`,
+      `Responde SOLO en JSON: {"scope":"diabetes|general","reply":"<respuesta mostrada en mg/dL — 2-3 frases para diabetes, completa y libre para una pregunta general — SIN número de dosis>","voice":"<lo que se lee en voz alta: para una pregunta general, la respuesta completa; para diabetes, una frase. SIN número de dosis; di la glucosa SIN unidad, solo el número (ej 78, 218)>","meal":{"description":"<comida>","carbsG":<numero>,"planned":<true si futura, false si ya comida>,"basis":"stated|estimated","minutesAgo":<minutos desde que comió, 0 si ahora, NEGATIVO si es futuro (dentro de 10 min → -10)>}|null,"insulin":{"units":<numero>,"name":"<insulina>","minutesAgo":<minutos desde la inyección, 0 si ahora>}|null,"activity":{"kind":"<tipo>","description":"<texto>","intensity":"low|moderate|high","planned":<true|false>,"minutesAgo":<minutos, 0 si ahora>}|null}`,
     ].filter(Boolean).join(" ");
   }
   return [
@@ -230,6 +236,8 @@ function buildSystem(lang: string, p: any, cur: number | null, series: string, m
     `REPAS À VENIR : s'il dit qu'il VA manger quelque chose (« je vais manger un McDo », « ce soir je mange des pâtes »), remplis "meal" avec "planned":true et ta meilleure estimation de glucides — le système ajoutera la consigne de faire l'insuline au moment de manger.`,
     `CAPTEUR : s'il dit que son capteur est expiré / fini ou qu'il vient d'en changer, prends-le en compte (un capteur neuf met ~1 h à démarrer) et conseille un test au doigt en attendant — ne lui dis pas de « re-scanner » un capteur fini.`,
     `QUAND : s'il précise QUAND il l'a mangé ou injecté («il y a 3 heures», «ce matin», «à 14h»), calcule les minutes écoulées et mets-les dans "minutesAgo" (0 si c'est maintenant ou non précisé). N'invente pas.`,
+    `QUAND — FUTUR : s'il annonce quelque chose À VENIR («je vais manger dans 10 minutes», «je mange à 20h», «je fais mon insuline dans une demi-heure»), mets "minutesAgo" NÉGATIF = le nombre de minutes qui restent (dans 10 minutes → -10 ; dans une heure → -60). C'est ce qui permet au système de préparer la dose AVANT le repas.`,
+    `ALIMENTS : ne nomme JAMAIS un aliment qu'il n'a pas dit lui-même et qui n'est pas dans REPAS RÉCENTS — n'invente pas d'exemples d'aliments, ne complète pas un repas avec ce qu'il « pourrait » avoir mangé. Si tu ne sais pas ce qu'il a mangé, demande.`,
     `S'il mentionne du sport ou une activité (faite ou prévue), remplis "activity".`,
     `S'il dit avoir DÉJÀ fait une dose (remplis "insulin"), ne propose pas d'en refaire ; si ça semble beaucoup d'insuline, conseille de surveiller une hypo et d'avoir du sucre à portée. Ne conseille jamais d'insuline en plus d'une dose déjà faite.`,
     carbEstimationRules(lang),
@@ -239,7 +247,7 @@ function buildSystem(lang: string, p: any, cur: number | null, series: string, m
     sugarTiming,
     sugarTimingFact(lang),
     `C'est un conseil, pas un dispositif médical.`,
-    `Réponds UNIQUEMENT en JSON : {"scope":"diabetes|general","reply":"<réponse affichée en mg/dL — 2-3 phrases pour le diabète, complète et libre pour une question générale — SANS chiffre de dose>","voice":"<ce qui est lu à voix haute : pour une question générale, la réponse complète ; pour le diabète, une phrase. SANS chiffre de dose ; dis la glycémie SANS unité, juste le nombre (ex 78, 218)>","meal":{"description":"<aliment>","carbsG":<nombre>,"planned":<true si à venir, false si déjà mangé>,"basis":"stated|estimated","minutesAgo":<minutes depuis qu'il a mangé, 0 si maintenant>}|null,"insulin":{"units":<nombre>,"name":"<insuline>","minutesAgo":<minutes depuis l'injection, 0 si maintenant>}|null,"activity":{"kind":"<type>","description":"<texte>","intensity":"low|moderate|high","planned":<true|false>,"minutesAgo":<minutes, 0 si maintenant>}|null}`,
+    `Réponds UNIQUEMENT en JSON : {"scope":"diabetes|general","reply":"<réponse affichée en mg/dL — 2-3 phrases pour le diabète, complète et libre pour une question générale — SANS chiffre de dose>","voice":"<ce qui est lu à voix haute : pour une question générale, la réponse complète ; pour le diabète, une phrase. SANS chiffre de dose ; dis la glycémie SANS unité, juste le nombre (ex 78, 218)>","meal":{"description":"<aliment>","carbsG":<nombre>,"planned":<true si à venir, false si déjà mangé>,"basis":"stated|estimated","minutesAgo":<minutes depuis qu'il a mangé, 0 si maintenant, NÉGATIF si c'est à venir (dans 10 min → -10)>}|null,"insulin":{"units":<nombre>,"name":"<insuline>","minutesAgo":<minutes depuis l'injection, 0 si maintenant>}|null,"activity":{"kind":"<type>","description":"<texte>","intensity":"low|moderate|high","planned":<true|false>,"minutesAgo":<minutes, 0 si maintenant>}|null}`,
   ].filter(Boolean).join(" ");
 }
 
@@ -250,6 +258,24 @@ function backdatedIso(minutesAgo: unknown, nowMs: number): string | null {
   const m = Number(minutesAgo);
   if (!Number.isFinite(m) || m <= 0) return null;
   return new Date(nowMs - Math.min(m, 36 * 60) * 60000).toISOString();
+}
+
+/** Minutes UNTIL an announced meal ("je mange dans 10 minutes"), from the model's negative
+ *  minutesAgo. 0 when it is being eaten now or nothing was said. Clamped to 36 h like the past
+ *  direction, so a hallucinated value can't push a meal a week out. */
+function minutesUntil(minutesAgo: unknown, ): number {
+  const m = Number(minutesAgo);
+  if (!Number.isFinite(m) || m >= 0) return 0;
+  return Math.min(-m, 36 * 60);
+}
+
+/** The logged timestamp for a meal/dose, in EITHER direction. The old helper only went backwards, so
+ *  "dans 10 minutes" was stored as "now" and the announced time — the whole point of announcing —
+ *  was thrown away before anything could anticipate it. */
+function offsetIso(minutesAgo: unknown, nowMs: number): string | null {
+  const ahead = minutesUntil(minutesAgo);
+  if (ahead > 0) return new Date(nowMs + ahead * 60000).toISOString();
+  return backdatedIso(minutesAgo, nowMs);
 }
 
 Deno.serve(async (req: Request) => {
@@ -299,8 +325,13 @@ Deno.serve(async (req: Request) => {
     if (subject) {
       const { data: p } = await db.from("mechabetics_profiles").select("*").eq("subject", subject).maybeSingle();
       profile = p;
+      // WINDOWED like the coach's: these rows are handed to the model under the heading "REPAS
+      // RÉCENTS". Without a time bound, a meal logged weeks ago is presented as something just
+      // eaten, and the model repeats that food back at the user for ever.
+      const mealsSinceIso = new Date(nowMs - 26 * 60 * 60 * 1000).toISOString();
       const { data: m } = await db.from("mechabetics_meals")
         .select("ts, description, carbs_g, planned").eq("subject", subject)
+        .gte("ts", mealsSinceIso)
         .order("ts", { ascending: false }).limit(6);
       meals = m ?? [];
     }
@@ -336,7 +367,7 @@ Deno.serve(async (req: Request) => {
     const actCtx = activityContext(activity, lang);
     // Match the client's NO SIGNAL window (5 min): a stale last reading means the LIVE value is
     // unknown — the spoken reply must not assert "tu es à X", only the LAST KNOWN value.
-    const signalLost = cur != null && (!hasTs || (nowMs - (lastR as any).ts) > 5 * 60000);
+    const signalLost = cur != null && (!hasTs || (nowMs - (lastR as any).ts) > STALE_MIN * 60000);
     const pr = await loadPrompts(lang);
     const sys = buildSystem(lang, profile, cur, series, meals, pr, insCtx, actCtx, hint, signalLost, staleMin, sensorExpired);
 
@@ -404,6 +435,13 @@ Deno.serve(async (req: Request) => {
 
     const insulinForbidden = overReported || (guardForAction.maxInsulinUnits === 0 && mealUnits === 0);
     if (insulinForbidden) { reply = stripInsulinNumbers(reply) || reply; voice = stripInsulinNumbers(voice) || voice; }
+    // Insulin allowed: the answer still may not name MORE units than the system decided (correction
+    // plus the meal bolus, which is the legitimate total here). Previously unchecked.
+    else {
+      const ceiling = { ...guardForAction, maxInsulinUnits: guardForAction.maxInsulinUnits + Math.max(0, mealUnits || 0) };
+      reply = enforceInsulinCeiling(reply, ceiling) || reply;
+      voice = enforceInsulinCeiling(voice, ceiling) || voice;
+    }
 
     let text = reply;
     let voiceText = voice;
@@ -446,9 +484,22 @@ Deno.serve(async (req: Request) => {
       // Show the code action line for every dose-relevant situation (incl. blocked highs:
       // falling/post-hypo/covered/stale -> explicit "aucune insuline"). Stay silent only for a
       // plain in-range reading or when there's no glucose data at all.
-      const showAction = mealUnits > 0 || !(guardForAction.reason === "in_range" || guardForAction.reason === "no_reading");
+      const showAction = mealUnits > 0 || mealPlanned ||
+        !(guardForAction.reason === "in_range" || guardForAction.reason === "no_reading");
       if (showAction) {
-        const line = combinedActionLine(guardForAction, mealUnits, lang, gp, mealPlanned);
+        // A meal ANNOUNCED for later is the forward-looking case the whole app exists for ("si je
+        // mange 30 sucres dans 10 minutes, combien d'insuline ?"): answer it BEFORE the meal, with
+        // the dose, what the carbs would do uncovered and when to inject — instead of waiting for
+        // the glucose to rise and reacting to it. planMealDose delegates the correction half to
+        // computeGuard, so every no-insulin invariant still holds.
+        const line = mealPlanned && (mealCarbs ?? 0) > 0
+          ? mealPlanLine(planMealDose({
+              glucoseMgdl: cur, trend, staleMin, iobUnits: iob,
+              carbsG: mealCarbs, description: parsed.meal?.description,
+              minutesUntilMeal: minutesUntil(parsed.meal?.minutesAgo),
+              minSinceRescue, recentHypo, profile: gp,
+            }), lang, gp)
+          : combinedActionLine(guardForAction, mealUnits, lang, gp, mealPlanned);
         const label = lang === "es" ? "Acción" : "Action";
         text = `${reply}\n\n${label} : ${line}`;
         voiceText = `${voice} ${line}`.trim();
@@ -462,7 +513,7 @@ Deno.serve(async (req: Request) => {
       // Estimated (not user-stated) carbs -> no firm number. For an ANNOUNCED future meal, the note
       // still says PLAINLY that insulin will be needed at eating time and whether any dose is on
       // record (the McDo case); otherwise, the usual "log it for a precise dose" nudge.
-      if (mealEstimated && guardForAction.kind !== "sugar" && mealPlanned) {
+      if (mealEstimated && guardForAction.kind !== "sugar" && mealPlanned && mealCarbs <= 0) {
         const recentRapid = (insulinDoses || []).some((d: any) => {
           if (!d || d.kind === "basal") return false;
           const t = new Date(d.ts).getTime();
@@ -488,8 +539,12 @@ Deno.serve(async (req: Request) => {
       const cn = lang === "es"
         ? `${mealCarbs} g de carbohidratos (${carbsCubesPhrase(mealCarbs, "es")}).`
         : `${mealCarbs} g de glucides (${carbsCubesPhrase(mealCarbs, "fr")}).`;
+      // Spoken, the symbol and the "(s)" are noise — say it the way a person would.
+      const cnVoice = lang === "es"
+        ? `${mealCarbs} g de carbohidratos, ${carbsCubesPhrase(mealCarbs, "es", true)}.`
+        : `${mealCarbs} g de glucides, ${carbsCubesPhrase(mealCarbs, "fr", true)}.`;
       text = `${text}\n\n${cn}`;
-      voiceText = `${voiceText} ${cn}`.trim();
+      voiceText = `${voiceText} ${cnVoice}`.trim();
       // Starchy food (potato/bread/rice/pasta) isn't sweet but IS high-carb → explain it.
       const sn = starchyCarbNote(parsed.meal?.description, lang);
       if (sn) text = `${text}\n\n${sn}`;
@@ -499,10 +554,13 @@ Deno.serve(async (req: Request) => {
     // rise, recheck later — fatty also gets the split-bolus note). Skip during a hypo rescue
     // (guard "sugar"): telling someone treating a low to "pre-bolus next time" is contradictory.
     if (parsed.meal && typeof parsed.meal === "object" && guardForAction.kind !== "sugar") {
-      const adv = carbSpeedAdvice(mealCarbSpeed(parsed.meal.description), lang, mealPlanned);
+      const speed = mealCarbSpeed(parsed.meal.description);
+      const adv = carbSpeedAdvice(speed, lang, mealPlanned);
       if (adv) {
         text = `${text}\n\n${adv}`;
-        voiceText = `${voiceText} ${adv}`.trim();
+        // The SPOKEN variant carries no food examples: heard without the parentheses, "(jus, bonbons,
+        // pain blanc…)" sounds like a list of what was eaten.
+        voiceText = `${voiceText} ${carbSpeedAdvice(speed, lang, mealPlanned, true)}`.trim();
       }
     }
 
@@ -513,12 +571,18 @@ Deno.serve(async (req: Request) => {
     let logFailed = false;
     let loggedMeal: any = null;
     if (subject && parsed.meal && typeof parsed.meal === "object" && parsed.meal.description) {
-      const mealTs = backdatedIso(parsed.meal.minutesAgo, nowMs);
+      // Announced meals keep their stated TIME, not just a "planned" flag: "dans 10 minutes" is
+      // stored 10 minutes ahead, so the whole app can anticipate it and so it becomes an ordinary
+      // eaten meal on its own once that moment passes (isEatenBy).
+      const mealTs = offsetIso(parsed.meal.minutesAgo, nowMs);
+      // ONE source of truth for "planned": the timestamp. The model's own flag is only a fallback
+      // for when it gave no timing at all — the two used to disagree and both were stored.
+      const plannedFromTs = mealTs ? Date.parse(mealTs) > nowMs + 5 * 60000 : !!parsed.meal.planned;
       loggedMeal = {
         subject,
         description: String(parsed.meal.description).slice(0, 240),
         carbs_g: mealCarbs,
-        planned: !!parsed.meal.planned,
+        planned: plannedFromTs,
         ...(mealTs ? { ts: mealTs } : {}),
       };
       const { error: mErr } = await db.from("mechabetics_meals").insert(loggedMeal);
@@ -533,7 +597,7 @@ Deno.serve(async (req: Request) => {
 
     // Log an insulin dose if the user reported one ("j'ai fait X u de NovoRapid").
     if (subject && reportedUnits > 0) {
-      const insTs = backdatedIso(parsed.insulin?.minutesAgo, nowMs);
+      const insTs = offsetIso(parsed.insulin?.minutesAgo, nowMs);
       const { error: iErr } = await db.from("mechabetics_insulin").insert({
         subject,
         units: reportedUnits, // the CLAMPED value — never store a garbage dose that would corrupt future IOB
@@ -552,7 +616,7 @@ Deno.serve(async (req: Request) => {
 
     // Log a physical activity if mentioned ("je vais courir", "j'ai fait du foot").
     if (subject && parsed.activity && typeof parsed.activity === "object" && (parsed.activity.kind || parsed.activity.description)) {
-      const actTs = backdatedIso(parsed.activity.minutesAgo, nowMs);
+      const actTs = offsetIso(parsed.activity.minutesAgo, nowMs);
       const { error: aErr } = await db.from("mechabetics_activity").insert({
         subject,
         kind: parsed.activity.kind ? String(parsed.activity.kind).slice(0, 60) : null,
