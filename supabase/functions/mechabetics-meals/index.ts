@@ -3,6 +3,7 @@ import { createClient } from "jsr:@supabase/supabase-js@2";
 import { accessSubject } from "../_shared/access.ts";
 import { chatJson } from "../_shared/llm.ts";
 import { carbEstimationRules } from "../_shared/doseGuard.ts";
+import { lookupBarcode, lookupProduct, foodFactLine, type FoodFact } from "../_shared/foodFacts.ts";
 
 const DEEPSEEK_API_KEY = Deno.env.get("MECHABETICS_DEEPSEEK_API_KEY") ?? "";
 const DEEPSEEK_MODEL = Deno.env.get("MECHABETICS_DEEPSEEK_MODEL") ?? "deepseek-v4-flash";
@@ -11,13 +12,30 @@ const GEMINI_TEXT_MODEL = Deno.env.get("MECHABETICS_GEMINI_TEXT_MODEL") ?? "gemi
 /** Estimate a meal's carbs (g) from its description via the LLM, so the user never HAS to type
  *  them — diabetes carb-counting is exactly what the AI is good at. Best-effort: returns null when
  *  no AI key is available or the call fails (the meal is still logged, just without a carb number). */
-async function estimateCarbs(description: string, geminiKey?: unknown): Promise<number | null> {
+async function estimateCarbs(
+  description: string,
+  geminiKey?: unknown,
+  country?: string | null,
+  barcode?: string | null,
+): Promise<{ carbsG: number | null; fact: FoodFact | null }> {
+  // A SOURCED FIGURE FIRST, ALWAYS. The model answers packaged products from memory with a single
+  // global number — that is how a 33 cl 7UP became 35 g when its Spanish label says 16. A barcode is
+  // the label itself; a country listing is at least the right market. Either one, when found, is
+  // handed to the model as the authoritative value it must multiply by the quantity described.
+  // When nothing is found we are exactly where we were before, and the caller says "estimation".
+  let fact: FoodFact | null = null;
+  try {
+    fact = barcode ? await lookupBarcode(barcode) : null;
+    if (!fact) fact = await lookupProduct(description, country ?? null);
+  } catch (_) { fact = null; }
+
   const byok = typeof geminiKey === "string" ? geminiKey.trim() : "";
-  if (!byok && !DEEPSEEK_API_KEY) return null;
+  if (!byok && !DEEPSEEK_API_KEY) return { carbsG: null, fact };
+  const where = country ? ` La personne est en : ${country}. Les valeurs nutritionnelles d'un même produit varient selon le pays — raisonne pour CE marché.` : "";
   try {
     const raw = await chatJson(
       {
-        system: `Tu estimes les glucides d'un aliment pour une personne diabétique. ${carbEstimationRules("fr")} Réponds UNIQUEMENT en JSON {"carbsG":<grammes entiers de glucides pour TOUT ce qui est décrit>}. Pas de texte.`,
+        system: `Tu estimes les glucides d'un aliment pour une personne diabétique.${where} ${carbEstimationRules("fr")}${fact ? " " + foodFactLine(fact, "fr") : ""} Réponds UNIQUEMENT en JSON {"carbsG":<grammes entiers de glucides pour TOUT ce qui est décrit>}. Pas de texte.`,
         user: `Aliment : ${description}`,
         temperature: 0,
         maxTokens: 200,
@@ -26,9 +44,9 @@ async function estimateCarbs(description: string, geminiKey?: unknown): Promise<
     );
     const parsed = JSON.parse(raw.match(/\{[\s\S]*\}/)?.[0] ?? "{}");
     const n = Math.round(Number(parsed.carbsG));
-    return Number.isFinite(n) && n > 0 ? Math.min(300, n) : null;
+    return { carbsG: Number.isFinite(n) && n > 0 ? Math.min(300, n) : null, fact };
   } catch {
-    return null;
+    return { carbsG: null, fact };
   }
 }
 
@@ -99,7 +117,27 @@ Deno.serve(async (req: Request) => {
       // The user shouldn't HAVE to type carbs — if they didn't, let the AI estimate them. carbs_g
       // is the TOTAL eaten = per-unit × quantity (so "ate it 3×" needs no re-scan/re-type).
       let perUnit: number | null = Number.isFinite(carbs) && carbs > 0 ? Math.round(carbs) : null;
-      if (perUnit == null) perUnit = await estimateCarbs(description, body.geminiKey);
+      // WHERE THE NUMBER CAME FROM travels with it. A figure the user typed, a figure read off a
+      // barcode and a figure a model guessed are three different things, and the app used to print
+      // all three the same way. The parent has to be able to tell an estimate from a label.
+      let carbSource: string = perUnit != null ? "user" : "estimate";
+      let carbFact: unknown = null;
+      if (perUnit == null) {
+        // The person's country steers the estimate: the same product differs by market. Read from
+        // the profile so an older APK that doesn't send one still benefits.
+        const { data: prof } = await db.from("mechabetics_profiles")
+          .select("country").eq("subject", subject).maybeSingle();
+        const country = (body.country ?? (prof as any)?.country ?? null) as string | null;
+        const est = await estimateCarbs(description, body.geminiKey, country, m.barcode ?? null);
+        perUnit = est.carbsG;
+        if (est.fact) {
+          carbSource = est.fact.source === "barcode" ? "label_barcode" : "product_db";
+          carbFact = {
+            per100: est.fact.carbsPer100, name: est.fact.productName, brand: est.fact.brand,
+            code: est.fact.code, country: est.fact.country, source: est.fact.source,
+          };
+        }
+      }
       const carbsG = perUnit != null ? Math.min(2000, perUnit * quantity) : null;
       const mealTs = clampTs(m.ts);
       const row = {
@@ -112,7 +150,7 @@ Deno.serve(async (req: Request) => {
       };
       const { data, error } = await db.from("mechabetics_meals").insert(row).select().single();
       if (error) return json({ error: error.message }, 500);
-      return json({ meal: data });
+      return json({ meal: data, carbSource, carbFact });
     }
 
     // Manual rapid-insulin log (the Insulin page) -> feeds IOB used by coach/ask/scan.

@@ -830,6 +830,7 @@ data class BgStrings(
     // HbA1c sur la page Profil : champ « dernier labo » + estimation maison (GMI) calculée
     // depuis la glycémie moyenne. %1$d = moyenne mg/dL, %2$d = nb de jours de mesures.
     val hba1cField: String,
+    val fieldCountry: String,
     val gmiTitle: String,
     val gmiExplain: String,
     val gmiAccumulating: String,
@@ -868,6 +869,7 @@ private val BgStringsFr = BgStrings(
     analysisStaleBody = "Ce bilan date de %s — la glycémie a bougé depuis. Appuie pour une nouvelle analyse.",
     networkLost = "Réseau perdu — sans Wi-Fi ni données mobiles, Dr Claude est limité : pas de nouvelle glycémie, ni analyse ni sauvegarde. Tout reprend dès que la connexion revient.",
     hba1cField = "HbA1c — dernier labo (%)",
+    fieldCountry = "Pays (pour le calcul des glucides)",
     gmiTitle = "HbA1c ESTIMÉE (GMI)",
     gmiExplain = "Estimée à partir de ta glycémie moyenne (%1\$d mg/dL sur %2\$d jours) — c'est l'indicateur « GMI » qu'affiche aussi LibreLink. Elle complète ton analyse de labo, sans la remplacer.",
     gmiAccumulating = "Dr Claude l'estimera après environ 14 jours de mesures (%1\$d j pour l'instant). En dessous, le chiffre ne serait pas fiable — on préfère ne rien afficher de trompeur.",
@@ -899,6 +901,7 @@ private val BgStringsEs = BgStrings(
     analysisStaleBody = "Este informe es de las %s — la glucosa ha cambiado. Toca para un análisis nuevo.",
     networkLost = "Sin conexión — sin Wi-Fi ni datos móviles, Dr Claude está limitado: sin glucosa nueva, ni análisis ni guardado. Todo se reanuda en cuanto vuelva la conexión.",
     hba1cField = "HbA1c — último análisis (%)",
+    fieldCountry = "País (para el cálculo de carbohidratos)",
     gmiTitle = "HbA1c ESTIMADA (GMI)",
     gmiExplain = "Estimada a partir de tu glucosa media (%1\$d mg/dL en %2\$d días) — es el indicador « GMI » que muestra también LibreLink. Complementa tu análisis de laboratorio, sin sustituirlo.",
     gmiAccumulating = "Dr Claude la estimará tras unos 14 días de mediciones (%1\$d días por ahora). Con menos, el número no sería fiable — preferimos no mostrar nada engañoso.",

@@ -165,6 +165,11 @@ Deno.serve(async (req: Request) => {
       // Last lab HbA1c the user typed (%). Merged like the rest: absent in a partial save → keep stored.
       hba1c: num(pick("hba1c")),
       lang: pick("lang") ?? null,
+      // WHERE the person is. Not a formality: the same packaged product carries up to twice the sugar
+      // depending on the market — Spanish 7UP is 4.6 g per 100 ml, the classic recipe 10.6 — so an
+      // estimate made without a country is a guess about which country. NOT derivable from `lang`:
+      // this family speaks French and lives in Spain, which is exactly the case that would break.
+      country: pick("country") ?? null,
       notes: pick("notes") ?? null,
       updated_at: new Date().toISOString(),
     };

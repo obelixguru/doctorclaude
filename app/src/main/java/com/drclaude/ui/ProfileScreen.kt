@@ -108,6 +108,7 @@ fun ProfileScreen(
     var carbRatio by remember { mutableStateOf("") }
     var correction by remember { mutableStateOf("") }
     var target by remember { mutableStateOf("") }
+    var country by remember { mutableStateOf("") }
     var notes by remember { mutableStateOf("") }
     var hba1c by remember { mutableStateOf("") }
     var gmi by remember { mutableStateOf<ProfileService.Gmi?>(null) }
@@ -129,7 +130,7 @@ fun ProfileScreen(
         // blend to the child, handing an adult's correction factor to the guard that doses the child.
         nickname = ""; age = ""; weight = ""; dxYears = ""
         rapidName = ""; rapidUnits = ""; basalName = ""; basalUnits = ""
-        carbRatio = ""; correction = ""; target = ""; notes = ""; hba1c = ""
+        carbRatio = ""; correction = ""; target = ""; notes = ""; hba1c = ""; country = ""
         gmi = null; gmiLoaded = false
         if (patientId != null) {
             val full = service.loadFull(patientId)
@@ -163,6 +164,7 @@ fun ProfileScreen(
                 if (!p.isNull("carb_ratio")) carbRatio = p.optInt("carb_ratio").toString()
                 if (!p.isNull("correction_factor")) correction = p.optInt("correction_factor").toString()
                 if (!p.isNull("target_mgdl")) target = p.optInt("target_mgdl").toString()
+                if (!p.isNull("country")) country = p.optString("country")
                 if (!p.isNull("notes")) notes = p.optString("notes")
                 if (!p.isNull("hba1c")) hba1c = trimNum(p.optDouble("hba1c"))
             }
@@ -194,6 +196,8 @@ fun ProfileScreen(
                 putOpt("target_mgdl", target.toIntOrNull())
                 // Lab HbA1c (%) — accepts "6,4" or "6.4". Server merges it like the rest.
                 putOpt("hba1c", hba1c.replace(',', '.').toDoubleOrNull())
+                // Steers carb estimation: the same packaged product differs by market.
+                putOpt("country", country.ifBlank { null })
                 putOpt("notes", notes.ifBlank { null })
                 put("lang", lang.code.lowercase())
             }
@@ -211,7 +215,7 @@ fun ProfileScreen(
     // Waiting for the typing to stop means only settled values are ever persisted.
     val editSignature = listOf(
         nickname, age, weight, dxYears, rapidName, rapidUnits, basalName, basalUnits,
-        carbRatio, correction, target, notes, hba1c, byok,
+        carbRatio, correction, target, notes, hba1c, country, byok,
     ).joinToString("\u0000")
     var lastSaved by remember(patientId) { mutableStateOf<String?>(null) }
     LaunchedEffect(editSignature, loaded, patientId) {
@@ -456,6 +460,7 @@ fun ProfileScreen(
                 Box(Modifier.weight(1f)) { Field(s.fieldWeight, weight, number = true) { weight = it } }
             }
             Field(s.fieldDxYears, dxYears, number = true) { dxYears = it }
+            Field(bg.fieldCountry, country) { country = it }
             // HbA1c: the lab value the user types, plus Doctor Claude's own estimate (GMI) computed
             // from the CGM mean — the same indicator LibreLink shows. The estimate appears once enough
             // readings exist; under ~14 days it's shown as indicative.
