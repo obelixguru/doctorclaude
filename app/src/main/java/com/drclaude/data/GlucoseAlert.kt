@@ -62,6 +62,10 @@ data class GlucoseAlert(
         /** Red-high floor: above this it sounds. */
         const val ALARM_HIGH = 180
         const val RAPID_SLOPE = 2.0 // mg/dL per minute
+        /** How clearly the curve must be heading BACK toward range before its banner is dropped —
+         *  ±0.5 mg/dL/min, i.e. about 30 mg/dL an hour, the same "is it really moving" bar the dose
+         *  guard uses. Below it the curve is flat, and a flat out-of-range value still deserves saying. */
+        const val RETURNING_SLOPE = 0.5
         /** A reading older than this is "signal lost": we can't know the current glucose, so we must
          *  neither alarm on the stale value nor let it suppress a real alarm (the dashboard shows the
          *  big red NO SIGNAL past this point). Deliberately SHORT — the Libre sends a value every
@@ -129,17 +133,40 @@ data class GlucoseAlert(
             nowMs: Long = System.currentTimeMillis()
         ): GlucoseAlert {
             val raw = of(current, history, nowMs)
-            if (raw.kind != AlertKind.HIGH && raw.kind != AlertKind.HIGH_WARN) return raw
-            // A HIGH only rings when there's something to DO (mirrors the dose guard's "no insulin"
-            // cases): suppressed if insulin is on board and it's not still climbing, OR it's already
-            // coming down on its own. A high that keeps RISING despite insulin still alarms.
-            if (iobUnits >= IOB_ACTIVE_MIN && raw.slope < HIGH_RISING_SLOPE) return GlucoseAlert(AlertKind.NONE, raw.slope, raw.value)
-            if (raw.slope <= -0.5) return GlucoseAlert(AlertKind.NONE, raw.slope, raw.value)
+
+            // AN ALERT IS ABOUT A GLUCOSE MOVING AWAY FROM RANGE, NOT ONE COMING BACK TO IT.
+            // Announcing "presque haut" to someone watching their glucose fall through 175 tells them
+            // nothing they can act on, and a warning that keeps appearing when there is nothing to do
+            // is how a warning stops being read. Same on the other side: climbing back through 65
+            // after a rescue is the treatment WORKING.
+            if (raw.kind == AlertKind.HIGH || raw.kind == AlertKind.HIGH_WARN) {
+                // A HIGH only rings when there's something to DO (mirrors the dose guard's "no insulin"
+                // cases): suppressed if insulin is on board and it's not still climbing, OR it's already
+                // coming down on its own. A high that keeps RISING despite insulin still alarms.
+                if (iobUnits >= IOB_ACTIVE_MIN && raw.slope < HIGH_RISING_SLOPE) return GlucoseAlert(AlertKind.NONE, raw.slope, raw.value)
+                if (raw.slope <= -RETURNING_SLOPE) return GlucoseAlert(AlertKind.NONE, raw.slope, raw.value)
+                return raw
+            }
+            // The amber low band, symmetric with the amber high band above. Deliberately NOT extended
+            // to the red hypo below 60: that one is about where the glucose IS, not where it is going.
+            // A 55 climbing is still a 55, it is the alarm that sounds at night, and a rebound can
+            // stall — the cost of being wrong there is not comparable.
+            if (raw.kind == AlertKind.LOW_WARN && raw.slope >= RETURNING_SLOPE) {
+                return GlucoseAlert(AlertKind.NONE, raw.slope, raw.value)
+            }
             return raw
         }
 
-        /** Average slope over the most recent ~15 min (mg/dL per minute). Returns 0 when the
-         *  span is too short to trust, so a single jumpy reading can't fake a "rapid" curve. */
+        /**
+         * Slope over the most recent ~15 min (mg/dL per minute, + rising / − falling). Returns 0 when
+         * the span is too short to trust, so a single jumpy reading can't fake a "rapid" curve.
+         *
+         * Fitted through EVERY point, after a median-of-3 despike — the same computation the server's
+         * robustSlope does, and for the same reason. Reading only the first and last point of the
+         * window meant one noisy sample decided the answer, and this slope is what decides whether a
+         * banner is suppressed: a glucose visibly coming down through 175 kept being announced as
+         * "presque haut" because the two ends happened not to differ by enough.
+         */
         fun recentSlope(history: List<GlucoseReading>): Double {
             val sorted = cleanGlucoseSeries(history) // dedupe + drop noise/future/ancient before measuring slope
             if (sorted.size < 2) return 0.0
@@ -147,10 +174,25 @@ data class GlucoseAlert(
             val windowStart = last.timestampMs - 15 * 60_000L
             val pts = sorted.filter { it.timestampMs >= windowStart }
             if (pts.size < 2) return 0.0
-            val first = pts.first()
-            val dtMin = (last.timestampMs - first.timestampMs) / 60_000.0
+            val t0 = pts.first().timestampMs
+            val dtMin = (last.timestampMs - t0) / 60_000.0
             if (dtMin < 4) return 0.0
-            return (last.valueMgDl - first.valueMgDl) / dtMin
+
+            val v = DoubleArray(pts.size) { pts[it].valueMgDl.toDouble() }
+            val smooth = v.copyOf()
+            for (i in 1 until v.size - 1) {
+                val a = v[i - 1]; val b = v[i]; val c = v[i + 1]
+                smooth[i] = maxOf(minOf(a, b), minOf(maxOf(a, b), c)) // median of three
+            }
+            var sx = 0.0; var sy = 0.0; var sxx = 0.0; var sxy = 0.0
+            for (i in pts.indices) {
+                val x = (pts[i].timestampMs - t0) / 60_000.0
+                sx += x; sy += smooth[i]; sxx += x * x; sxy += x * smooth[i]
+            }
+            val n = pts.size
+            val denom = n * sxx - sx * sx
+            if (denom == 0.0) return 0.0
+            return (n * sxy - sx * sy) / denom
         }
 
         /** How many minutes the curve has been moving CONTINUOUSLY in one direction (no reversal

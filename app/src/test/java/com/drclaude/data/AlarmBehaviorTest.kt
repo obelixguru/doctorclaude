@@ -208,4 +208,61 @@ class AlarmBehaviorTest {
         assertFalse(AlarmPolicy.inQuietWindow(8 * 60, 22 * 60, 7 * 60))  // 08:00 outside
     }
 
+    // ── 5) A banner is for a glucose moving AWAY from range, never one coming back to it. ──────────
+
+    /** Readings ending NOW, five minutes apart — cleanGlucoseSeries anchors on the real clock and
+     *  keeps one reading per 5-minute bucket, so anything denser or older simply disappears. */
+    private fun series(vararg vals: Int): List<GlucoseReading> {
+        val end = System.currentTimeMillis()
+        return vals.mapIndexed { i, v ->
+            GlucoseReading(end - (vals.size - 1 - i) * 5L * 60_000L, v)
+        }
+    }
+
+    private fun kindOfSeries(vararg vals: Int): AlertKind {
+        val h = series(*vals)
+        return GlucoseAlert.evaluate(h.last(), h, iobUnits = 0.0, nowMs = h.last().timestampMs).kind
+    }
+
+    @Test
+    fun `a glucose falling through 175 no longer says presque haut`() {
+        // The reported case: coming down from 200, still announced as nearly-high at every refresh.
+        assertEquals(AlertKind.NONE, kindOfSeries(200, 191, 183, 175))
+    }
+
+    @Test
+    fun `a glucose still climbing through 175 does say presque haut`() {
+        assertEquals(AlertKind.HIGH_WARN, kindOfSeries(150, 158, 167, 175))
+    }
+
+    @Test
+    fun `climbing back through 67 after a rescue drops the amber low badge`() {
+        assertEquals(AlertKind.NONE, kindOfSeries(55, 59, 63, 67))
+    }
+
+    @Test
+    fun `still falling through 65 keeps the amber low badge`() {
+        assertEquals(AlertKind.LOW_WARN, kindOfSeries(80, 75, 70, 65))
+    }
+
+    @Test
+    fun `a red hypo is never suppressed by rising - it is about where you ARE`() {
+        val h = series(45, 49, 53, 57)
+        val a = GlucoseAlert.evaluate(h.last(), h, iobUnits = 0.0, nowMs = h.last().timestampMs)
+        assertEquals(AlertKind.LOW, a.kind)
+        assertTrue(a.ringsAlarm)
+    }
+
+    @Test
+    fun `a flat out-of-range value is still announced`() {
+        // Not moving is not recovering: 175 sitting still has something to say.
+        assertEquals(AlertKind.HIGH_WARN, kindOfSeries(175, 174, 176, 175))
+    }
+
+    @Test
+    fun `one noisy sample cannot decide the direction`() {
+        // A single low sample among a flat line used to drag the two-point slope negative and silence
+        // the banner; the median-of-3 despike ignores it.
+        assertEquals(AlertKind.HIGH_WARN, kindOfSeries(176, 176, 168, 176))
+    }
 }
