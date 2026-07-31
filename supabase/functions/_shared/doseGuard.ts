@@ -1110,20 +1110,27 @@ export const RESCUE_LOOKBACK_MIN = 45;
 /**
  * Was this eaten to fix a low? Reads the curve around the moment of eating.
  *
- * SIZE STILL DECIDES. The curve rule was added so a 7up drunk at 57 mg/dL stopped being answered
- * with insulin — but it was written with no carb ceiling, so it swallowed WHOLE MEALS: a McDonald's
- * menu (~110 g) logged at 80 mg/dL was filed as a hypo rescue, vanished from findUncoveredMeal, and
- * the app answered a 28-sugar-cube meal with "no insulin at all, keep sugar handy". Nobody treats a
- * low with a Maxi Best Of. Above RESCUE_MAX_CARBS it is a meal whatever the glucose was — the same
- * ceiling isHypoRescue already applies to the vocabulary rule.
+ * WHAT IT IS STILL DECIDES. The curve rule was added so a 7up drunk at 57 mg/dL stopped being
+ * answered with insulin — but it was written on the timestamp alone, so it swallowed WHOLE MEALS: a
+ * McDonald's menu (~110 g) logged at 80 mg/dL was filed as a hypo rescue, vanished from
+ * findUncoveredMeal, and the app answered a 28-sugar-cube meal with "no insulin at all, keep sugar
+ * handy". Nobody treats a low with a Maxi Best Of. Two vetoes, both about the food itself:
+ *   - above RESCUE_MAX_CARBS it is a meal whatever the glucose was (the ceiling isHypoRescue already
+ *     applies to the vocabulary rule);
+ *   - a SLOW or FATTY food cannot be a rescue at any size — pasta, potatoes, a burger and a pizza do
+ *     not lift a low in the fifteen minutes a rescue is judged on. That is what makes them meals.
+ * The curve keeps the last word only over food that could plausibly have been the treatment.
  */
 export function eatenToTreatALow(
   mealTs: number,
   readings: { ts: number; value: number }[] | null | undefined,
   carbsG?: number | null,
+  description?: string | null,
 ): boolean {
   const c = Number(carbsG);
   if (Number.isFinite(c) && c > RESCUE_MAX_CARBS) return false;
+  const speed = mealCarbSpeed(description);
+  if (speed === "slow" || speed === "fatty") return false;
   const rs = (readings || []).filter((r) => r && Number(r.value) > 0 && Number.isFinite(Number(r.ts)));
   if (!rs.length) return false;
   // A genuine low shortly BEFORE the food (the reason it was eaten), or still low just after.
@@ -1165,7 +1172,7 @@ export function findUncoveredMeal(
     if (!Number.isFinite(mt)) continue;
     // THE CURVE OVERRULES THE WORDS. Eaten while low = treatment for that low, never a meal to cover
     // — but only at rescue SIZE: a full menu eaten at 80 mg/dL is still a meal that needs its bolus.
-    if (eatenToTreatALow(mt, readings, carbs)) continue;
+    if (eatenToTreatALow(mt, readings, carbs, m.description)) continue;
     const minsAgo = (nowMs - mt) / 60000;
     if (minsAgo < 0) continue; // not eaten yet
     const speed = mealCarbSpeed(m.description);
@@ -1599,10 +1606,17 @@ export function mealTimingLine(timing: MealTiming, lang: string, minutesUntilMea
         ? "Azúcar rápido: pon la insulina ~15 min ANTES de empezar a comer, si no el pico llega antes que ella."
         : "Sucre rapide : fais l'insuline ~15 min AVANT de commencer à manger, sinon le pic arrive avant elle.";
     }
-    case "split":
+    case "split": {
+      // "Dans 20 min" was dropped here: every other timing named the announced hour and the split
+      // one answered as if the plate were already on the table. The whole point of announcing a meal
+      // is being told WHEN to inject for it.
+      const start = until > 0
+        ? (es ? `una parte al empezar a comer, dentro de ${until} min` : `une partie au moment de commencer à manger, dans ${until} min`)
+        : (es ? "una parte al empezar" : "une partie en commençant");
       return es
-        ? "Comida lenta o grasa: sube TARDE. Bolo dividido — una parte al empezar, el resto 1-2 h después — y recontrola a las 2-3 h."
-        : "Repas lent ou gras : ça monte TARD. Bolus étalé — une partie en commençant, le reste 1-2 h après — et recontrôle à 2-3 h.";
+        ? `Comida lenta o grasa: sube TARDE. Bolo dividido — ${start}, el resto 1-2 h después — y recontrola a las 2-3 h.`
+        : `Repas lent ou gras : ça monte TARD. Bolus étalé — ${start}, le reste 1-2 h après — et recontrôle à 2-3 h.`;
+    }
     case "at_meal":
       return until > 0
         ? (es ? `Pon la insulina al empezar a comer, dentro de ${until} min.` : `Fais l'insuline au moment de commencer à manger, dans ${until} min.`)

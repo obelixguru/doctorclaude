@@ -1163,3 +1163,43 @@ test("balanced on paper, but low on the meter → the sugar stays within reach",
   assert.match(line, /garde quand même du sucre à portée/);
   assert.doesNotMatch(line, /pas besoin de sucre/);
 });
+
+test("a slow or fatty food is never a rescue, whatever the glucose was when it was logged", () => {
+  // "Fais qu'il remarque si c'est un repas ou pas": the size ceiling alone still let a small plate
+  // through — a slice of pizza logged at 79 mg/dL was filed as treatment for that low. Nothing slow
+  // or fatty lifts a low inside the quarter of an hour a rescue is judged on; that is what makes it
+  // a meal. The curve keeps the last word only over food that could plausibly have been the cure.
+  const T = MC_T;
+  const lowCurve = [[-10, 78], [0, 76], [8, 84]].map(([m, v]) => ({ ts: T + (m as number) * 60_000, value: v as number }));
+  assert.equal(eatenToTreatALow(T, lowCurve, 24, "part de pizza"), false);
+  assert.equal(eatenToTreatALow(T, lowCurve, 20, "pâtes"), false);
+  assert.equal(eatenToTreatALow(T, lowCurve, 22, "cheeseburger"), false);
+  // ...while a real rescue is untouched, by word or by speed.
+  assert.equal(eatenToTreatALow(T, lowCurve, 15, "3 sucres"), true);
+  assert.equal(eatenToTreatALow(T, lowCurve, 16, "canette 7up"), true);
+  assert.equal(eatenToTreatALow(T, lowCurve, 20, "jus d'orange"), true);
+});
+
+test("even a 'rescue' this big cannot mean a coming hypo: sugar on board is sugar on board", () => {
+  // The user's own objection: "si c'est un resucrage de 28 sucres il ne peut toujours pas dire que
+  // je vais vers une hypo". carbsOnBoard counts every gram eaten, rescue or meal — the projection
+  // must never look at the insulin alone again, whatever the food was filed as.
+  const rescue = [{ ts: MC_T, carbs_g: 112, planned: false, description: "3 sucres" }];
+  assert.equal(isHypoRescue("3 sucres", 112), false);             // 112 g is not a rescue either
+  const cob = carbsOnBoard(rescue as any, MC_NOW);
+  assert.ok(cob > 90, `rescue carbs must still count as sugar on board, got ${cob}`);
+  const iob = activeIob(mcDoses as any, MC_NOW, 240);
+  assert.equal(mealBolusHeldByIob(121, iob, mcdo, cob), false);
+  const line = inRangeActionLine(rescue as any, mcDoses as any, mcCurve, MC_NOW, mcdo, "fr", iob);
+  assert.doesNotMatch(line, /vers une hypo/i);
+  assert.match(line, /en digestion/);
+});
+
+test("an announced slow/fatty meal keeps its hour: the split bolus is due AT the meal, not now", () => {
+  const fr = mealTimingLine("split", "fr", 20);
+  assert.match(fr, /dans 20 min/);
+  assert.match(fr, /1-2 h après/);
+  assert.match(mealTimingLine("split", "es", 20), /dentro de 20 min/);
+  // Eating now: no phantom delay.
+  assert.doesNotMatch(mealTimingLine("split", "fr", 0), /dans \d+ min/);
+});
