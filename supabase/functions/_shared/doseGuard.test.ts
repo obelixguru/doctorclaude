@@ -38,6 +38,7 @@ import {
   unusualDoseNote,
   enforceInsulinCeiling,
   overCeilingUnits,
+  pendingDropMgdl,
   mealBolusHeldByIob,
   mealBolusHeldLine,
   eatenToTreatALow,
@@ -975,7 +976,8 @@ test("in range is not the same as safe: the pending drop outranks 'rien à corri
   const iob = activeIob(preBolus as any, NOW_AFTER, 240);
   const readings = [{ ts: NOW_AFTER - 10 * 60_000, value: 95 }, { ts: NOW_AFTER, value: 85 }];
   const line = inRangeActionLine(dinnerMeal as any, preBolus as any, readings, NOW_AFTER, ryan, "fr", iob);
-  assert.match(line, /vers une hypo/i);
+  assert.match(line, /sous 70/i);          // where it lands, not just "a fall is owed"
+  assert.match(line, /tu es à 85 mg\/dL/); // ...from the value actually on the meter
   assert.match(line, /sucre à portée/i);
   assert.doesNotMatch(line, /rien à corriger/i);
 });
@@ -1063,4 +1065,101 @@ test("the same drink at a normal glucose IS a meal to cover", () => {
 test("no readings at all: the curve cannot overrule, and nothing changes", () => {
   assert.equal(eatenToTreatALow(Date.now(), []), false);
   assert.equal(eatenToTreatALow(Date.now(), null), false);
+});
+
+// ─── The McDonald's incident, 31 July 2026. At 80 mg/dL the user logged a "Maxi Best Of Royal
+// Cheese" (~110 g, 28 sugar cubes), jumped to 130 within minutes and asked for an analysis. It came
+// back: "l'insuline encore active a ~154 mg/dL de baisse à délivrer — tu vas vers une hypo […] et
+// aucune insuline en plus (repas compris)". Two independent faults, both reproduced below: the menu
+// was filed as a HYPO RESCUE because the glucose happened to be 80 when it was logged, and the
+// trajectory counted the insulin on board while ignoring the 110 g of carbs on board. ─────────────
+
+const mcdo = { carbRatio: 12, correctionFactor: 40, targetMgdl: 110, weightKg: 60, rapidInsulin: "Fiasp" };
+const MC_T = new Date("2026-07-31T15:04:00Z").getTime();   // the menu, 16 min before the analysis
+const MC_NOW = MC_T + 16 * 60_000;
+// 80 at the moment of eating, then the climb the user described.
+const mcCurve = [[-20, 84], [-10, 82], [0, 80], [6, 98], [11, 118], [16, 121]]
+  .map(([m, v]) => ({ ts: MC_T + (m as number) * 60_000, value: v as number }));
+const mcMeal = [{
+  ts: "2026-07-31T15:04:00+00:00", carbs_g: 112, planned: false,
+  description: "Maxi Best Of Royal Cheese (menu McDonald)",
+}];
+// 12 u three hours earlier on a 4 h decay -> ~3.9 u left, i.e. ~154 mg/dL still owed at ISF 40.
+const mcDoses = [{ ts: MC_NOW - 163 * 60_000, units: 12, kind: "rapid", insulin_name: "Fiasp" }];
+
+test("a whole menu eaten at 80 mg/dL is a MEAL, not a hypo rescue", () => {
+  // Nobody treats a low with a Maxi Best Of. The curve rule owns rescue-SIZED food only.
+  assert.equal(eatenToTreatALow(MC_T, mcCurve, 112), false);
+  assert.equal(eatenToTreatALow(MC_T, mcCurve, 16), true); // a can at the same moment still is one
+  const un = findUncoveredMeal(mcMeal as any, [], MC_NOW, mcdo, mcCurve);
+  assert.ok(un, "the menu must surface as an uncovered meal");
+  assert.equal(un!.carbsG, 112);
+  assert.equal(mealBolusPlan(mcMeal as any, [], MC_NOW, mcdo, 180, mcCurve).units, 9.5); // 112 / 12
+});
+
+test("the carbs on board are weighed against the insulin on board", () => {
+  const iob = activeIob(mcDoses as any, MC_NOW, 240);
+  assert.ok(iob > 3.8 && iob < 3.9, `expected the report's ~4 u still active, got ${iob}`);
+  assert.equal(Math.round((pendingDropMgdl(iob, mcdo) ?? 0)), 154); // the "154" of the screenshot
+  const cob = carbsOnBoard(mcMeal as any, MC_NOW);
+  assert.ok(cob > 100, `expected the menu still digesting, got ${cob}`);
+  // Insulin alone: 121 - 154 < 70 -> "a fall is coming". With the food: it is a climb.
+  assert.equal(mealBolusHeldByIob(121, iob, mcdo, 0), true);
+  assert.equal(mealBolusHeldByIob(121, iob, mcdo, cob), false);
+  // ...and nothing changed when there is genuinely no food on board.
+  assert.equal(mealBolusHeldByIob(85, iob, mcdo, 0), true);
+});
+
+test("the analysis no longer announces a hypo 16 min into a 28-sugar-cube menu", () => {
+  const iob = activeIob(mcDoses as any, MC_NOW, 240);
+  const line = inRangeActionLine(mcMeal as any, mcDoses as any, mcCurve, MC_NOW, mcdo, "fr", iob);
+  assert.doesNotMatch(line, /vers une hypo/i);
+  assert.doesNotMatch(line, /aucune insuline en plus/i);
+  assert.match(line, /121 mg\/dL/);        // the value on the meter is named...
+  assert.match(line, /en digestion/);      // ...and so is the food it is racing
+  assert.match(line, /recontrôle dans 15 min/);
+  const es = inRangeActionLine(mcMeal as any, mcDoses as any, mcCurve, MC_NOW, mcdo, "es", iob);
+  assert.match(es, /digiriendo/);
+  assert.doesNotMatch(es, /hacia una hipoglucemia/i);
+});
+
+test("a REAL incoming hypo still says so — and says what the numbers mean", () => {
+  const iob = activeIob(mcDoses as any, MC_NOW, 240); // ~3.9 u -> ~154 mg/dL owed
+  const quiet = [[-20, 130], [-10, 125], [0, 121]].map(([m, v]) => ({ ts: MC_NOW + (m as number) * 60_000, value: v as number }));
+  const line = inRangeActionLine([], mcDoses as any, quiet, MC_NOW, mcdo, "fr", iob); // nothing eaten
+  assert.match(line, /vers une hypo|sous 70/i);
+  assert.match(line, /121 mg\/dL/);                 // "154" was read as a glucose value: name the real one
+  assert.match(line, /~154 mg\/dL de baisse/);      // and say what 154 actually is
+  assert.match(line, /sucre à portée MAINTENANT/);
+});
+
+test("mealBolusHeldLine names the current glucose next to the pending drop", () => {
+  const iob = activeIob(mcDoses as any, MC_NOW, 240);
+  const fr = mealBolusHeldLine(85, iob, mcdo, "fr");
+  assert.match(fr, /tu es à 85 mg\/dL/);
+  assert.match(fr, /~154 mg\/dL de baisse/);
+  assert.match(fr, /sous 70/);
+  assert.match(mealBolusHeldLine(85, iob, mcdo, "es"), /estás a 85 mg\/dL/);
+});
+
+test("planMealDose: earlier carbs still landing lift the floor the meal bolus is judged against", () => {
+  const iob = activeIob(mcDoses as any, MC_NOW, 240);
+  const bare = planMealDose({ glucoseMgdl: 121, trend: "rising", staleMin: 2, iobUnits: iob, carbsG: 40, profile: mcdo });
+  assert.equal(bare.lowBeforeMeal, true);          // insulin alone: 121 - 154 = -33
+  const withFood = planMealDose({
+    glucoseMgdl: 121, trend: "rising", staleMin: 2, iobUnits: iob, carbsG: 40,
+    cobGrams: carbsOnBoard(mcMeal as any, MC_NOW), profile: mcdo,
+  });
+  assert.equal(withFood.lowBeforeMeal, false);
+  assert.ok((withFood.floorMgdl as number) > 70);
+  assert.equal(withFood.mealUnits, 3.5);           // the carb maths itself is untouched
+});
+
+test("balanced on paper, but low on the meter → the sugar stays within reach", () => {
+  const iob = 1.2;                                   // ~48 mg/dL owed at ISF 40
+  const meal = [{ ts: MC_NOW - 30 * 60_000, carbs_g: 30, description: "sandwich" }];
+  const low = [[-20, 92], [-10, 88], [0, 84]].map(([m, v]) => ({ ts: MC_NOW + (m as number) * 60_000, value: v as number }));
+  const line = inRangeActionLine(meal as any, [], low, MC_NOW, mcdo, "fr", iob);
+  assert.match(line, /garde quand même du sucre à portée/);
+  assert.doesNotMatch(line, /pas besoin de sucre/);
 });

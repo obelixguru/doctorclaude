@@ -531,35 +531,77 @@ export function pendingDropMgdl(iobUnits: number, profile: GuardProfile | null):
 }
 
 /**
+ * The share of the carbs-still-digesting we are willing to bank on when asking "is a fall coming?".
+ *
+ * Insulin action is far more predictable than carb absorption (a wrong carb count, a fatty meal that
+ * lands late, a slow stomach), so the two sides of the balance do not deserve equal trust. Counting
+ * only part of the rise keeps the answer on the cautious side: under-counting food keeps the hypo
+ * warning up, over-counting it would silence a real one. It is NEVER used to make a dose bigger —
+ * carbs on board only ever answer "where is this heading", never "how much insulin".
+ */
+export const COB_TRUST_FRACTION = 0.7;
+
+/** How much the carbs still being absorbed have left to RAISE the glucose, in mg/dL — the mirror of
+ *  pendingDropMgdl, discounted by COB_TRUST_FRACTION. Null without both ratios. */
+export function pendingRiseMgdl(cobGrams: number, profile: GuardProfile | null): number | null {
+  const icr = profile?.carbRatio && profile.carbRatio > 0 ? profile.carbRatio : null;
+  const isf = profile?.correctionFactor && profile.correctionFactor > 0 ? profile.correctionFactor : null;
+  if (!icr || !isf) return null;
+  return (Math.max(0, cobGrams || 0) / icr) * isf * COB_TRUST_FRACTION;
+}
+
+/**
  * Would a meal bolus land on top of a fall that is already happening?
  *
  * Carb counting alone says "50 g needs 3 u" and is right about the carbs — but insulin already on
  * board keeps working regardless, and if it is going to take the glucose under 70 by itself then
  * three more units is not a meal bolus, it is a hypo. The same test planMealDose applies internally
- * (floor = glucose − iob × ISF), lifted out so the eaten-meal path gets it too: that path went
- * straight to combinedActionLine, which sums units and has never seen a glucose or an IOB.
+ * (floor = glucose − iob × ISF + the carbs still coming), lifted out so the eaten-meal path gets it
+ * too: that path went straight to combinedActionLine, which sums units and has never seen a glucose
+ * or an IOB.
+ *
+ * BOTH SIDES OR NEITHER. This used to weigh the insulin alone, so it read the most ordinary event in
+ * the day — a meal, its bolus, and both still working — as an incoming hypo. Live report: 121 mg/dL
+ * sixteen minutes after a ~110 g menu, with 3.9 u left from three hours earlier, came back as "you
+ * are heading for a hypo, no insulin at all (meal included), keep sugar handy" while the glucose was
+ * in fact climbing hard. `carbsOnBoard` existed and nothing on the server ever called it.
  */
 export function mealBolusHeldByIob(
   glucoseMgdl: number | null,
   iobUnits: number,
   profile: GuardProfile | null,
+  /** Carbs still being absorbed (grams) — from `carbsOnBoard`. 0 = count the insulin alone. */
+  cobGrams = 0,
 ): boolean {
   const drop = pendingDropMgdl(iobUnits, profile);
   if (drop == null || glucoseMgdl == null || !Number.isFinite(glucoseMgdl) || glucoseMgdl <= 0) return false;
-  return glucoseMgdl - drop < LOW_MGDL;
+  const rise = pendingRiseMgdl(cobGrams, profile) ?? 0;
+  return glucoseMgdl + rise - drop < LOW_MGDL;
 }
 
-/** Why no meal bolus is due right now, in the user's language. */
+/** Why no meal bolus is due right now, in the user's language. Names the CURRENT glucose next to the
+ *  pending drop: "~154 mg/dL de baisse" alone was read as a glucose reading ("je suis à 154 ?") by
+ *  the user it was written for — a number on screen that isn't the one on the meter needs saying
+ *  what it is and where it lands. */
 export function mealBolusHeldLine(
   glucoseMgdl: number,
   iobUnits: number,
   profile: GuardProfile | null,
   lang: string,
+  cobGrams = 0,
 ): string {
   const drop = Math.round(pendingDropMgdl(iobUnits, profile) ?? 0);
-  return lang === "es"
-    ? `ninguna insulina para la comida ahora: la insulina que sigue activa aún tiene ~${drop} mg/dL de bajada por delante y te llevaría por debajo de 70. Vigila, ten azúcar a mano, y recontrola en 15 min.`
-    : `aucune insuline pour le repas maintenant : l'insuline encore active a ~${drop} mg/dL de baisse à délivrer et t'emmènerait sous 70. Surveille, garde du sucre à portée, et recontrôle dans 15 min.`;
+  const g = Math.round(glucoseMgdl);
+  const cob = Math.round(cobGrams || 0);
+  const es = lang === "es";
+  const food = cob > 0
+    ? (es
+      ? ` Los ~${cob} g que aún estás digiriendo no alcanzan para compensarla.`
+      : ` Les ~${cob} g encore en digestion ne suffisent pas à la compenser.`)
+    : "";
+  return es
+    ? `ninguna insulina para la comida ahora: estás a ${g} mg/dL y la insulina que sigue activa aún tiene ~${drop} mg/dL de bajada por delante — te llevaría por debajo de 70.${food} Come primero, ten azúcar a mano, y pon el bolo cuando la subida haya empezado (recontrola en 15 min).`
+    : `aucune insuline pour le repas maintenant : tu es à ${g} mg/dL et l'insuline encore active a ~${drop} mg/dL de baisse à délivrer — ça t'emmènerait sous 70.${food} Mange d'abord, garde du sucre à portée, et fais le bolus une fois la remontée amorcée (recontrôle dans 15 min).`;
 }
 
 /** Meal bolus = carbs / carb-ratio, rounded to 0.5 u. Carb counting doesn't need fresh glucose.
@@ -1065,11 +1107,23 @@ export const RESCUE_GLUCOSE_MGDL = 80;
 /** A low this recently makes whatever followed it a rescue. */
 export const RESCUE_LOOKBACK_MIN = 45;
 
-/** Was this eaten to fix a low? Reads the curve around the moment of eating. */
+/**
+ * Was this eaten to fix a low? Reads the curve around the moment of eating.
+ *
+ * SIZE STILL DECIDES. The curve rule was added so a 7up drunk at 57 mg/dL stopped being answered
+ * with insulin — but it was written with no carb ceiling, so it swallowed WHOLE MEALS: a McDonald's
+ * menu (~110 g) logged at 80 mg/dL was filed as a hypo rescue, vanished from findUncoveredMeal, and
+ * the app answered a 28-sugar-cube meal with "no insulin at all, keep sugar handy". Nobody treats a
+ * low with a Maxi Best Of. Above RESCUE_MAX_CARBS it is a meal whatever the glucose was — the same
+ * ceiling isHypoRescue already applies to the vocabulary rule.
+ */
 export function eatenToTreatALow(
   mealTs: number,
   readings: { ts: number; value: number }[] | null | undefined,
+  carbsG?: number | null,
 ): boolean {
+  const c = Number(carbsG);
+  if (Number.isFinite(c) && c > RESCUE_MAX_CARBS) return false;
   const rs = (readings || []).filter((r) => r && Number(r.value) > 0 && Number.isFinite(Number(r.ts)));
   if (!rs.length) return false;
   // A genuine low shortly BEFORE the food (the reason it was eaten), or still low just after.
@@ -1109,8 +1163,9 @@ export function findUncoveredMeal(
     if (!Number.isFinite(carbs) || carbs < UNCOVERED_MEAL_MIN_CARBS) continue;
     const mt = typeof m.ts === "number" ? m.ts : new Date(m.ts).getTime();
     if (!Number.isFinite(mt)) continue;
-    // THE CURVE OVERRULES THE WORDS. Eaten while low = treatment for that low, never a meal to cover.
-    if (eatenToTreatALow(mt, readings)) continue;
+    // THE CURVE OVERRULES THE WORDS. Eaten while low = treatment for that low, never a meal to cover
+    // — but only at rescue SIZE: a full menu eaten at 80 mg/dL is still a meal that needs its bolus.
+    if (eatenToTreatALow(mt, readings, carbs)) continue;
     const minsAgo = (nowMs - mt) / 60000;
     if (minsAgo < 0) continue; // not eaten yet
     const speed = mealCarbSpeed(m.description);
@@ -1205,12 +1260,37 @@ export function inRangeActionLine(
   // screen says: 85 mg/dL with 3.4 u still active has ~195 mg/dL of fall still owed, and "dans la
   // cible, rien à corriger" is a dangerous thing to read there. This outranks everything below,
   // including an uncovered meal — you do not bolus into a drop that is already coming.
+  //
+  // ...BUT THE FOOD COUNTS TOO. Weighed against the insulin alone, this fired on the single most
+  // ordinary moment of the day — just after eating — and told a user sixteen minutes into a ~110 g
+  // menu that they were heading for a hypo and must not take any insulin "meal included". A warning
+  // that fires while the glucose is climbing is a warning that gets ignored the day it is right. So:
+  // the insulin alone still opens the question, and the carbs still digesting decide the answer.
   const cur = readings && readings.length ? readings[readings.length - 1].value : null;
+  const cob = carbsOnBoard(meals || [], nowMs);
   if (mealBolusHeldByIob(cur, iobUnits, profile)) {
     const drop = Math.round(pendingDropMgdl(iobUnits, profile) ?? 0);
+    const g = Math.round(cur as number);
+    const grams = Math.round(cob);
+    // Food on board covers the pending drop: not a hypo warning, a watch. The advice that changes is
+    // the dangerous half ("eat sugar now, no insulin at all"); the recheck stays.
+    if (!mealBolusHeldByIob(cur, iobUnits, profile, cob)) {
+      const rise = Math.round(pendingRiseMgdl(cob, profile) ?? 0);
+      // Balanced ON PAPER is not the same as comfortable: down at the bottom of the range the margin
+      // for a carb count being wrong is gone, so the sugar stays within reach even here.
+      const near = g < FALL_WATCH_BELOW
+        ? (es ? `ten azúcar a mano de todas formas` : `garde quand même du sucre à portée`)
+        : (es ? `no hace falta azúcar` : `pas besoin de sucre`);
+      return es
+        ? `estás a ${g} mg/dL: la insulina activa aún tiene ~${drop} mg/dL de bajada por delante, pero los ~${grams} g que sigues digiriendo tiran hacia arriba (~${rise} mg/dL). Por ahora se compensan — ${near}, recontrola en 15 min y decide con la nueva medición.`
+        : `tu es à ${g} mg/dL : l'insuline active a encore ~${drop} mg/dL de baisse à délivrer, mais les ~${grams} g encore en digestion tirent vers le haut (~${rise} mg/dL). Les deux se compensent pour l'instant — ${near}, recontrôle dans 15 min et décide sur la nouvelle mesure.`;
+    }
+    const food = grams > 0
+      ? (es ? ` Los ~${grams} g que aún digieres no alcanzan.` : ` Les ~${grams} g encore en digestion ne suffiront pas.`)
+      : "";
     return es
-      ? `la insulina que sigue activa aún tiene ~${drop} mg/dL de bajada por delante — vas hacia una hipoglucemia. Ten azúcar a mano AHORA, recontrola en 15 min, y ninguna insulina más (tampoco para una comida) mientras no haya vuelto a subir.`
-      : `l'insuline encore active a ~${drop} mg/dL de baisse à délivrer — tu vas vers une hypo. Garde du sucre à portée MAINTENANT, recontrôle dans 15 min, et aucune insuline en plus (repas compris) tant que ce n'est pas remonté.`;
+      ? `estás a ${g} mg/dL y la insulina que sigue activa aún tiene ~${drop} mg/dL de bajada por delante: sin azúcar bajas de 70.${food} Ten azúcar a mano AHORA, recontrola en 15 min, y ninguna insulina más (tampoco para una comida) mientras no haya vuelto a subir.`
+      : `tu es à ${g} mg/dL et l'insuline encore active a ~${drop} mg/dL de baisse à délivrer : sans sucre tu passes sous 70.${food} Garde du sucre à portée MAINTENANT, recontrôle dans 15 min, et aucune insuline en plus (repas compris) tant que ce n'est pas remonté.`;
   }
   const falling = pred.kind === "watch_fall";
   const rising = pred.kind === "watch_rise" || pred.kind === "high_soon";
@@ -1382,6 +1462,10 @@ export interface MealPlanInput {
   carbsG: number | null | undefined;
   description?: string | null;
   minutesUntilMeal?: number | null; // 0 / absent = about to eat
+  /** Carbs from EARLIER meals still being absorbed (grams, from `carbsOnBoard`). They push UP while
+   *  the insulin on board pushes DOWN — without them the floor test below reads every properly
+   *  bolused meal as an incoming hypo. NOT the carbs of the meal being planned: those are `carbsG`. */
+  cobGrams?: number | null;
   minSinceRescue?: number | null;
   recentHypo?: boolean;
   profile: GuardProfile | null;
@@ -1407,9 +1491,10 @@ export interface MealPlanResult {
   // falling, or the insulin still on board (iob × ISF) will drag it under on its own. A meal bolus
   // then stacks onto a fall already in progress, so it is deferred to after the rise has started.
   lowBeforeMeal: boolean;
-  // Where the insulin on board alone would take the glucose (current − iob × ISF), null without ISF.
-  // Kept UNCLAMPED for the logic — it can go negative, which is precisely the signal that the drop
-  // still owed is larger than the distance to zero. Never show it raw; show pendingDropMgdl instead.
+  // Where the glucose is headed before this meal's own carbs act: current − iob × ISF + whatever
+  // EARLIER carbs are still landing (cobGrams). Null without ISF. Kept UNCLAMPED for the logic — it
+  // can go negative, which is precisely the signal that the drop still owed is larger than the
+  // distance to zero. Never show it raw; show pendingDropMgdl instead.
   floorMgdl: number | null;
   // How much the insulin still on board has left to lower the glucose (iob × ISF), in mg/dL.
   pendingDropMgdl: number | null;
@@ -1440,11 +1525,15 @@ export function planMealDose(input: MealPlanInput): MealPlanResult {
   const mealUnits = mealBolusUnits(carbsG, profile);
   const correctionUnits = guard.kind === "correction" ? guard.insulinUnits : 0;
 
+  // Carbs from EARLIER meals still landing (discounted, see COB_TRUST_FRACTION). They belong in every
+  // "where does this end up" figure below, on the same footing as the insulin on board.
+  const cobRise = pendingRiseMgdl(Number(input.cobGrams) || 0, profile) ?? 0;
+
   // What these carbs do UNBOLUSED: (carbs / ICR) units' worth of glucose, i.e. × ISF mg/dL. Insulin
   // already on board is netted off — it will absorb part of the rise.
   const expectedRiseMgdl = (icr && isf) ? Math.round((carbsG / icr) * isf) : null;
   const projectedUncoveredMgdl = (expectedRiseMgdl != null && g != null && Number.isFinite(g) && g > 0)
-    ? Math.max(20, Math.min(PROJECTION_MAX_MGDL, Math.round(g + expectedRiseMgdl - (isf ? (iobUnits || 0) * isf : 0))))
+    ? Math.max(20, Math.min(PROJECTION_MAX_MGDL, Math.round(g + expectedRiseMgdl + cobRise - (isf ? (iobUnits || 0) * isf : 0))))
     : null;
 
   // A low comes first, always: no pre-bolus, nothing injected until it is treated and the meal started.
@@ -1456,8 +1545,10 @@ export function planMealDose(input: MealPlanInput): MealPlanResult {
   // is already low AND falling, then a meal bolus — however correct for the carbs — is added on top
   // of a fall that is already happening. The real shape of the miss: 100 mg/dL falling with 3 u still
   // active is ~150 mg/dL of drop still to come, and the plan used to answer "10 u" with no caveat.
+  // 121 mg/dL with 4 u active but a menu still digesting is not a floor of −33, it is a glucose on
+  // its way up: cobRise (above) is netted in here too.
   const floorMgdl = (g != null && Number.isFinite(g) && g > 0 && isf)
-    ? Math.round(g - (iobUnits || 0) * isf)
+    ? Math.round(g + cobRise - (iobUnits || 0) * isf)
     : null;
   const lowBeforeMeal = !hypoFirst && carbsG > 0 && (
     (floorMgdl != null && floorMgdl < LOW_MGDL) ||

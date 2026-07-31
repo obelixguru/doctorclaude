@@ -10,6 +10,7 @@ import {
   insulinActionMinutes,
   mealBolusUnits,
   mealBolusHeldByIob,
+  carbsOnBoard,
   mealBolusHeldLine,
   combinedActionLine,
   situationHint,
@@ -341,6 +342,8 @@ Deno.serve(async (req: Request) => {
     const iob = activeIob(insulinDoses, nowMs, dia);
     const recentHypo = hasTs ? recentHypoFrom(rds, nowMs) : rds.some((r) => r.value > 0 && r.value < 70);
     const minSinceRescue = minutesSinceLastRescue(meals, nowMs);
+    // Sugar still on board — the counterweight to `iob` (see mealBolusHeldByIob).
+    const cob = carbsOnBoard(meals ?? [], nowMs);
     const guard = computeGuard({ glucoseMgdl: cur, trend, staleMin, iobUnits: iob, recentHypo, minSinceRescue, profile: gp });
     const hint = situationHint(guard, lang);
 
@@ -377,7 +380,7 @@ Deno.serve(async (req: Request) => {
     // was reachable from here exactly as it was from the home screen. The insulin already in keeps
     // going whatever the number on screen says.
     const mealUnitsRaw = mealBolusUnits(mealCarbs, gp);
-    const mealHeld = mealUnitsRaw > 0 && mealBolusHeldByIob(cur, iob, gp);
+    const mealHeld = mealUnitsRaw > 0 && mealBolusHeldByIob(cur, iob, gp, cob);
     const mealUnits = mealHeld ? 0 : mealUnitsRaw;
     // Signal lost (stale reading) → forbid any dose off it and override the action with a fingerstick
     // prompt, exactly like coach. Otherwise a 5–15 min-old high could yield a correction the app's own
@@ -403,7 +406,7 @@ Deno.serve(async (req: Request) => {
           ? "Señal perdida: reconecta el sensor (acerca el teléfono que lo escanea, vuelve a escanear); si no vuelve, hazte una punción capilar antes de cualquier decisión."
           : "Signal perdu : reconnecte le capteur (rapproche le téléphone qui le scanne, re-scanne) ; s'il ne revient pas, fais un test au doigt avant toute décision.")
         : mealHeld
-          ? mealBolusHeldLine(cur as number, iob, gp, lang)
+          ? mealBolusHeldLine(cur as number, iob, gp, lang, cob)
           : combinedActionLine(guard, mealUnits, lang, gp);
       const label = lang === "es" ? "Acción" : "Action";
       text = `${reply}\n\n${label} : ${line}`;

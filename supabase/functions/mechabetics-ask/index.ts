@@ -13,6 +13,7 @@ import {
   mealBolusUnits,
   mealBolusHeldByIob,
   mealBolusHeldLine,
+  carbsOnBoard,
   combinedActionLine,
   situationHint,
   stripInsulinNumbers,
@@ -362,6 +363,9 @@ Deno.serve(async (req: Request) => {
     const recentHypo = hasTs ? recentHypoFrom(rds, nowMs) : rds.some((r) => r.value > 0 && r.value < 70);
     // Sugar already taken recently? Don't re-recommend sugar for a low that's already being treated.
     const minSinceRescue = minutesSinceLastRescue(meals, nowMs);
+    // Sugar still on board — the counterweight to `iob` when asking whether a fall is coming. Not
+    // fed to computeGuard: carbs on board say where the glucose is heading, never how much insulin.
+    const cob = carbsOnBoard(meals ?? [], nowMs);
     const guard = computeGuard({ glucoseMgdl: cur, trend, staleMin, iobUnits: iob, recentHypo, minSinceRescue, profile: gp });
     const hint = situationHint(guard, lang);
 
@@ -416,7 +420,9 @@ Deno.serve(async (req: Request) => {
     // was reachable from here exactly as it was from the home screen. The insulin already in keeps
     // going whatever the number on screen says.
     const mealUnitsRaw = mealStated ? mealBolusUnits(mealCarbs, gp) : 0;
-    const mealHeld = mealUnitsRaw > 0 && mealBolusHeldByIob(cur, iob, gp);
+    // Weighed against the FOOD too: judged on the insulin alone this refused the bolus for a whole
+    // menu because a dose from three hours earlier was still tailing off (the McDo report).
+    const mealHeld = mealUnitsRaw > 0 && mealBolusHeldByIob(cur, iob, gp, cob);
     const mealUnits = mealHeld ? 0 : mealUnitsRaw;
     const mealEstimated = !!mealCarbs && !mealStated;
     // An ANNOUNCED future meal ("je vais manger un McDo"): its bolus happens AT EATING TIME, never
@@ -508,12 +514,12 @@ Deno.serve(async (req: Request) => {
         const line = mealPlanned && (mealCarbs ?? 0) > 0
           ? mealPlanLine(planMealDose({
               glucoseMgdl: cur, trend, staleMin, iobUnits: iob,
-              carbsG: mealCarbs, description: parsed.meal?.description,
+              carbsG: mealCarbs, description: parsed.meal?.description, cobGrams: cob,
               minutesUntilMeal: minutesUntil(parsed.meal?.minutesAgo),
               minSinceRescue, recentHypo, profile: gp,
             }), lang, gp)
           : mealHeld
-            ? mealBolusHeldLine(cur as number, iob, gp, lang)
+            ? mealBolusHeldLine(cur as number, iob, gp, lang, cob)
             : combinedActionLine(guardForAction, mealUnits, lang, gp, mealPlanned);
         const label = lang === "es" ? "Acción" : "Action";
         text = `${reply}\n\n${label} : ${line}`;

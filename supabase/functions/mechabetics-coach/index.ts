@@ -29,6 +29,7 @@ import {
   mealBolusPlan,
   mealBolusHeldByIob,
   mealBolusHeldLine,
+  carbsOnBoard,
   planMealDose,
   mealPlanLine,
   plannedMealNote,
@@ -278,9 +279,17 @@ function accountingLine(insulin: any[], meals: any[], iob: number, nowMs: number
   if (dayMeals.length) {
     const m = dayMeals[0];
     const ago = agoLabel(Math.round((nowMs - m.t) / 60000), lang);
-    mealPart = es
+    // The carbs still digesting, next to the insulin still active — the two halves of the balance the
+    // action line is decided on. Reported: an analysis that named "≈ 4 u encore active" and the meal
+    // eaten 16 min earlier, then announced a coming hypo, gave the reader nothing to weigh it
+    // against. Whichever way the verdict goes, both numbers behind it are now on screen.
+    const cob = Math.round(carbsOnBoard(meals ?? [], nowMs));
+    const cobPart = cob > 0
+      ? (es ? ` · ~${cob} g de carbohidratos aún digiriéndose` : ` · ~${cob} g de glucides encore en digestion`)
+      : "";
+    mealPart = (es
       ? `${dayMeals.length} comida(s) registrada(s) hoy (última « ${m.desc} » ${ago})`
-      : `${dayMeals.length} repas loggé(s) aujourd'hui (dernier « ${m.desc} » ${ago})`;
+      : `${dayMeals.length} repas loggé(s) aujourd'hui (dernier « ${m.desc} » ${ago})`) + cobPart;
   } else {
     mealPart = es ? "ninguna comida registrada" : "aucun repas loggé";
   }
@@ -965,6 +974,10 @@ Deno.serve(async (req: Request) => {
         : `HYPO RÉCENTE (calculé par le système) : il y a eu une valeur sous 70 dans les 75 dernières minutes. Prends-le en compte pour expliquer ce qui se passe maintenant (un rebond après un resucrage est attendu) et mentionne-le.`)
       : "";
     const minSinceRescue = minutesSinceLastRescue(meals ?? [], nowMs);
+    // Sugar still on board, the counterweight to `iob` in every "where is this heading" question
+    // below. computeGuard itself is deliberately NOT given it: carbs on board answer where the
+    // glucose is going, they never make a correction bigger.
+    const cob = carbsOnBoard(meals ?? [], nowMs);
     const guard = computeGuard({ glucoseMgdl: cur, trend, staleMin, iobUnits: iob, recentHypo, minSinceRescue, profile: gp });
     const hint = situationHint(guard, lang);
 
@@ -1034,13 +1047,16 @@ Deno.serve(async (req: Request) => {
         // planMealDose has always checked this; the eaten-meal branch below goes to
         // combinedActionLine, which sums units and has never seen a glucose or an IOB. That is how
         // "3 u de Fiasp" was answered at 85 mg/dL with 3.4 u still working.
-        if (plan.units > 0 && mealBolusHeldByIob(cur, iob, gp)) {
-          return mealBolusHeldLine(cur as number, iob, gp, lang);
+        // The food already eaten is weighed against that insulin (cob) — judged on the insulin
+        // alone, this held the bolus for a ~110 g menu because a dose from three hours before was
+        // still tailing off.
+        if (plan.units > 0 && mealBolusHeldByIob(cur, iob, gp, cob)) {
+          return mealBolusHeldLine(cur as number, iob, gp, lang, cob);
         }
         if (plan.planned && plan.carbsG != null) {
           return mealPlanLine(planMealDose({
             glucoseMgdl: cur, trend, staleMin, iobUnits: iob,
-            carbsG: plan.carbsG, description: null,
+            carbsG: plan.carbsG, description: null, cobGrams: cob,
             minSinceRescue, recentHypo, profile: gp,
           }), lang, gp, true); // concise: the ANALYSE card is a summary + ONE action line
         }
