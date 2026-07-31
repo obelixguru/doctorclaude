@@ -40,6 +40,7 @@ import {
   overCeilingUnits,
   mealBolusHeldByIob,
   mealBolusHeldLine,
+  eatenToTreatALow,
 } from "./doseGuard.ts";
 
 const prof = { carbRatio: 12, correctionFactor: 50, targetMgdl: 110, weightKg: 38, rapidInsulin: "NovoRapid" };
@@ -1025,4 +1026,41 @@ test("an unidentified meal still gets a sentence", () => {
   const g = computeGuard({ glucoseMgdl: 150, trend: "rising", staleMin: 1, iobUnits: 0, recentHypo: false, profile: prof });
   assert.match(combinedActionLine(g, 2, "fr", prof, false, null), /pour le repas/);
   assert.match(combinedActionLine(g, 2, "es", prof, false, null), /para la comida/);
+});
+
+// ─── The 7up incident, 31 July 2026. A child fell to 57 mg/dL at 23:11; the can of 7up drunk to
+// climb out of it was read as a meal and answered with 1 u of rapid insulin. isHypoRescue knows
+// "soda", "coca" and "limonade" — it did not know "7up". Brand vocabulary is never complete. ───────
+
+test("food eaten to climb out of a low is never answered with insulin", () => {
+  const child = { carbRatio: 16, correctionFactor: 58, targetMgdl: 120, weightKg: 40, rapidInsulin: "Fiasp" };
+  const T = new Date("2026-07-30T22:37:00Z").getTime();   // the can
+  const now = T + 21 * 60_000;
+  // The real curve: 81 -> 57 -> back up, with the drink logged during the climb.
+  const curve: { ts: number; value: number }[] = [];
+  [[-32, 81], [-30, 73], [-28, 63], [-26, 57], [-22, 57], [-18, 64], [-12, 71], [-6, 78], [0, 74], [8, 90], [16, 111]]
+    .forEach(([m, v]) => curve.push({ ts: T + (m as number) * 60_000, value: v as number }));
+  const meal = [{ ts: "2026-07-30T22:37:00+00:00", description: "canette 7up", carbs_g: 16, planned: false }];
+
+  // The word list alone does NOT catch it — which is exactly why the curve has to.
+  assert.equal(isHypoRescue("canette 7up", 16), false);
+  assert.equal(eatenToTreatALow(T, curve), true);
+
+  assert.equal(findUncoveredMeal(meal as any, [], now, child, curve), null);
+  const plan = mealBolusPlan(meal as any, [], now, child, 180, curve);
+  assert.equal(plan.units, 0, "no insulin for a rescue");
+});
+
+test("the same drink at a normal glucose IS a meal to cover", () => {
+  const child = { carbRatio: 16, correctionFactor: 58, targetMgdl: 120, weightKg: 40, rapidInsulin: "Fiasp" };
+  const T = new Date("2026-07-30T15:00:00Z").getTime();
+  const flat = [-30, -20, -10, 0, 10].map((m) => ({ ts: T + m * 60_000, value: 140 }));
+  const meal = [{ ts: "2026-07-30T15:00:00+00:00", description: "canette 7up", carbs_g: 16, planned: false }];
+  assert.equal(eatenToTreatALow(T, flat), false);
+  assert.equal(mealBolusPlan(meal as any, [], T + 20 * 60_000, child, 180, flat).units, 1);
+});
+
+test("no readings at all: the curve cannot overrule, and nothing changes", () => {
+  assert.equal(eatenToTreatALow(Date.now(), []), false);
+  assert.equal(eatenToTreatALow(Date.now(), null), false);
 });

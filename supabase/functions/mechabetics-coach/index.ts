@@ -996,7 +996,7 @@ Deno.serve(async (req: Request) => {
         // WHICH meal to dose, and when — the ANALYSE button used to pass a hardcoded 0 here, so it
         // could never name a dose for food: 120 g logged and unbolused at 175 mg/dL came back as
         // "in range, nothing to correct".
-        const plan = mealBolusPlan(meals ?? [], insulin ?? [], nowMs, gp);
+        const plan = mealBolusPlan(meals ?? [], insulin ?? [], nowMs, gp, 180, sorted);
         proseDoseCeiling = guard.maxInsulinUnits + Math.max(0, plan.units || 0) + contextUnits;
         // A MEAL BOLUS IS NOT DUE WHEN THE INSULIN ALREADY IN IS ABOUT TO TAKE THE GLUCOSE LOW.
         // planMealDose has always checked this; the eaten-meal branch below goes to

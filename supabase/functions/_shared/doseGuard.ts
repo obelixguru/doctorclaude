@@ -1055,6 +1055,36 @@ export interface UncoveredMeal {
 type MealRow = { ts: string | number; carbs_g?: number | null; carbsG?: number | null; description?: string | null; planned?: boolean };
 type DoseRow = { ts: string | number; units: number; kind?: string | null };
 
+// A hypo rescue eaten while the glucose was LOW is a rescue whatever it is called. The word list
+// below it (RESCUE_WORDS / mealCarbSpeed) knows "soda", "coca", "limonade" — and did not know "7up",
+// so a can drunk to climb out of 57 mg/dL was read as a meal and answered with 1 u of rapid insulin
+// for a 40 kg child on his way up from a hypo. Brand vocabulary can never be complete; the glucose
+// curve at the moment of eating cannot be argued with.
+/** At or below this when they ate, and it was treatment, not a meal. */
+export const RESCUE_GLUCOSE_MGDL = 80;
+/** A low this recently makes whatever followed it a rescue. */
+export const RESCUE_LOOKBACK_MIN = 45;
+
+/** Was this eaten to fix a low? Reads the curve around the moment of eating. */
+export function eatenToTreatALow(
+  mealTs: number,
+  readings: { ts: number; value: number }[] | null | undefined,
+): boolean {
+  const rs = (readings || []).filter((r) => r && Number(r.value) > 0 && Number.isFinite(Number(r.ts)));
+  if (!rs.length) return false;
+  // A genuine low shortly BEFORE the food (the reason it was eaten), or still low just after.
+  const from = mealTs - RESCUE_LOOKBACK_MIN * 60000;
+  const to = mealTs + 10 * 60000;
+  if (rs.some((r) => Number(r.ts) >= from && Number(r.ts) <= to && Number(r.value) < LOW_MGDL)) return true;
+  // Or simply low-ish at the moment itself: nobody boluses a snack taken at 72 mg/dL.
+  let nearest: { dt: number; v: number } | null = null;
+  for (const r of rs) {
+    const dt = Math.abs(Number(r.ts) - mealTs);
+    if (dt <= 15 * 60000 && (!nearest || dt < nearest.dt)) nearest = { dt, v: Number(r.value) };
+  }
+  return !!nearest && nearest.v <= RESCUE_GLUCOSE_MGDL;
+}
+
 /** The most recent EATEN meal that (a) was substantial (≥ UNCOVERED_MEAL_MIN_CARBS g), (b) is still
  *  within its carb-speed digestion window, and (c) was NOT covered by a rapid dose near its time.
  *  Returns null when there's no such meal. ts may be ISO or epoch ms; carbs read from carbs_g/carbsG. */
@@ -1063,6 +1093,8 @@ export function findUncoveredMeal(
   doses: DoseRow[],
   nowMs: number,
   profile: GuardProfile | null,
+  /** The glucose curve, so food eaten to treat a low is never answered with insulin. */
+  readings?: { ts: number; value: number }[] | null,
 ): UncoveredMeal | null {
   const cr = profile?.carbRatio && profile.carbRatio > 0 ? profile.carbRatio : null;
   let best: UncoveredMeal | null = null;
@@ -1077,6 +1109,8 @@ export function findUncoveredMeal(
     if (!Number.isFinite(carbs) || carbs < UNCOVERED_MEAL_MIN_CARBS) continue;
     const mt = typeof m.ts === "number" ? m.ts : new Date(m.ts).getTime();
     if (!Number.isFinite(mt)) continue;
+    // THE CURVE OVERRULES THE WORDS. Eaten while low = treatment for that low, never a meal to cover.
+    if (eatenToTreatALow(mt, readings)) continue;
     const minsAgo = (nowMs - mt) / 60000;
     if (minsAgo < 0) continue; // not eaten yet
     const speed = mealCarbSpeed(m.description);
@@ -1163,7 +1197,7 @@ export function inRangeActionLine(
   iobUnits = 0,
 ): string {
   const es = lang === "es";
-  const uncovered = findUncoveredMeal(meals, doses, nowMs, profile);
+  const uncovered = findUncoveredMeal(meals, doses, nowMs, profile, readings);
   const recentMeal = uncovered && uncovered.minutesAgo <= 45 ? uncovered : null;
   const pred = predictiveAdvice(readings, nowMs);
 
@@ -1285,8 +1319,9 @@ export function mealBolusPlan(
   nowMs: number,
   profile: GuardProfile | null,
   announcedWindowMin = 180,
+  readings?: { ts: number; value: number }[] | null,
 ): MealBolusPlan {
-  const uncovered = findUncoveredMeal(meals, doses, nowMs, profile);
+  const uncovered = findUncoveredMeal(meals, doses, nowMs, profile, readings);
   if (uncovered) {
     return {
       units: mealBolusUnits(uncovered.carbsG, profile), planned: false, carbsG: uncovered.carbsG,
