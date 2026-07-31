@@ -9,6 +9,8 @@ import {
   activeIob,
   insulinActionMinutes,
   mealBolusUnits,
+  mealBolusHeldByIob,
+  mealBolusHeldLine,
   combinedActionLine,
   situationHint,
   minutesSinceLastRescue,
@@ -370,7 +372,13 @@ Deno.serve(async (req: Request) => {
     // ----- CODE OWNS THE DOSE -----
     const mealCarbs = (parsed.meal && typeof parsed.meal === "object" && Number.isFinite(Number(parsed.meal.carbsG)))
       ? Math.min(300, Math.max(0, Math.round(Number(parsed.meal.carbsG)))) : null; // clamp a hallucinated carb count
-    const mealUnits = mealBolusUnits(mealCarbs, gp);
+    // NO MEAL BOLUS INTO A FALL ALREADY OWED. The dashboard got this guard; the voice and the photo
+    // did not, and they name doses too — so "3 u pour ce repas" at 85 mg/dL with 3.4 u still working
+    // was reachable from here exactly as it was from the home screen. The insulin already in keeps
+    // going whatever the number on screen says.
+    const mealUnitsRaw = mealBolusUnits(mealCarbs, gp);
+    const mealHeld = mealUnitsRaw > 0 && mealBolusHeldByIob(cur, iob, gp);
+    const mealUnits = mealHeld ? 0 : mealUnitsRaw;
     // Signal lost (stale reading) → forbid any dose off it and override the action with a fingerstick
     // prompt, exactly like coach. Otherwise a 5–15 min-old high could yield a correction the app's own
     // NO SIGNAL state contradicts.
@@ -394,7 +402,9 @@ Deno.serve(async (req: Request) => {
         ? (lang === "es"
           ? "Señal perdida: reconecta el sensor (acerca el teléfono que lo escanea, vuelve a escanear); si no vuelve, hazte una punción capilar antes de cualquier decisión."
           : "Signal perdu : reconnecte le capteur (rapproche le téléphone qui le scanne, re-scanne) ; s'il ne revient pas, fais un test au doigt avant toute décision.")
-        : combinedActionLine(guard, mealUnits, lang, gp);
+        : mealHeld
+          ? mealBolusHeldLine(cur as number, iob, gp, lang)
+          : combinedActionLine(guard, mealUnits, lang, gp);
       const label = lang === "es" ? "Acción" : "Action";
       text = `${reply}\n\n${label} : ${line}`;
       voiceText = `${voice} ${line}`.trim();

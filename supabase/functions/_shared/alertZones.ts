@@ -25,6 +25,8 @@ export const WARN_DEADBAND = 2;
 /** While already in a red zone, only a further whole step AWAY from range alerts again. */
 export const STEP_HIGH = 10;
 export const STEP_LOW = 5;
+/** How far back toward range a reading must have moved before its amber warning is dropped. */
+export const AMBER_RETURN_MGDL = 4;
 
 export type Zone = "red_low" | "amber_low" | "normal" | "amber_high" | "red_high";
 
@@ -96,10 +98,20 @@ export function alertMessage(prev: number, cur: number, name: string): string | 
       return a.severe
         ? `🚨 <b>Glycémie de ${name} : ${cur} mg/dL — TRÈS BASSE</b>\nResucrage immédiat (15 g de sucre rapide).`
         : `🚨 <b>Glycémie de ${name} : ${cur} mg/dL — basse</b>`;
+    // THE AMBER BANDS ONLY WARN ABOUT A GLUCOSE STILL HEADING OUT OF RANGE. Announcing "presque
+    // haute" to a group watching a child come down through 175 is noise, and noise is what makes a
+    // channel stop being read. Same rule as the in-app banner, with a stricter test: this suppresses
+    // a PUSH to people who are not looking at their phone, so a coarse prev→cur step has to move by
+    // a real margin, not by one point of sensor jitter. The RED bands are untouched — they are about
+    // where the glucose IS, not where it is going.
     case "amber_low":
-      return `⚠️ <b>Glycémie de ${name} : ${cur} mg/dL — presque basse</b>`;
+      return cur - prev >= AMBER_RETURN_MGDL
+        ? null
+        : `⚠️ <b>Glycémie de ${name} : ${cur} mg/dL — presque basse</b>`;
     case "amber_high":
-      return `⚠️ <b>Glycémie de ${name} : ${cur} mg/dL — presque haute</b>`;
+      return prev - cur >= AMBER_RETURN_MGDL
+        ? null
+        : `⚠️ <b>Glycémie de ${name} : ${cur} mg/dL — presque haute</b>`;
     case "red_high":
       return `🚨 <b>Glycémie de ${name} : ${cur} mg/dL — haute</b>`;
     default:

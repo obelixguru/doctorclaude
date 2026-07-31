@@ -11,6 +11,8 @@ import {
   insulinActionMinutes,
   iobSystemLine,
   mealBolusUnits,
+  mealBolusHeldByIob,
+  mealBolusHeldLine,
   combinedActionLine,
   situationHint,
   stripInsulinNumbers,
@@ -409,7 +411,13 @@ Deno.serve(async (req: Request) => {
     // Food fallback: only bolus carbs the user actually STATED. A vague/guessed carb count gets a
     // "log it for a precise dose" nudge instead of a firm number (safety > convenience).
     const mealStated = !!(parsed.meal && typeof parsed.meal === "object" && parsed.meal.basis === "stated");
-    const mealUnits = mealStated ? mealBolusUnits(mealCarbs, gp) : 0;
+    // NO MEAL BOLUS INTO A FALL ALREADY OWED. The dashboard got this guard; the voice and the photo
+    // did not, and they name doses too — so "3 u pour ce repas" at 85 mg/dL with 3.4 u still working
+    // was reachable from here exactly as it was from the home screen. The insulin already in keeps
+    // going whatever the number on screen says.
+    const mealUnitsRaw = mealStated ? mealBolusUnits(mealCarbs, gp) : 0;
+    const mealHeld = mealUnitsRaw > 0 && mealBolusHeldByIob(cur, iob, gp);
+    const mealUnits = mealHeld ? 0 : mealUnitsRaw;
     const mealEstimated = !!mealCarbs && !mealStated;
     // An ANNOUNCED future meal ("je vais manger un McDo"): its bolus happens AT EATING TIME, never
     // now — combinedActionLine words it accordingly, and the estimated case gets plannedMealNote.
@@ -504,7 +512,9 @@ Deno.serve(async (req: Request) => {
               minutesUntilMeal: minutesUntil(parsed.meal?.minutesAgo),
               minSinceRescue, recentHypo, profile: gp,
             }), lang, gp)
-          : combinedActionLine(guardForAction, mealUnits, lang, gp, mealPlanned);
+          : mealHeld
+            ? mealBolusHeldLine(cur as number, iob, gp, lang)
+            : combinedActionLine(guardForAction, mealUnits, lang, gp, mealPlanned);
         const label = lang === "es" ? "Acción" : "Action";
         text = `${reply}\n\n${label} : ${line}`;
         voiceText = `${voice} ${line}`.trim();

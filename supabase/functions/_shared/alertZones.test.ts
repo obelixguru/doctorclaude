@@ -72,3 +72,16 @@ test("messages name the patient and match the zone", () => {
   assert.match(alertMessage(65, 58, "Ana") ?? "", /🚨/);
   assert.equal(alertMessage(120, 130, "Ana"), null);
 });
+
+test("an amber zone moving BACK toward range no longer pushes", () => {
+  // Same principle as the in-app banner: a warning about a glucose already coming home is noise,
+  // and a channel that cries wolf stops being read. Red zones keep alerting whatever the direction.
+  assert.equal(alertMessage(182, 175, "Ryan"), null);        // coming down through the amber high
+  assert.notEqual(alertMessage(168, 175, "Ryan"), null);     // still climbing into it
+  assert.equal(alertMessage(61, 66, "Ryan"), null);          // climbing out of the amber low
+  assert.notEqual(alertMessage(72, 66, "Ryan"), null);       // still falling into it
+  // A red low still fires on the way IN, whatever the amber rule does above it.
+  assert.notEqual(alertMessage(66, 57, "Ryan"), null);
+  // (52 -> 57 is silent because re-alerting only fires on a further step AWAY from range — the
+  // pre-existing rule that keeps a sitting hypo from re-ringing every five minutes.)
+});
