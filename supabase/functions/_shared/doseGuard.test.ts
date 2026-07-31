@@ -43,6 +43,8 @@ import {
   mealBolusHeldLine,
   eatenToTreatALow,
   speakable,
+  glucoseBalance,
+  balanceSystemLine,
 } from "./doseGuard.ts";
 
 const prof = { carbRatio: 12, correctionFactor: 50, targetMgdl: 110, weightKg: 38, rapidInsulin: "NovoRapid" };
@@ -1344,4 +1346,62 @@ test("speakable: what the engine writes is not what the TTS should read", () => 
   const warned = speakable("⚠️ L'insuline déjà active va encore faire baisser", "fr");
   assert.doesNotMatch(warned, /⚠️/);
   assert.match(speakable("Para ~36 g, ≈ 9 terrón(es): 3 u", "es"), /unos 9 terrones de azúcar/);
+});
+
+// ─── The balance is the app's one calculation. Everything that asks "where is this heading" reads
+// it; the model is handed it as a fact. A widget that compares the two forces WITHOUT the current
+// glucose can say "insulin leads" at 250 and at 80 with the same conviction — the landing is what
+// makes the verdict mean something. ─────────────────────────────────────────────────────────────
+
+test("glucoseBalance: the two forces and where they land", () => {
+  // The McDonald's moment: 121, 3.85 u still active, ~105 g still digesting.
+  const b = glucoseBalance(121, 3.85, 105, mcdo)!;
+  assert.equal(b.dropMgdl, 154);                       // 3.85 × 40
+  assert.equal(b.riseMgdl, Math.round((105 / 12) * 40 * 0.7));
+  assert.equal(b.landingMgdl, 121 + b.riseMgdl - b.dropMgdl);
+  assert.ok(b.headroomMgdl > 0, "the food wins this one");
+  assert.equal(b.winner, "carbs");
+  // Same insulin, nothing eaten: the other way round, and under 70.
+  const alone = glucoseBalance(121, 3.85, 0, mcdo)!;
+  assert.equal(alone.winner, "insulin");
+  assert.ok(alone.headroomMgdl < 0);
+  // THE GLUCOSE IS PART OF THE VERDICT. Identical forces, two very different situations — which is
+  // exactly what a units-vs-units comparison cannot see.
+  const high = glucoseBalance(250, 3.85, 105, mcdo)!;
+  assert.equal(high.winner, "carbs");                  // same tug...
+  assert.ok(high.landingMgdl > 250);                   // ...but it lands somewhere else entirely
+});
+
+test("glucoseBalance: refuses to pretend when it cannot compute", () => {
+  assert.equal(glucoseBalance(null, 2, 30, mcdo), null);      // no glucose
+  assert.equal(glucoseBalance(120, 2, 30, null), null);       // no ratios at all
+  // No carb ratio: the food counts as zero — the safe side, never a guessed rise.
+  const noIcr = { carbRatio: null as any, correctionFactor: 40, targetMgdl: 110, weightKg: 60, rapidInsulin: "Fiasp" };
+  const b = glucoseBalance(120, 2, 60, noIcr)!;
+  assert.equal(b.riseMgdl, 0);
+  assert.equal(b.landingMgdl, 40);
+});
+
+test("the balance the model is handed carries both sides and the landing", () => {
+  const fr = balanceSystemLine(glucoseBalance(121, 3.85, 105, mcdo), "fr");
+  assert.match(fr, /121 mg\/dL/);
+  assert.match(fr, /\+245 mg\/dL/);     // the sugar's push
+  assert.match(fr, /−154 mg\/dL/);      // the insulin's pull
+  assert.match(fr, /le sucre l'emporte/);
+  assert.match(fr, /NE le recalcule PAS/);
+  assert.match(balanceSystemLine(glucoseBalance(121, 3.85, 105, mcdo), "es"), /el azúcar va ganando/);
+  assert.equal(balanceSystemLine(null, "fr"), ""); // nothing to say beats something invented
+});
+
+test("every 'where is this heading' answer reads the SAME balance", () => {
+  // The regression this consolidation exists to prevent: three inline copies drifting apart.
+  const cases: [number, number, number][] = [[121, 3.85, 105], [85, 3.4, 0], [200, 4, 60], [95, 3, 80]];
+  for (const [g, iob, cob] of cases) {
+    const b = glucoseBalance(g, iob, cob, mcdo)!;
+    assert.equal(mealBolusHeldByIob(g, iob, mcdo, cob), b.headroomMgdl < 0,
+      `the meal-bolus hold disagrees with the balance at ${g}/${iob}u/${cob}g`);
+    const plan = planMealDose({ glucoseMgdl: g, trend: "stable", staleMin: 1, iobUnits: iob, carbsG: 30, cobGrams: cob, profile: mcdo });
+    assert.equal(plan.floorMgdl, b.landingMgdl,
+      `the plan's floor disagrees with the balance at ${g}/${iob}u/${cob}g`);
+  }
 });

@@ -879,6 +879,7 @@ class MainActivity : ComponentActivity() {
                         )
                         Tab.INSULIN -> InsulinScreen(
                             state.patientId, meals, ai, profile, lang, store,
+                            currentMgdl = state.current?.valueMgDl,
                             header = { tabHeader(stringsFor(lang).tabInsulin, false) },
                             onDataChanged = { dataVersion++ },
                             openEditId = openDoseId, onOpenEditConsumed = { openDoseId = null },

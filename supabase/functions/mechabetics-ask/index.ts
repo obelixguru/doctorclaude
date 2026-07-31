@@ -10,6 +10,8 @@ import {
   activeIob,
   insulinActionMinutes,
   iobSystemLine,
+  glucoseBalance,
+  balanceSystemLine,
   mealBolusUnits,
   mealBolusHeldByIob,
   mealBolusHeldLine,
@@ -363,7 +365,11 @@ Deno.serve(async (req: Request) => {
     const guard = computeGuard({ glucoseMgdl: cur, trend, staleMin, iobUnits: iob, recentHypo, minSinceRescue, profile: gp });
     const hint = situationHint(guard, lang);
 
-    const insCtx = insulinContext(insulinDoses, iob, dia, nowMs, lang);
+    const balance = glucoseBalance(cur, iob, cob, gp);
+    // The sugar side of insCtx, which never had one. Appended to it so the model reads the two
+    // forces together instead of hearing about the insulin and guessing about the food.
+    const balCtx = balanceSystemLine(balance, lang);
+    const insCtx = [insulinContext(insulinDoses, iob, dia, nowMs, lang), balCtx].filter(Boolean).join(" ");
     const actCtx = activityContext(activity, lang);
     // Match the client's NO SIGNAL window (5 min): a stale last reading means the LIVE value is
     // unknown — the spoken reply must not assert "tu es à X", only the LAST KNOWN value.

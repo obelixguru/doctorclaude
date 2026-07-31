@@ -13,6 +13,8 @@ import {
   insulinActionMinutes,
   iobStatusPhrase,
   iobSystemLine,
+  glucoseBalance,
+  balanceSystemLine,
   combinedActionLine,
   situationHint,
   stripInsulinNumbers,
@@ -968,6 +970,11 @@ Deno.serve(async (req: Request) => {
     // below. computeGuard itself is deliberately NOT given it: carbs on board answer where the
     // glucose is going, they never make a correction bigger.
     const cob = carbsOnBoard(meals ?? [], nowMs);
+    // THE TUG-OF-WAR IS THE WHOLE PICTURE, so the model gets it as a fact — where the glucose is,
+    // what the food still has to give, what the insulin still has to take, and where that lands.
+    // It had an authoritative line about the insulin and nothing at all about the sugar, so its
+    // narrative could only ever describe one side of a two-sided race.
+    const balance = glucoseBalance(cur, iob, cob, gp);
     const guard = computeGuard({ glucoseMgdl: cur, trend, staleMin, iobUnits: iob, recentHypo, minSinceRescue, profile: gp });
     const hint = situationHint(guard, lang);
 
@@ -1060,7 +1067,8 @@ Deno.serve(async (req: Request) => {
     const prompt = buildPrompt(
       cur, stats, lang,
       ctx + (mealNudgeNote ? " " + mealNudgeNote : "") + (spikeNote ? " " + spikeNote : "")
-        + (recentHypoNote ? " " + recentHypoNote : ""),
+        + (recentHypoNote ? " " + recentHypoNote : "")
+        + (balanceSystemLine(balance, lang) ? " " + balanceSystemLine(balance, lang) : ""),
       swing, pr, hint, recent, stability, signalLost, staleMin, sensorExpired,
       actionLine, noDoseDue(guard), sorted,
     );

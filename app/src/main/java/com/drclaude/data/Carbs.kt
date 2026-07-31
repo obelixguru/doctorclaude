@@ -95,3 +95,55 @@ fun carbsOnBoard(meals: List<AnalysisService.RecentMeal>, nowMs: Long): Double =
     meals.sumOf { m ->
         if (m.ts > nowMs) 0.0 else carbsStillActive(m.carbsG, m.description, m.ts, nowMs)
     }.coerceAtLeast(0.0)
+
+/** Share of the carbs-still-digesting we bank on when asking where the glucose is heading.
+ *  MIRRORS COB_TRUST_FRACTION in supabase/functions/_shared/doseGuard.ts — change both together.
+ *  Carb absorption is less predictable than insulin action, so the two sides of the balance do not
+ *  get equal trust: under-counting food keeps a warning up, over-counting it silences a real one. */
+private const val COB_TRUST_FRACTION = 0.7
+
+/**
+ * The tug-of-war as one number — the mirror of `glucoseBalance` on the server.
+ *
+ * Sugar pulls up, insulin pulls down, and the only question that matters is where the rope ends up
+ * FROM WHERE THE GLUCOSE IS NOW. Comparing the two forces without the current value is how a widget
+ * can announce "insulin leads" at 250 and at 80 with equal conviction: true both times, and useful
+ * neither time. `landingMgdl` is deliberately UNCLAMPED — a negative landing is exactly the signal
+ * that the fall owed is bigger than the distance to zero.
+ *
+ * Returns null when it cannot be computed honestly (no reading, or no correction factor to turn
+ * units into mg/dL). A caller that gets null must not pretend the sides are even.
+ */
+data class GlucoseBalance(
+    val glucoseMgdl: Int,
+    val iobUnits: Double,
+    val cobGrams: Double,
+    val dropMgdl: Int,      // iob × correction factor
+    val riseMgdl: Int,      // (cob / carb ratio) × correction factor, discounted
+    val landingMgdl: Int,   // glucose + rise − drop
+    val headroomMgdl: Int,  // how far above 70 that lands (negative = under)
+) {
+    val sugarWins get() = riseMgdl > dropMgdl * 1.15
+    val insulinWins get() = dropMgdl > riseMgdl * 1.15
+}
+
+fun glucoseBalance(
+    glucoseMgdl: Int?,
+    iobUnits: Double,
+    cobGrams: Double,
+    carbRatio: Int?,
+    correctionFactor: Int?,
+): GlucoseBalance? {
+    val g = glucoseMgdl ?: return null
+    if (g <= 0) return null
+    val isf = correctionFactor?.takeIf { it > 0 } ?: return null
+    val drop = iobUnits.coerceAtLeast(0.0) * isf
+    // No carb ratio: the food counts as zero here — the safe side, never a guessed rise.
+    val rise = carbRatio?.takeIf { it > 0 }?.let { cobGrams.coerceAtLeast(0.0) / it * isf * COB_TRUST_FRACTION } ?: 0.0
+    val landing = g + rise - drop
+    return GlucoseBalance(
+        glucoseMgdl = g, iobUnits = iobUnits.coerceAtLeast(0.0), cobGrams = cobGrams.coerceAtLeast(0.0),
+        dropMgdl = Math.round(drop).toInt(), riseMgdl = Math.round(rise).toInt(),
+        landingMgdl = Math.round(landing).toInt(), headroomMgdl = Math.round(landing).toInt() - 70,
+    )
+}

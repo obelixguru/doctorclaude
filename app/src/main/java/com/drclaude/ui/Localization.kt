@@ -871,6 +871,9 @@ data class BgStrings(
     val mealDoseTooLate: String,
     // Aliment sans glucides : c'est une RÉPONSE (rien à couvrir), pas une panne.
     val mealDoseNoCarbs: String,
+    // Tir-à-la-corde : OÙ ça atterrit. %1$d = glycémie actuelle, %2$d = valeur d'arrivée.
+    val tugLands: String,
+    val tugLandsLow: String,
 )
 
 private val BgStringsFr = BgStrings(
@@ -913,6 +916,8 @@ private val BgStringsFr = BgStrings(
     mealDoseFailed = "Dose indisponible — réessaie dans un instant.",
     mealDoseTooLate = "Repas déjà mangé — la dose d'un repas se calcule avant de le manger.",
     mealDoseNoCarbs = "Pas de glucides à couvrir — aucune insuline pour ce repas.",
+    tugLands = "À ce rythme : %1\$d → ~%2\$d mg/dL",
+    tugLandsLow = "À ce rythme : %1\$d → sous 70. Garde du sucre à portée.",
 )
 
 private val BgStringsEs = BgStrings(
@@ -955,6 +960,8 @@ private val BgStringsEs = BgStrings(
     mealDoseFailed = "Dosis no disponible — inténtalo de nuevo en un momento.",
     mealDoseTooLate = "Comida ya ingerida — la dosis de una comida se calcula antes de comerla.",
     mealDoseNoCarbs = "Sin carbohidratos que cubrir — ninguna insulina para esta comida.",
+    tugLands = "A este ritmo: %1\$d → ~%2\$d mg/dL",
+    tugLandsLow = "A este ritmo: %1\$d → por debajo de 70. Ten azúcar a mano.",
 )
 
 fun bgStringsFor(lang: Lang): BgStrings = if (lang == Lang.ES) BgStringsEs else BgStringsFr

@@ -28,6 +28,8 @@ import com.drclaude.data.CredentialsStore
 import com.drclaude.data.insulinActionMinutes
 import com.drclaude.data.DEFAULT_INSULIN_ACTION_MIN
 import com.drclaude.data.carbsOnBoard
+import com.drclaude.data.GlucoseBalance
+import com.drclaude.data.glucoseBalance
 import com.drclaude.data.carbsStillActive
 import com.drclaude.ui.theme.*
 import kotlinx.coroutines.launch
@@ -56,6 +58,9 @@ fun InsulinScreen(
     profileSvc: ProfileService,
     lang: Lang,
     store: CredentialsStore,
+    /** The live glucose. The tug-of-war is meaningless without it: two forces pulling on nothing in
+     *  particular. WHERE they land is the whole question. */
+    currentMgdl: Int? = null,
     header: @Composable () -> Unit = {},
     onDataChanged: () -> Unit = {},
     /** Dose id to open the edit dialog on as soon as the doses are loaded — set when the user taps
@@ -181,6 +186,12 @@ fun InsulinScreen(
     }
     // Put both sides in the SAME unit (insulin-equivalents) for a fair tug-of-war: carbs ÷ ICR.
     val sugarUnits = carbRatio?.takeIf { it > 0 }?.let { cob / it } ?: 0.0
+    // ...and the balance that says where the rope actually ends up, from the glucose you are at now.
+    // Same maths as the server's glucoseBalance (data/Carbs.kt mirrors it), so the widget and the
+    // analysis can never announce different winners for the same moment.
+    val balance = remember(currentMgdl, iob, cob, carbRatio, correction) {
+        glucoseBalance(currentMgdl, iob, cob, carbRatio, correction)
+    }
 
     Column(modifier = Modifier.fillMaxSize().background(LightBg)) {
         Column(Modifier.padding(start = 16.dp, end = 16.dp, top = 20.dp, bottom = 4.dp)) { header() }
@@ -237,7 +248,7 @@ fun InsulinScreen(
                     Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp),
                     verticalArrangement = Arrangement.spacedBy(12.dp)
                 ) {
-                    SugarVsInsulinTug(iob, sugarUnits, cob.toInt(), carbRatio, correction, target, ratiosEstimated, hasSettings, s)
+                    SugarVsInsulinTug(iob, sugarUnits, cob.toInt(), carbRatio, correction, target, ratiosEstimated, hasSettings, s, balance, bgS)
                     Surface(color = CardWhite, shape = RoundedCornerShape(14.dp), border = BorderStroke(1.dp, BorderLight), modifier = Modifier.fillMaxWidth()) {
                         Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                             Text(s.autotuneTitle, color = InkPrimary, fontSize = 13.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.sp)
@@ -420,6 +431,8 @@ private fun SugarVsInsulinTug(
     iobUnits: Double, sugarUnits: Double, cobGrams: Int,
     carbRatio: Int?, correction: Int?, target: Int?, ratiosEstimated: Boolean, hasSettings: Boolean,
     s: Strings,
+    balance: GlucoseBalance?,
+    bgS: BgStrings,
 ) {
     val total = iobUnits + sugarUnits
     val active = total > 0.05
@@ -469,6 +482,20 @@ private fun SugarVsInsulinTug(
                 }
             }
             Text(verdict, color = verdictColor, fontSize = 13.sp, fontWeight = FontWeight.Bold, textAlign = TextAlign.Center, modifier = Modifier.fillMaxWidth())
+            // WHERE THE ROPE ENDS UP. "Insulin leads" is equally true at 250 and at 80, and useful at
+            // neither: what changes the next hour is the landing. Under 70 it is said plainly, since
+            // that is the one outcome worth acting on.
+            balance?.let { b ->
+                val goesLow = b.headroomMgdl < 0
+                Text(
+                    if (goesLow) String.format(bgS.tugLandsLow, b.glucoseMgdl)
+                    else String.format(bgS.tugLands, b.glucoseMgdl, b.landingMgdl),
+                    color = if (goesLow) GlucoseStatus.DANGER.strong else InkMuted,
+                    fontSize = 12.sp, lineHeight = 16.sp, textAlign = TextAlign.Center,
+                    fontWeight = if (goesLow) FontWeight.Bold else FontWeight.Normal,
+                    modifier = Modifier.fillMaxWidth()
+                )
+            }
             // What to DO about it — a forward-looking, non-prescriptive nudge (never a dose).
             val tugAction = when {
                 !active -> ""

@@ -566,6 +566,77 @@ export function pendingRiseMgdl(cobGrams: number, profile: GuardProfile | null):
 }
 
 /**
+ * THE TUG-OF-WAR, AS ONE NUMBER. Sugar pulls the glucose up, insulin pulls it down, and the only
+ * question that ever matters is where the rope ends up FROM WHERE IT IS NOW. Everything in this file
+ * that used to ask "is a fall coming?" was computing its own half-version of this inline — and the
+ * app's own tug-of-war widget compared the two sides while never once looking at the glucose, so it
+ * could say "insulin leads" at 250 and at 80 with the same conviction.
+ *
+ * `landing` is the whole story: current + what the food still has to give − what the insulin still
+ * has to take. Kept UNCLAMPED — a negative landing is precisely the signal that the drop owed is
+ * bigger than the distance to zero. Never show it raw; show the drop, the rise, and the verdict.
+ */
+export interface GlucoseBalance {
+  glucoseMgdl: number;
+  iobUnits: number;
+  cobGrams: number;
+  /** iob × ISF: what the insulin still has to take off. */
+  dropMgdl: number;
+  /** (cob / ICR) × ISF, discounted by COB_TRUST_FRACTION: what the food still has to add. */
+  riseMgdl: number;
+  /** glucose + rise − drop. Where this ends up if nothing else happens. */
+  landingMgdl: number;
+  /** How far that landing sits above the low threshold (negative = it goes under). */
+  headroomMgdl: number;
+  winner: "carbs" | "insulin" | "balanced";
+}
+
+/** The balance, or null when it cannot be computed honestly (no glucose, or no ratios to convert
+ *  units and grams into mg/dL). A caller that gets null must NOT pretend the sides are even. */
+export function glucoseBalance(
+  glucoseMgdl: number | null | undefined,
+  iobUnits: number,
+  cobGrams: number,
+  profile: GuardProfile | null,
+): GlucoseBalance | null {
+  const g = Number(glucoseMgdl);
+  if (!Number.isFinite(g) || g <= 0) return null;
+  const drop = pendingDropMgdl(iobUnits, profile);
+  if (drop == null) return null;                 // no correction factor: units can't become mg/dL
+  const rise = pendingRiseMgdl(cobGrams, profile) ?? 0; // no carb ratio: food counts as 0, the safe side
+  const landing = g + rise - drop;
+  // A 15% band, so "balanced" means genuinely level rather than "the last decimal decided".
+  const winner = rise > drop * 1.15 ? "carbs" : drop > rise * 1.15 ? "insulin" : "balanced";
+  return {
+    glucoseMgdl: Math.round(g), iobUnits: Math.max(0, iobUnits || 0), cobGrams: Math.max(0, cobGrams || 0),
+    dropMgdl: Math.round(drop), riseMgdl: Math.round(rise),
+    landingMgdl: Math.round(landing), headroomMgdl: Math.round(landing - LOW_MGDL), winner,
+  };
+}
+
+/**
+ * The balance, handed to the MODEL as a fact it may not recompute — the twin of iobSystemLine, whose
+ * absence is why the narrative could describe a day in terms of insulin alone while the code-owned
+ * action line talked about food. The model gets the two forces and where they land; it never gets to
+ * invent either.
+ */
+export function balanceSystemLine(b: GlucoseBalance | null, lang: string): string {
+  if (!b) return "";
+  const es = lang === "es";
+  const verdict = b.winner === "carbs"
+    ? (es ? "el azúcar va ganando" : "le sucre l'emporte")
+    : b.winner === "insulin"
+      ? (es ? "la insulina va ganando" : "l'insuline l'emporte")
+      : (es ? "están parejos" : "les deux se compensent");
+  const land = b.landingMgdl < 20
+    ? (es ? "por debajo de 20" : "sous 20")
+    : `~${b.landingMgdl}`;
+  return es
+    ? `BALANCE AZÚCAR/INSULINA (calculado por el sistema, NO lo recalcules): ahora ${b.glucoseMgdl} mg/dL · el azúcar aún por absorber (~${b.cobGrams} g) empuja +${b.riseMgdl} mg/dL · la insulina aún activa (~${fmtUnits(roundToHalf(b.iobUnits))} u) tira −${b.dropMgdl} mg/dL · sin nada más, esto termina en ${land} mg/dL — ${verdict}. Usa ESTAS cifras cuando expliques hacia dónde va la glucosa.`
+    : `BALANCE SUCRE/INSULINE (calculé par le système, NE le recalcule PAS) : maintenant ${b.glucoseMgdl} mg/dL · le sucre encore à absorber (~${b.cobGrams} g) pousse de +${b.riseMgdl} mg/dL · l'insuline encore active (~${fmtUnits(roundToHalf(b.iobUnits))} u) tire de −${b.dropMgdl} mg/dL · sans rien d'autre, ça finit vers ${land} mg/dL — ${verdict}. Appuie-toi sur CES chiffres quand tu expliques où va la glycémie.`;
+}
+
+/**
  * Would a meal bolus land on top of a fall that is already happening?
  *
  * Carb counting alone says "50 g needs 3 u" and is right about the carbs — but insulin already on
@@ -588,10 +659,8 @@ export function mealBolusHeldByIob(
   /** Carbs still being absorbed (grams) — from `carbsOnBoard`. 0 = count the insulin alone. */
   cobGrams = 0,
 ): boolean {
-  const drop = pendingDropMgdl(iobUnits, profile);
-  if (drop == null || glucoseMgdl == null || !Number.isFinite(glucoseMgdl) || glucoseMgdl <= 0) return false;
-  const rise = pendingRiseMgdl(cobGrams, profile) ?? 0;
-  return glucoseMgdl + rise - drop < LOW_MGDL;
+  const b = glucoseBalance(glucoseMgdl, iobUnits, cobGrams, profile);
+  return !!b && b.headroomMgdl < 0;
 }
 
 /** Why no meal bolus is due right now, in the user's language. Names the CURRENT glucose next to the
@@ -1333,14 +1402,18 @@ export function inRangeActionLine(
   // the insulin alone still opens the question, and the carbs still digesting decide the answer.
   const cur = readings && readings.length ? readings[readings.length - 1].value : null;
   const cob = carbsOnBoard(meals || [], nowMs);
-  if (mealBolusHeldByIob(cur, iobUnits, profile)) {
-    const drop = Math.round(pendingDropMgdl(iobUnits, profile) ?? 0);
-    const g = Math.round(cur as number);
+  // ONE balance, read twice: once counting the insulin alone (does the question even arise?) and
+  // once with the food on the other side (does it survive contact with what is still digesting?).
+  const bare = glucoseBalance(cur, iobUnits, 0, profile);
+  const bal = glucoseBalance(cur, iobUnits, cob, profile);
+  if (bare && bare.headroomMgdl < 0) {
+    const drop = bare.dropMgdl;
+    const g = bare.glucoseMgdl;
     const grams = Math.round(cob);
     // Food on board covers the pending drop: not a hypo warning, a watch. The advice that changes is
     // the dangerous half ("eat sugar now, no insulin at all"); the recheck stays.
-    if (!mealBolusHeldByIob(cur, iobUnits, profile, cob)) {
-      const rise = Math.round(pendingRiseMgdl(cob, profile) ?? 0);
+    if (bal && bal.headroomMgdl >= 0) {
+      const rise = bal.riseMgdl;
       // Balanced ON PAPER is not the same as comfortable: down at the bottom of the range the margin
       // for a carb count being wrong is gone, so the sugar stays within reach even here.
       const near = g < FALL_WATCH_BELOW
@@ -1590,9 +1663,11 @@ export function planMealDose(input: MealPlanInput): MealPlanResult {
   const mealUnits = mealBolusUnits(carbsG, profile);
   const correctionUnits = guard.kind === "correction" ? guard.insulinUnits : 0;
 
-  // Carbs from EARLIER meals still landing (discounted, see COB_TRUST_FRACTION). They belong in every
-  // "where does this end up" figure below, on the same footing as the insulin on board.
-  const cobRise = pendingRiseMgdl(Number(input.cobGrams) || 0, profile) ?? 0;
+  // The tug-of-war as it stands BEFORE this meal's own carbs join it: earlier food still landing
+  // against the insulin still working. Same function every other "where is this heading" question
+  // uses, so the plan's floor and the analysis can never disagree about the same moment.
+  const balance = glucoseBalance(g, iobUnits, Number(input.cobGrams) || 0, profile);
+  const cobRise = balance?.riseMgdl ?? 0;
 
   // What these carbs do UNBOLUSED: (carbs / ICR) units' worth of glucose, i.e. × ISF mg/dL. Insulin
   // already on board is netted off — it will absorb part of the rise.
@@ -1612,9 +1687,7 @@ export function planMealDose(input: MealPlanInput): MealPlanResult {
   // active is ~150 mg/dL of drop still to come, and the plan used to answer "10 u" with no caveat.
   // 121 mg/dL with 4 u active but a menu still digesting is not a floor of −33, it is a glucose on
   // its way up: cobRise (above) is netted in here too.
-  const floorMgdl = (g != null && Number.isFinite(g) && g > 0 && isf)
-    ? Math.round(g + cobRise - (iobUnits || 0) * isf)
-    : null;
+  const floorMgdl = balance ? balance.landingMgdl : null;
   const lowBeforeMeal = !hypoFirst && carbsG > 0 && (
     (floorMgdl != null && floorMgdl < LOW_MGDL) ||
     (falling && g != null && g < FALL_WATCH_BELOW + 10)
