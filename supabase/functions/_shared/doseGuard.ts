@@ -523,6 +523,21 @@ export function situationHint(guard: GuardResult, lang: string): string {
   }
 }
 
+/** The `mechabetics_profiles` row (snake_case, as it comes out of the DB) mapped to the shape every
+ *  dose function takes. Lived as four byte-identical private copies in ask / scan / coach / meals —
+ *  and this mapping is the single point where a doctor's ratio can silently go missing, which turns
+ *  every dose answer into "je ne peux pas donner de dose". One copy, one place to fix. */
+export function toGuardProfile(p: any): GuardProfile | null {
+  if (!p) return null;
+  return {
+    carbRatio: p.carb_ratio ?? null,
+    correctionFactor: p.correction_factor ?? null,
+    targetMgdl: p.target_mgdl ?? null,
+    weightKg: p.weight_kg ?? null,
+    rapidInsulin: p.rapid_insulin ?? null,
+  };
+}
+
 /** How much lowering the rapid insulin already on board still has to deliver, in mg/dL. Null without
  *  a correction factor to convert units into mg/dL. */
 export function pendingDropMgdl(iobUnits: number, profile: GuardProfile | null): number | null {
@@ -610,6 +625,25 @@ export function mealBolusHeldLine(
 export function mealBolusUnits(carbsG: number | null | undefined, profile: GuardProfile | null): number {
   if (!profile || !profile.carbRatio || !carbsG || carbsG <= 0) return 0;
   return Math.max(0, roundToHalf(carbsG / profile.carbRatio));
+}
+
+/**
+ * Make a code-owned line SPEAKABLE. Everything the app writes is also read aloud, and the written
+ * form is full of things that come out as noise: "≈ 8 sucre(s)" is heard as "environ huit sucre
+ * parenthèse s", and a ⚠️ is either silence or the word for the glyph. The rule the repo already
+ * follows for hand-written voice strings, applied to the ones built by the engine.
+ */
+export function speakable(line: string, lang: string): string {
+  if (!line) return line;
+  const es = lang === "es";
+  return line
+    .replace(/⚠️/g, "")
+    .replace(/,?\s*≈\s*(\d+)\s*(?:sucre\(s\)|terrón\(es\))/g, (_m, n) =>
+      es
+        ? (n === "1" ? ", un terrón de azúcar" : `, unos ${n} terrones de azúcar`)
+        : (n === "1" ? ", environ 1 sucre" : `, environ ${n} sucres`))
+    .replace(/\s+/g, " ")
+    .trim();
 }
 
 /** A food's carbs expressed as ~4 g sugar-cube equivalents (e.g. 25 g -> 6). Every carb figure
@@ -1106,6 +1140,14 @@ type DoseRow = { ts: string | number; units: number; kind?: string | null };
 export const RESCUE_GLUCOSE_MGDL = 80;
 /** A low this recently makes whatever followed it a rescue. */
 export const RESCUE_LOOKBACK_MIN = 45;
+/** How close to the meal a sub-70 reading must be to mean "they were low WHILE eating". A low that
+ *  has been treated and resolved is history by the time the next meal comes; forty minutes was long
+ *  enough to swallow the lunch that followed a morning hypo. */
+export const RESCUE_NEARBY_MIN = 15;
+/** Carb ceiling for that case. Deliberately looser than RESCUE_MAX_CARBS: over-treating a low is
+ *  ordinary, a can plus a biscuit is 40 g and still treatment. Above it, it is a meal — one that
+ *  waits for the rise before being bolused, not one that is never bolused at all. */
+export const RESCUE_AT_LOW_MAX_CARBS = 50;
 
 /**
  * Was this eaten to fix a low? Reads the curve around the moment of eating.
@@ -1127,17 +1169,33 @@ export function eatenToTreatALow(
   carbsG?: number | null,
   description?: string | null,
 ): boolean {
+  const rs = (readings || []).filter((r) => r && Number(r.value) > 0 && Number.isFinite(Number(r.ts)));
+  if (!rs.length) return false;
+
   const c = Number(carbsG);
+  // A LOW MEASURED WHILE THEY WERE EATING outranks the vocabulary and the carb speed. People do not
+  // measure out a textbook 15 g when they feel a hypo coming: at 57 mg/dL a can of classic cola is
+  // 35 g — over the ordinary rescue ceiling — and answering it with three units of rapid is the 7up
+  // incident again. Over-treating a low is normal behaviour, so the ceiling here is generous.
+  //
+  // It is a ceiling all the same. Without one, ANY food within three quarters of an hour of a low
+  // became treatment for it — including the lunch eaten forty minutes after a hypo was resolved, or
+  // a 90 g plate of pasta that happens to be served at 64. Those need their bolus (afterwards, once
+  // the rise is under way — planMealDose's hypo_first path says exactly that); filing them as
+  // rescues means nothing ever covers them, and 90 g uncovered is its own emergency.
+  const from = mealTs - RESCUE_NEARBY_MIN * 60000;
+  const to = mealTs + 10 * 60000;
+  const lowWhileEating = rs.some((r) => Number(r.ts) >= from && Number(r.ts) <= to && Number(r.value) < LOW_MGDL);
+  if (lowWhileEating) return !(Number.isFinite(c) && c > RESCUE_AT_LOW_MAX_CARBS);
+
+  // Below here there is NO low at the moment of eating — only a low-ISH value (≤ 80) near the meal,
+  // or a low that had already passed, from which we INFER treatment. An inference is where the food
+  // gets a say, because the far more common reading of "ate at 78" is simply "ate lunch a bit low",
+  // and filing lunch as a rescue means never being told to cover it. So: nothing above rescue size,
+  // and nothing slow or fatty (neither lifts a low inside the quarter of an hour this window judges).
   if (Number.isFinite(c) && c > RESCUE_MAX_CARBS) return false;
   const speed = mealCarbSpeed(description);
   if (speed === "slow" || speed === "fatty") return false;
-  const rs = (readings || []).filter((r) => r && Number(r.value) > 0 && Number.isFinite(Number(r.ts)));
-  if (!rs.length) return false;
-  // A genuine low shortly BEFORE the food (the reason it was eaten), or still low just after.
-  const from = mealTs - RESCUE_LOOKBACK_MIN * 60000;
-  const to = mealTs + 10 * 60000;
-  if (rs.some((r) => Number(r.ts) >= from && Number(r.ts) <= to && Number(r.value) < LOW_MGDL)) return true;
-  // Or simply low-ish at the moment itself: nobody boluses a snack taken at 72 mg/dL.
   let nearest: { dt: number; v: number } | null = null;
   for (const r of rs) {
     const dt = Math.abs(Number(r.ts) - mealTs);
@@ -1575,7 +1633,10 @@ export function planMealDose(input: MealPlanInput): MealPlanResult {
   if (carbsG <= 0) reason = "no_carbs";
   else if (!icr) reason = "no_ratios";
   else if (hypoFirst) reason = "hypo_first";
-  else if (guard.reason === "stale_data") reason = "stale_no_correction";
+  // NO reading is at least as bad as an OLD one. computeGuard tests the missing glucose first and
+  // answers "no_reading", so a plan built with no glucose at all used to come out with no caveat —
+  // less warning than a five-minute-old value gets. Same clause for both.
+  else if (guard.reason === "stale_data" || guard.reason === "no_reading") reason = "stale_no_correction";
 
   const totalUnits = hypoFirst ? 0 : roundToHalf(mealUnits + correctionUnits);
   const fastFallCaution = trend === "falling_fast" && speed === "fast" && !hypoFirst && carbsG > 0;
@@ -1652,9 +1713,33 @@ export function mealPlanLine(
     return es ? "Dime qué vas a comer (y la cantidad) para calcular la dosis." : "Dis-moi ce que tu vas manger (et la quantité) pour calculer la dose.";
   }
   if (plan.reason === "no_ratios") {
-    return es
-      ? `Para ~${plan.carbsG} g de carbohidratos${cubesP} — no puedo dar una dosis: falta tu ratio de carbohidratos en el perfil. Complétalo y te doy el número exacto.`
-      : `Pour ~${plan.carbsG} g de glucides${cubesP} — je ne peux pas donner de dose : ton ratio glucides manque dans le profil. Renseigne-le et je te donne le chiffre exact.`;
+    // A MISSING CARB RATIO ONLY COSTS THE MEAL HALF. computeGuard needs the correction factor and
+    // the target, not the carb ratio, so a genuine hyper still has an authorised correction — and a
+    // hypo has a rescue in grams. Returning "je ne peux pas donner de dose" threw BOTH away: at
+    // 45 mg/dL the guard had already computed the sugar to take and the only sentence the endpoint
+    // emitted was a complaint about the profile.
+    const guardFirst = (plan.correctionUnits > 0 || plan.guard.kind === "sugar" || plan.guard.reason === "sugar_recent")
+      ? actionLine(plan.guard, lang, profile) + " "
+      : "";
+    return guardFirst + (es
+      ? `Para ~${plan.carbsG} g de carbohidratos${cubesP} no puedo dar la dosis de la COMIDA: falta tu ratio de carbohidratos en el perfil. Complétalo y te doy el número exacto.`
+      : `Pour ~${plan.carbsG} g de glucides${cubesP}, je ne peux pas donner la dose du REPAS : ton ratio glucides manque dans le profil. Renseigne-le et je te donne le chiffre exact.`);
+  }
+
+  // NOTHING TO INJECT, FROM EITHER HALF — so say WHY, and say ONLY that. A 0-2 g food (a sausage, an
+  // egg, a slice of cheese) produces a real plan whose dose is zero, and printing "0 u pour le
+  // repas" in place of the guard's own sentence lost the reason nothing is due and the recheck that
+  // goes with it. But every clause below assumes a dose exists: appending the timing to a zero
+  // produced "aucune insuline pour l'instant … Fais l'insuline au moment de commencer à manger" in a
+  // single breath, and the staleness tail spoke of "cette dose" that was never named. One sentence,
+  // the guard's own, and the fast-fall caution when it applies — nothing that points at a number.
+  if (plan.reason !== "hypo_first" && plan.totalUnits <= 0) {
+    const head = actionLine(plan.guard, lang, profile);
+    return plan.fastFallCaution
+      ? head + (es
+        ? " Ojo: estás bajando RÁPIDO. Si este azúcar es para frenar la bajada y no una comida, no lo cubras con insulina."
+        : " Attention : tu descends VITE. Si ce sucre sert à freiner la baisse et n'est pas un repas, ne le couvre pas avec de l'insuline.")
+      : head;
   }
 
   const parts: string[] = [];
@@ -1677,6 +1762,14 @@ export function mealPlanLine(
       head += es ? ` para la comida.` : ` pour le repas.`;
     }
     parts.push(head);
+    // The MEAL half is computable but the correction half is not (no correction factor / no target).
+    // combinedActionLine says so; going through the plan line dropped it, so a 300 mg/dL came back
+    // as a bare meal bolus with no hint that the high was left uncorrected for want of a ratio.
+    if (plan.guard.kind === "no_ratios") {
+      parts.push(es
+        ? "No puedo calcular la CORRECCIÓN: faltan los ratios del médico en el perfil — esta dosis cubre solo la comida."
+        : "Je ne peux pas calculer la CORRECTION : les ratios du médecin manquent dans le profil — cette dose ne couvre que le repas.");
+    }
   }
 
   // WHY the dose matters: what these carbs do if they go uncovered. This is the forward-looking half
@@ -1727,9 +1820,11 @@ export function mealPlanLine(
   }
 
   if (plan.reason === "stale_no_correction") {
+    // Covers BOTH "the reading is old" and "there is no reading at all" — from where the user
+    // stands they are the same problem, and the second one used to say nothing.
     parts.push(es
-      ? "Los datos no están actualizados: esta dosis cubre solo la comida, sin corrección — recontrola la glucosa antes de añadir nada."
-      : "Données pas à jour : cette dose ne couvre que le repas, sans correction — recontrôle la glycémie avant d'ajouter quoi que ce soit.");
+      ? "Sin glucosa actualizada: esta dosis cubre solo la comida, sin corrección — mide la glucosa antes de añadir nada."
+      : "Pas de glycémie à jour : cette dose ne couvre que le repas, sans correction — mesure ta glycémie avant d'ajouter quoi que ce soit.");
   }
   return parts.join(" ");
 }

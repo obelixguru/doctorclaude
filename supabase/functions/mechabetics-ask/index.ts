@@ -25,9 +25,11 @@ import {
   sugarTimingFact,
   hypoIobWarning,
   starchyCarbNote,
+  speakable,
   plannedMealNote,
   planMealDose,
   mealPlanLine,
+  toGuardProfile,
   type GuardProfile,
 } from "../_shared/doseGuard.ts";
 import { chatJson, llmErrorKind, llmErrorMessage } from "../_shared/llm.ts";
@@ -106,17 +108,6 @@ function extractStr(raw: string, key: string): string | null {
     i++;
   }
   return out.length ? out : null;
-}
-
-function toGuardProfile(p: any): GuardProfile | null {
-  if (!p) return null;
-  return {
-    carbRatio: p.carb_ratio ?? null,
-    correctionFactor: p.correction_factor ?? null,
-    targetMgdl: p.target_mgdl ?? null,
-    weightKg: p.weight_kg ?? null,
-    rapidInsulin: p.rapid_insulin ?? null,
-  };
 }
 
 // Recent rapid-insulin doses -> a context line (for the model's wording; the guard computes IOB
@@ -335,7 +326,10 @@ Deno.serve(async (req: Request) => {
       const { data: m } = await db.from("mechabetics_meals")
         .select("ts, description, carbs_g, planned").eq("subject", subject)
         .gte("ts", mealsSinceIso)
-        .order("ts", { ascending: false }).limit(6);
+        // 24, not 6: every scan inserts a meal row, so a handful of scans pushed the real meal
+        // out of the window and carbs-on-board silently read 0 — the food vanished from the very
+        // balance that decides whether a fall is coming.
+        .order("ts", { ascending: false }).limit(24);
       meals = m ?? [];
     }
 
@@ -523,7 +517,7 @@ Deno.serve(async (req: Request) => {
             : combinedActionLine(guardForAction, mealUnits, lang, gp, mealPlanned);
         const label = lang === "es" ? "Acción" : "Action";
         text = `${reply}\n\n${label} : ${line}`;
-        voiceText = `${voice} ${line}`.trim();
+        voiceText = `${voice} ${speakable(line, lang)}`.trim();
       }
       // Hypo while rapid insulin is still active → it'll keep falling, one rescue may not hold; warn
       // (the grams are already bumped for IOB by the guard) so the parent rechecks sooner + re-treats.

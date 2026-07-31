@@ -74,6 +74,22 @@ fun FoodScreen(
     var saveError by remember { mutableStateOf(false) } // a write failed → show it (no silent close)
     // Provenance of the carb figure the server just computed — shown once, under the list.
     var carbSourceNote by remember { mutableStateOf("") }
+    // THE ANSWER THE APP EXISTS FOR: how much insulin for the meal being logged. Code-computed
+    // server-side (doseGuard), never by a model, and never recomputed here — the phone displays the
+    // sentence it was handed. Shown for the meal just saved, and available BEFORE saving from the
+    // form itself, which is the only moment where the number can still change what happens.
+    var doseLine by remember { mutableStateOf("") }
+    var planLine by remember { mutableStateOf("") }   // the in-dialog preview, before anything is written
+    var planning by remember { mutableStateOf(false) }
+    // A plan request outlives the form that asked for it (a product lookup takes seconds). Without a
+    // stamp, cancelling and opening another meal lets the FIRST answer land in the SECOND dialog —
+    // meal A's dose shown as meal B's, and A's carbs written into B's field.
+    var planSeq by remember { mutableStateOf(0) }
+    // Where the carbs in the field came from when the app filled them in. Typing a number the server
+    // estimated makes it indistinguishable from one read off a packet: the save would then report
+    // carbSource "user" and the "glucides ESTIMÉS, vérifie l'emballage" warning would never appear.
+    var filledSource by remember { mutableStateOf<String?>(null) }
+    var filledProduct by remember { mutableStateOf<String?>(null) }
     var scanning by remember { mutableStateOf(false) }
     var scanResult by remember { mutableStateOf("") }
     var showCamera by remember { mutableStateOf(false) }
@@ -111,6 +127,7 @@ fun FoodScreen(
         qty = m.quantity.coerceAtLeast(1).toString()
         carbs = m.carbsG?.let { (it / m.quantity.coerceAtLeast(1)).toString() } ?: ""
         mealWhen = tsToMs(m.ts)
+        planLine = ""; planSeq += 1; filledSource = null; filledProduct = null
         showAdd = true
         onOpenEditConsumed()
     }
@@ -119,7 +136,7 @@ fun FoodScreen(
     val runScan: (File) -> Unit = { file ->
         showCamera = false
         if (patientId != null) {
-            scanning = true; scanResult = ""
+            scanning = true; scanResult = ""; doseLine = "" // the card described the PREVIOUS meal
             scope.launch {
                 val bytes = withContext(Dispatchers.IO) { processImage(file) }
                 if (bytes == null || bytes.isEmpty()) {
@@ -139,7 +156,7 @@ fun FoodScreen(
     // permission and works on every device — take the photo with the normal camera, then pick it.
     val pickMedia = rememberLauncherForActivityResult(ActivityResultContracts.PickVisualMedia()) { uri ->
         if (uri != null && patientId != null) {
-            scanning = true; scanResult = ""
+            scanning = true; scanResult = ""; doseLine = "" // the card described the PREVIOUS meal
             scope.launch {
                 val bytes = withContext(Dispatchers.IO) { processUri(context, uri) }
                 if (bytes == null || bytes.isEmpty()) {
@@ -228,6 +245,33 @@ fun FoodScreen(
                             }
                         }
                     }
+                    // "Pour ce repas : N u" — the dose for the meal that was just logged, with its
+                    // timing and what the food does uncovered. Every figure comes from the server's
+                    // dose guard, so this card can never disagree with the analysis or the voice.
+                    if (doseLine.isNotBlank()) {
+                        item {
+                            Surface(
+                                color = CardWhite, shape = RoundedCornerShape(14.dp),
+                                border = BorderStroke(1.dp, AccentGreen.copy(alpha = 0.4f)),
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Column(Modifier.padding(start = 14.dp, end = 6.dp, top = 4.dp, bottom = 14.dp)) {
+                                    Row(verticalAlignment = Alignment.CenterVertically) {
+                                        Text(
+                                            bgS.mealDoseTitle, color = AccentGreen, fontSize = 11.sp,
+                                            fontWeight = FontWeight.Black, letterSpacing = 1.5.sp,
+                                            modifier = Modifier.weight(1f)
+                                        )
+                                        IconButton(onClick = { doseLine = "" }, modifier = Modifier.size(32.dp)) {
+                                            Icon(Icons.Filled.Close, contentDescription = if (es) "Cerrar" else "Fermer", tint = InkMuted, modifier = Modifier.size(20.dp))
+                                        }
+                                    }
+                                    Text(doseLine, color = InkPrimary, fontSize = 14.sp, lineHeight = 20.sp, modifier = Modifier.padding(end = 8.dp))
+                                }
+                            }
+                        }
+                        item { DoseDisclaimer() }
+                    }
                     if (scanning) {
                         item {
                             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
@@ -273,7 +317,8 @@ fun FoodScreen(
                                     qty = m.quantity.coerceAtLeast(1).toString()
                                     // Show carbs PER UNIT (stored carbs_g is the total = per-unit × quantity).
                                     carbs = m.carbsG?.let { (it / m.quantity.coerceAtLeast(1)).toString() } ?: ""
-                                    mealWhen = tsToMs(m.ts); showAdd = true
+                                    mealWhen = tsToMs(m.ts); planLine = ""; planSeq += 1
+                                    filledSource = null; filledProduct = null; showAdd = true
                                 })
                         }
                     }
@@ -297,7 +342,8 @@ fun FoodScreen(
         // pick now lives as a small icon INSIDE the camera screen, so this row is less cluttered.
         Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             Button(
-                onClick = { if (patientId != null) { editingMeal = null; desc = ""; carbs = ""; qty = "1"; mealWhen = null; saveError = false; carbSourceNote = ""; showAdd = true } },
+                onClick = { if (patientId != null) { editingMeal = null; desc = ""; carbs = ""; qty = "1"; mealWhen = null; saveError = false; carbSourceNote = ""; doseLine = ""; planLine = ""; planSeq += 1
+                    filledSource = null; filledProduct = null; showAdd = true } },
                 enabled = patientId != null,
                 colors = ButtonDefaults.buttonColors(containerColor = AccentGreen, contentColor = LightBg),
                 shape = RoundedCornerShape(12.dp), contentPadding = PaddingValues(horizontal = 4.dp),
@@ -352,6 +398,65 @@ fun FoodScreen(
                         allowFuture = true, tomorrowLabel = bgS.whenTomorrow,
                         showSteppers = true,
                     )
+
+                    // "SI JE MANGE ÇA, COMBIEN ?" — asked here, before anything is written. Reacting
+                    // to the glucose afterwards can never catch a 110 g meal in time; the number has
+                    // to exist while the food is still a decision. On demand rather than on every
+                    // keystroke: when the carbs aren't typed the server has to look the product up,
+                    // and that is a real call, not a free one.
+                    TextButton(
+                        enabled = !planning && !busy && desc.isNotBlank() && patientId != null,
+                        onClick = {
+                            val pid = patientId ?: return@TextButton
+                            planSeq += 1
+                            val mySeq = planSeq
+                            planning = true; planLine = ""
+                            scope.launch {
+                                val q = qty.toIntOrNull()?.coerceIn(1, 50) ?: 1
+                                val r = service.plan(pid, desc.trim(), carbs.toIntOrNull(), tsMs = mealWhen, quantity = q, lang = lang.code.lowercase())
+                                // The spinner must stop whatever happens, INCLUDING when the answer
+                                // is dropped below: leaving it set disabled the button for the rest
+                                // of the screen's life, with "Calcul de la dose…" frozen on it.
+                                planning = false
+                                // Answer for a form the user has since left or changed → drop it.
+                                if (mySeq != planSeq) return@launch
+                                planLine = r.planLine ?: when {
+                                    r.alreadyEaten -> bgS.mealDoseTooLate
+                                    // The server answered, and its answer is "no carbs": that is a
+                                    // result, not a failure — retrying could never change it.
+                                    r.ok && r.carbsG == 0 -> bgS.mealDoseNoCarbs
+                                    else -> bgS.mealDoseFailed
+                                }
+                                // The server may have had to estimate the carbs to answer — show the
+                                // figure it used, so the dose and the number it came from agree, and
+                                // REMEMBER that it was estimated so the save still says so.
+                                if (carbs.isBlank()) (r.carbsPerUnit ?: r.carbsG?.let { it / q })?.let { perUnit ->
+                                    if (perUnit > 0) {
+                                        carbs = perUnit.toString()
+                                        filledSource = r.carbSource
+                                        filledProduct = r.productName
+                                    }
+                                }
+                            }
+                        }
+                    ) {
+                        Text(
+                            if (planning) bgS.mealDoseAsking else bgS.mealDoseAsk,
+                            color = AccentGreen, fontWeight = FontWeight.Bold, fontSize = 13.sp
+                        )
+                    }
+                    if (planLine.isNotBlank()) {
+                        Surface(
+                            color = LightBg, shape = RoundedCornerShape(12.dp),
+                            border = BorderStroke(1.dp, AccentGreen.copy(alpha = 0.4f)),
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Text(
+                                planLine, color = InkPrimary, fontSize = 13.sp, lineHeight = 18.sp,
+                                modifier = Modifier.padding(12.dp)
+                            )
+                        }
+                    }
                     // Editing an existing meal → delete it from here (no separate trash icon / confirm),
                     // mirroring how the insulin-dose dialog handles deletion.
                     editingMeal?.let { em ->
@@ -363,6 +468,7 @@ fun FoodScreen(
                                 if (okDel) {
                                     meals = service.list(patientId)
                                     onDataChanged()
+                                    doseLine = "" // a dose for a meal that no longer exists
                                     desc = ""; carbs = ""; qty = "1"; mealWhen = null; editingMeal = null; showAdd = false
                                 } else saveError = true
                                 busy = false
@@ -384,22 +490,33 @@ fun FoodScreen(
                             // timestamp — a null one omits the field and the server silently keeps the
                             // meal's old time, which read as the button doing nothing.
                             val editTs = mealWhen ?: System.currentTimeMillis()
-                            var added: com.drclaude.ai.MealsService.AddResult? = null
-                            val ok = if (em != null) service.update(patientId, em.id, desc.trim(), carbs.toIntOrNull(), tsMs = editTs, quantity = qn)
-                                     else service.add(patientId, desc.trim(), carbs.toIntOrNull(), false, tsMs = mealWhen, quantity = qn)
-                                         .also { added = it }.ok
+                            val added = if (em != null)
+                                service.update(patientId, em.id, desc.trim(), carbs.toIntOrNull(), tsMs = editTs, quantity = qn, lang = lang.code.lowercase())
+                            else
+                                service.add(patientId, desc.trim(), carbs.toIntOrNull(), false, tsMs = mealWhen, quantity = qn, lang = lang.code.lowercase())
+                            val ok = added.ok
                             if (ok) {
+                                // The dose for what was just logged, carried out of the dialog onto
+                                // the page — a number that disappears with the form it was computed
+                                // in is a number nobody can act on.
+                                doseLine = added.planLine ?: ""
                                 // SAY WHERE THE NUMBER CAME FROM. A figure read off a product and a
                                 // figure a model guessed are not the same claim, and printing both
                                 // the same way is how "35 g" for a 16 g can went unquestioned. Only
                                 // shown when the user did NOT type the carbs themselves.
-                                carbSourceNote = when (added?.carbSource) {
+                                // If the preview filled the field for us, the server now sees a
+                                // "typed" figure and reports carbSource "user" — so the provenance
+                                // it gave us BEFORE is the one that tells the truth.
+                                val src = filledSource ?: added.carbSource
+                                val prod = filledProduct ?: added.productName
+                                carbSourceNote = when (src) {
                                     "label_barcode" -> bgS.carbFromLabel
-                                    "product_db" -> added?.productName?.let { String.format(bgS.carbFromDbNamed, it) } ?: bgS.carbFromDb
+                                    "product_db" -> prod?.let { String.format(bgS.carbFromDbNamed, it) } ?: bgS.carbFromDb
                                     "estimate" -> bgS.carbFromEstimate
                                     else -> ""
                                 }
                                 desc = ""; carbs = ""; qty = "1"; mealWhen = null; editingMeal = null
+                                planLine = ""; filledSource = null; filledProduct = null
                                 meals = service.list(patientId)
                                 onDataChanged() // refresh home IOB/markers (so a HIGH alarm re-evaluates)
                                 showAdd = false

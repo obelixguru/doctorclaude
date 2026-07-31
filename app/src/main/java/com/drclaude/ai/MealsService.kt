@@ -54,22 +54,78 @@ class MealsService {
 
     /** WHERE the carb figure came from, so a label and a guess are never shown the same way.
      *  "user" typed it · "label_barcode" read off the product · "product_db" a country listing ·
-     *  "estimate" the model. Null when an older server doesn't say. */
-    data class AddResult(val ok: Boolean, val carbSource: String? = null, val productName: String? = null)
+     *  "estimate" the model · "kept" the figure already stored (an edit that didn't touch carbs).
+     *  Null when an older server doesn't say.
+     *
+     *  [planLine] is the code-computed answer to "if I eat this, how much insulin?" — units, when to
+     *  inject, and where the food would take the glucose uncovered. Every number in it comes from
+     *  the server's dose guard; the app only displays it. Null when there are no carbs to dose, when
+     *  the profile has no carb ratio, or against a server that predates it. */
+    data class AddResult(
+        val ok: Boolean,
+        val carbSource: String? = null,
+        val productName: String? = null,
+        val planLine: String? = null,
+        val totalUnits: Double? = null,
+        val carbsG: Int? = null,
+        /** The PER-UNIT figure the server used, when it had to work it out. Preferred over dividing
+         *  [carbsG] back down: the total is clamped at 2000 g, so the division can silently return a
+         *  smaller number than the food actually has. */
+        val carbsPerUnit: Int? = null,
+        /** The meal's time is already past: the prospective question doesn't apply, and no amount of
+         *  retrying will produce a dose. Distinguishes "no answer" from "the answer is: too late". */
+        val alreadyEaten: Boolean = false,
+    )
 
-    suspend fun add(patientId: String, description: String, carbsG: Int?, planned: Boolean, tsMs: Long? = null, quantity: Int = 1): AddResult =
+    /** org.json turns a JSON `null` into the SENTINEL object JSONObject.NULL, and optString on it
+     *  returns the four-character string "null" — which would have been rendered to the user, inside
+     *  a bordered card, as the dose for their meal. Every nullable field goes through here. */
+    private fun str(o: JSONObject?, key: String): String? =
+        o?.let { if (it.isNull(key)) null else it.optString(key) }?.takeIf { it.isNotBlank() }
+
+    private fun resultOf(j: JSONObject?): AddResult {
+        val ok = j != null && !(j.has("error") && !j.isNull("error"))
+        val plan = j?.optJSONObject("plan")
+        return AddResult(
+            ok = ok,
+            carbSource = str(j, "carbSource"),
+            productName = str(j?.optJSONObject("carbFact"), "name"),
+            planLine = str(j, "planLine"),
+            totalUnits = plan?.let { if (it.isNull("totalUnits")) null else it.optDouble("totalUnits") }
+                ?.takeIf { !it.isNaN() },
+            // The `plan` action returns the carbs at the top level; add/update nest them in `plan`.
+            carbsG = plan?.let { if (it.isNull("carbsG")) null else it.optInt("carbsG") }
+                ?: j?.let { if (it.isNull("carbsG")) null else it.optInt("carbsG", -1).takeIf { n -> n >= 0 } },
+            carbsPerUnit = j?.let { if (it.isNull("carbsPerUnit")) null else it.optInt("carbsPerUnit", -1).takeIf { n -> n >= 0 } },
+            // The meal is already eaten: there is no dose to give for it, and no point retrying.
+            alreadyEaten = j?.optBoolean("alreadyEaten", false) ?: false,
+        )
+    }
+
+    suspend fun add(patientId: String, description: String, carbsG: Int?, planned: Boolean, tsMs: Long? = null, quantity: Int = 1, lang: String = "fr"): AddResult =
         withContext(Dispatchers.IO) {
             try {
                 val meal = JSONObject().put("description", description).put("planned", planned).put("quantity", quantity)
                 if (carbsG != null) meal.put("carbsG", carbsG) // per-unit; server stores per-unit × quantity
                 if (tsMs != null) meal.put("ts", tsMs) // backdate a forgotten meal
-                val j = post(JSONObject().put("action", "add").put("subject", subjectOf(patientId)).put("meal", meal))
-                val ok = j != null && !(j.has("error") && !j.isNull("error"))
-                val src = j?.optString("carbSource")?.takeIf { it.isNotBlank() }
-                val name = j?.optJSONObject("carbFact")?.optString("name")?.takeIf { it.isNotBlank() }
-                AddResult(ok, src, name)
+                resultOf(post(JSONObject().put("action", "add").put("subject", subjectOf(patientId)).put("meal", meal).put("lang", lang)))
             } catch (e: Exception) {
                 Log.e(TAG, "add failed", e); AddResult(false)
+            }
+        }
+
+    /** "If I eat this, how much insulin?" — asked BEFORE anything is written, from the meal form.
+     *  Nothing is logged and nothing has to be undone; the server estimates the carbs if they
+     *  weren't typed and answers with the same engine the voice path uses. */
+    suspend fun plan(patientId: String, description: String, carbsG: Int?, tsMs: Long? = null, quantity: Int = 1, lang: String = "fr"): AddResult =
+        withContext(Dispatchers.IO) {
+            try {
+                val meal = JSONObject().put("description", description).put("quantity", quantity)
+                if (carbsG != null) meal.put("carbsG", carbsG)
+                if (tsMs != null) meal.put("ts", tsMs) // eating LATER moves the injection, not the maths
+                resultOf(post(JSONObject().put("action", "plan").put("subject", subjectOf(patientId)).put("meal", meal).put("lang", lang)))
+            } catch (e: Exception) {
+                Log.e(TAG, "plan failed", e); AddResult(false)
             }
         }
 
@@ -88,17 +144,18 @@ class MealsService {
             }
         }
 
-    /** Edit a meal already in the list (description / carbs / time). */
-    suspend fun update(patientId: String, id: Long, description: String, carbsG: Int?, tsMs: Long? = null, quantity: Int = 1): Boolean =
+    /** Edit a meal already in the list (description / carbs / time). Returns the same result as
+     *  [add] — an edit changes the carbs, the quantity or the hour, so it changes the dose too, and
+     *  returning a bare Boolean is why an edited meal never showed where its carb figure came from. */
+    suspend fun update(patientId: String, id: Long, description: String, carbsG: Int?, tsMs: Long? = null, quantity: Int = 1, lang: String = "fr"): AddResult =
         withContext(Dispatchers.IO) {
             try {
                 val meal = JSONObject().put("description", description).put("quantity", quantity)
                 if (carbsG != null) meal.put("carbsG", carbsG) // per-unit; server stores per-unit × quantity
                 if (tsMs != null) meal.put("ts", tsMs)
-                val j = post(JSONObject().put("action", "update").put("subject", subjectOf(patientId)).put("id", id).put("meal", meal))
-                j != null && !(j.has("error") && !j.isNull("error"))
+                resultOf(post(JSONObject().put("action", "update").put("subject", subjectOf(patientId)).put("id", id).put("meal", meal).put("lang", lang)))
             } catch (e: Exception) {
-                Log.e(TAG, "update failed", e); false
+                Log.e(TAG, "update failed", e); AddResult(false)
             }
         }
 

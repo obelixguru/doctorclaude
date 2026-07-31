@@ -33,6 +33,7 @@ import {
   planMealDose,
   mealPlanLine,
   plannedMealNote,
+  toGuardProfile,
   type GuardProfile,
 } from "../_shared/doseGuard.ts";
 import { chatJson, llmErrorKind, llmErrorMessage } from "../_shared/llm.ts";
@@ -152,17 +153,6 @@ function statsSummary(s: any, lang: string, stability?: { word: string; note: st
   }
   const d = drops ? ` ${drops} chute(s) rapide(s) de glycémie.` : "";
   return `${lead}${d} Continue d'ajuster pour lisser les variations.`;
-}
-
-function toGuardProfile(p: any): GuardProfile | null {
-  if (!p) return null;
-  return {
-    carbRatio: p.carb_ratio ?? null,
-    correctionFactor: p.correction_factor ?? null,
-    targetMgdl: p.target_mgdl ?? null,
-    weightKg: p.weight_kg ?? null,
-    rapidInsulin: p.rapid_insulin ?? null,
-  };
 }
 
 /** "il y a 3 min" / "il y a 2 h" — a human relative time so the model (and the accounting line)

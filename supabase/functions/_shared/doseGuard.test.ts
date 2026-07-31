@@ -42,6 +42,7 @@ import {
   mealBolusHeldByIob,
   mealBolusHeldLine,
   eatenToTreatALow,
+  speakable,
 } from "./doseGuard.ts";
 
 const prof = { carbRatio: 12, correctionFactor: 50, targetMgdl: 110, weightKg: 38, rapidInsulin: "NovoRapid" };
@@ -1202,4 +1203,145 @@ test("an announced slow/fatty meal keeps its hour: the split bolus is due AT the
   assert.match(mealTimingLine("split", "es", 20), /dentro de 20 min/);
   // Eating now: no phantom delay.
   assert.doesNotMatch(mealTimingLine("split", "fr", 0), /dans \d+ min/);
+});
+
+// ─── Review findings, 31 July 2026. The meal-vs-rescue veto added above was itself too broad, and
+// three prospective-plan sentences dropped something the reactive one had always said. ────────────
+
+test("a MEASURED low outranks the size of what was eaten: a can of cola at 57 is still a rescue", () => {
+  // 33 cl of classic cola is 35 g — over the rescue ceiling — so the size veto alone re-opened the
+  // 7up incident: insulin advised twenty minutes after a 57 mg/dL. Under 70 there is nothing to
+  // infer, the low is measured, and whatever was eaten was the treatment.
+  const T = new Date("2026-07-30T22:37:00Z").getTime();
+  const curve = [[-10, 73], [-4, 57], [4, 64], [12, 88]]
+    .map(([m, v]) => ({ ts: T + (m as number) * 60_000, value: v as number }));
+  assert.equal(eatenToTreatALow(T, curve, 35, "canette de coca"), true);
+  // A whole menu at 57 is NOT treatment, though — it is a meal eaten at a bad moment. Filing it as
+  // a rescue would leave 120 g uncovered; planMealDose answers it correctly with "sugar first, the
+  // meal's insulin only once you are back up".
+  assert.equal(eatenToTreatALow(T, curve, 120, "menu McDonald"), false)
+  const child = { carbRatio: 12, correctionFactor: 50, targetMgdl: 120, weightKg: 40, rapidInsulin: "Fiasp" };
+  const meal = [{ ts: new Date(T).toISOString(), description: "canette de coca", carbs_g: 35, planned: false }];
+  assert.equal(mealBolusPlan(meal as any, [], T + 22 * 60_000, child, 180, curve).units, 0);
+  // ...while at a merely low-ISH 78, with no low ever measured, the size still decides (the McDo).
+  const lowish = [[-10, 80], [0, 78], [10, 96]].map(([m, v]) => ({ ts: T + (m as number) * 60_000, value: v as number }));
+  assert.equal(eatenToTreatALow(T, lowish, 35, "canette de coca"), false);
+  assert.equal(eatenToTreatALow(T, lowish, 16, "canette de coca"), true);
+});
+
+test("a missing glucose carries the same caveat as a stale one", () => {
+  // computeGuard tests the absent value BEFORE staleness and answers "no_reading", so a plan built
+  // with no glucose at all used to print no warning — less than a five-minute-old reading gets.
+  const noRead = planMealDose({ glucoseMgdl: null, trend: "unknown", staleMin: 999, iobUnits: 0, carbsG: 60, profile: prof });
+  assert.equal(noRead.reason, "stale_no_correction");
+  assert.match(mealPlanLine(noRead, "fr", prof), /mesure ta glycémie/);
+  assert.match(mealPlanLine(noRead, "es", prof), /mide la glucosa/);
+  assert.equal(noRead.mealUnits, 5); // the carb maths is untouched: 60 / 12
+});
+
+test("a missing carb ratio costs the MEAL half only, never the correction the guard authorised", () => {
+  const noIcr = { carbRatio: null as any, correctionFactor: 50, targetMgdl: 110, weightKg: 38, rapidInsulin: "NovoRapid" };
+  const p = planMealDose({ glucoseMgdl: 300, trend: "rising", staleMin: 1, iobUnits: 0, carbsG: 40, profile: noIcr });
+  assert.equal(p.reason, "no_ratios");
+  assert.ok(p.correctionUnits > 0, "a 300 rising must still be corrected");
+  const fr = mealPlanLine(p, "fr", noIcr);
+  assert.match(fr, new RegExp(`${String(p.correctionUnits).replace(".", ",")} u`)); // the correction is named
+  assert.match(fr, /ratio glucides manque/);
+  assert.match(mealPlanLine(p, "es", noIcr), /ratio de carbohidratos/);
+});
+
+test("nothing to inject → the REASON, not a zero-unit dose instruction", () => {
+  // Two sausages (~2 g) photographed while the guard blocks insulin. "0 u pour le repas" replaced
+  // the sentence that said why nothing is due and when to recheck.
+  const falling = planMealDose({ glucoseMgdl: 240, trend: "falling", staleMin: 1, iobUnits: 0, carbsG: 2, profile: prof });
+  assert.equal(falling.totalUnits, 0);
+  const fr = mealPlanLine(falling, "fr", prof);
+  assert.doesNotMatch(fr, /0 u/);
+  assert.match(fr, /redescend déjà toute seule/);
+  const covered = planMealDose({ glucoseMgdl: 200, trend: "stable", staleMin: 1, iobUnits: 4, carbsG: 2, profile: prof });
+  assert.equal(covered.totalUnits, 0);
+  assert.match(mealPlanLine(covered, "fr", prof), /couvre déjà cette glycémie/);
+});
+
+// ─── Second review pass: the fixes above needed fixes of their own. ───────────────────────────────
+
+test("a low that was already treated does not turn the next meal into a rescue", () => {
+  // Hypo at noon, resucrage, back to 118 by 12:38, lunch at 12:40. The measured-low exemption used
+  // to reach back 45 min with no ceiling, so the lunch was filed as treatment for a low that was
+  // over — and 110 g then went uncovered for ever.
+  const LUNCH = new Date("2026-07-31T12:40:00Z").getTime();
+  const curve = [[-40, 65], [-34, 78], [-20, 101], [-2, 118], [10, 140]]
+    .map(([m, v]) => ({ ts: LUNCH + (m as number) * 60_000, value: v as number }));
+  assert.equal(eatenToTreatALow(LUNCH, curve, 110, "menu McDonald"), false);
+  const un = findUncoveredMeal(
+    [{ ts: new Date(LUNCH).toISOString(), carbs_g: 110, description: "menu McDonald" }] as any,
+    [], LUNCH + 20 * 60_000, mcdo, curve,
+  );
+  assert.ok(un, "the lunch after a resolved low still needs covering");
+  // ...and a rescue-sized food at that same moment is still a rescue, by the low-ish rule.
+  assert.equal(eatenToTreatALow(LUNCH, [{ ts: LUNCH, value: 74 }], 15, "3 sucres"), true);
+});
+
+test("over-treating a low is still treatment, but a dinner served at 64 is still dinner", () => {
+  const T = new Date("2026-07-31T20:00:00Z").getTime();
+  const low = [{ ts: T - 4 * 60_000, value: 64 }, { ts: T + 8 * 60_000, value: 88 }];
+  assert.equal(eatenToTreatALow(T, low, 35, "canette de coca"), true);   // a whole can
+  assert.equal(eatenToTreatALow(T, low, 45, "jus + biscuits"), true);    // over-treated, still a rescue
+  assert.equal(eatenToTreatALow(T, low, 90, "assiette de pâtes"), false); // a plate is a meal
+  // The meal at a low is not answered with insulin NOW — it is answered with sugar first.
+  const p = planMealDose({ glucoseMgdl: 64, trend: "falling", staleMin: 1, iobUnits: 0, carbsG: 90, description: "pâtes", profile: mcdo });
+  assert.equal(p.reason, "hypo_first");
+  assert.equal(p.totalUnits, 0);
+  assert.match(mealPlanLine(p, "fr", mcdo), /sucre rapide/);
+  assert.match(mealPlanLine(p, "fr", mcdo), /seulement APRÈS être remonté/);
+});
+
+test("nothing to inject → ONE sentence, never a dose instruction bolted onto it", () => {
+  for (const input of [
+    { glucoseMgdl: 240, trend: "falling" as const, staleMin: 1, iobUnits: 0 },
+    { glucoseMgdl: 200, trend: "stable" as const, staleMin: 1, iobUnits: 4 },
+    { glucoseMgdl: null, trend: "unknown" as const, staleMin: 999, iobUnits: 0 },
+    { glucoseMgdl: 250, trend: "stable" as const, staleMin: 40, iobUnits: 0 },
+    { glucoseMgdl: 100, trend: "stable" as const, staleMin: 1, iobUnits: 3 },
+  ]) {
+    for (const lang of ["fr", "es"]) {
+      const line = mealPlanLine(planMealDose({ ...input, carbsG: 2, profile: prof }), lang, prof);
+      assert.ok(line.trim().length > 0, `empty line for ${JSON.stringify(input)}`);
+      assert.doesNotMatch(line, /Fais l'insuline|Pon la insulina|Bolus étalé|Bolo dividido/,
+        `a when-to-inject instruction next to a zero dose: "${line}"`);
+      assert.doesNotMatch(line, /cette dose|esta dosis/, `names a dose that does not exist: "${line}"`);
+      assert.doesNotMatch(line, /0 u/);
+    }
+  }
+});
+
+test("a missing carb ratio during a HYPO still leads with the sugar", () => {
+  const noIcr = { carbRatio: null as any, correctionFactor: 50, targetMgdl: 110, weightKg: 38, rapidInsulin: "NovoRapid" };
+  const p = planMealDose({ glucoseMgdl: 45, trend: "falling", staleMin: 1, iobUnits: 2, carbsG: 40, profile: noIcr });
+  assert.equal(p.reason, "no_ratios");
+  const fr = mealPlanLine(p, "fr", noIcr);
+  assert.match(fr, /sucre rapide/);          // the rescue the guard computed is named FIRST
+  assert.match(fr, /ratio glucides manque/); // ...and the meal half still explains itself
+});
+
+test("a computable meal with no correction factor says the correction is missing", () => {
+  const noIsf = { carbRatio: 10, correctionFactor: null as any, targetMgdl: null as any, weightKg: 60, rapidInsulin: "Fiasp" };
+  const p = planMealDose({ glucoseMgdl: 300, trend: "rising", staleMin: 1, iobUnits: 0, carbsG: 60, profile: noIsf });
+  assert.equal(p.mealUnits, 6);
+  const fr = mealPlanLine(p, "fr", noIsf);
+  assert.match(fr, /6 u/);
+  assert.match(fr, /CORRECTION/);
+  assert.match(mealPlanLine(p, "es", noIsf), /CORRECCIÓN/);
+});
+
+test("speakable: what the engine writes is not what the TTS should read", () => {
+  const p = planMealDose({ glucoseMgdl: 120, trend: "stable", staleMin: 1, iobUnits: 0, carbsG: 36, description: "jus d'orange", profile: prof });
+  const written = mealPlanLine(p, "fr", prof);
+  assert.match(written, /≈ 9 sucre\(s\)/);          // the written form keeps the compact notation
+  const spoken = speakable(written, "fr");
+  assert.doesNotMatch(spoken, /sucre\(s\)|≈|⚠️/);
+  assert.match(spoken, /environ 9 sucres/);
+  const warned = speakable("⚠️ L'insuline déjà active va encore faire baisser", "fr");
+  assert.doesNotMatch(warned, /⚠️/);
+  assert.match(speakable("Para ~36 g, ≈ 9 terrón(es): 3 u", "es"), /unos 9 terrones de azúcar/);
 });

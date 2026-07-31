@@ -860,6 +860,17 @@ data class BgStrings(
     val carbsActiveValue: String,
     val carbsActiveExplain: String,
     val carbsActiveRow: String,
+    // « Si je mange ça, combien d'insuline ? » — la réponse AVANT le repas, page Repas.
+    // mealDoseTitle : titre de la carte. mealDoseAsk : bouton dans le formulaire.
+    // mealDoseAsking : pendant le calcul. mealDoseFailed : le serveur n'a pas répondu.
+    val mealDoseTitle: String,
+    val mealDoseAsk: String,
+    val mealDoseAsking: String,
+    val mealDoseFailed: String,
+    // Le repas est daté dans le PASSÉ : la question « combien pour ce repas » ne se pose plus.
+    val mealDoseTooLate: String,
+    // Aliment sans glucides : c'est une RÉPONSE (rien à couvrir), pas une panne.
+    val mealDoseNoCarbs: String,
 )
 
 private val BgStringsFr = BgStrings(
@@ -896,6 +907,12 @@ private val BgStringsFr = BgStrings(
     carbsActiveValue = "≈ %1\$d g (≈ %2\$d sucres)",
     carbsActiveExplain = "Les glucides de tes derniers repas encore en train d'être absorbés — ils vont continuer à faire monter la glycémie. Un sucre rapide agit en ~2 h, des pâtes ou un repas gras jusqu'à ~4 h.",
     carbsActiveRow = "encore ~%d g",
+    mealDoseTitle = "POUR CE REPAS",
+    mealDoseAsk = "Combien d'insuline ?",
+    mealDoseAsking = "Calcul de la dose…",
+    mealDoseFailed = "Dose indisponible — réessaie dans un instant.",
+    mealDoseTooLate = "Repas déjà mangé — la dose d'un repas se calcule avant de le manger.",
+    mealDoseNoCarbs = "Pas de glucides à couvrir — aucune insuline pour ce repas.",
 )
 
 private val BgStringsEs = BgStrings(
@@ -932,6 +949,12 @@ private val BgStringsEs = BgStrings(
     carbsActiveValue = "≈ %1\$d g (≈ %2\$d terrones)",
     carbsActiveExplain = "Los carbohidratos de tus últimas comidas que aún se están absorbiendo — seguirán subiendo la glucosa. Un azúcar rápido actúa en ~2 h; la pasta o una comida grasa hasta ~4 h.",
     carbsActiveRow = "aún ~%d g",
+    mealDoseTitle = "PARA ESTA COMIDA",
+    mealDoseAsk = "¿Cuánta insulina?",
+    mealDoseAsking = "Calculando la dosis…",
+    mealDoseFailed = "Dosis no disponible — inténtalo de nuevo en un momento.",
+    mealDoseTooLate = "Comida ya ingerida — la dosis de una comida se calcula antes de comerla.",
+    mealDoseNoCarbs = "Sin carbohidratos que cubrir — ninguna insulina para esta comida.",
 )
 
 fun bgStringsFor(lang: Lang): BgStrings = if (lang == Lang.ES) BgStringsEs else BgStringsFr
