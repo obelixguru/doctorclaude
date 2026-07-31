@@ -15,6 +15,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.ChevronRight
 import androidx.compose.material.icons.outlined.Close
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -51,9 +52,9 @@ import java.util.Date
 import java.util.Locale
 import kotlin.math.hypot
 
-/** A meal or insulin event drawn as a dot ON the glucose curve. Tapping it opens THAT record.
- *  [id] is the row id of the meal / dose it stands for (0 when unknown — then the tap can only fall
- *  back to the history). */
+/** A meal or insulin event drawn as a dot ON the glucose curve. Tapping it opens a preview badge;
+ *  tapping the badge's line opens THAT record. [id] is the row id of the meal / dose it stands for
+ *  (0 when unknown — then the badge is read-only and the record can't be opened from here). */
 data class GraphEvent(val ts: Long, val insulin: Boolean, val label: String, val id: Long = 0)
 
 // Meal = RED (it sends glucose UP), insulin = GREEN (it brings glucose DOWN) — the user's mnemonic.
@@ -127,7 +128,8 @@ fun GlucoseGraph(
     lineColor: Color = AccentGreen,
     events: List<GraphEvent> = emptyList(),
     onBackgroundClick: () -> Unit = {},
-    /** Tapping a marker that stands for one identified record — opens THAT meal / dose. */
+    /** A LINE OF THE PREVIEW BADGE was tapped — opens THAT meal / dose. Never fired by the tap on
+     *  the dot itself: that only opens the badge, so reading the curve never throws you into a form. */
     onEventClick: (GraphEvent) -> Unit = {},
 ) {
     val pts = remember(readings) { readings.sortedBy { it.timestampMs } }
@@ -172,9 +174,15 @@ fun GlucoseGraph(
     }
 
     var canvasSize by remember { mutableStateOf(IntSize.Zero) }
-    var selected by remember(readings, events) { mutableStateOf<EventCluster?>(null) }
-    var selectedPos by remember { mutableStateOf(Offset.Zero) } // px of the tapped marker, for the badge
+    // WHICH marker is open, held as its TIMESTAMP rather than as the cluster object. Keyed on
+    // `readings`/`events`, the open badge was wiped every time a new glucose arrived — every five
+    // minutes, mid-read. That was a nuisance while a tap opened the editor directly; now that the
+    // badge IS the way into the editor, it would make the record unreachable in the seconds before
+    // the sensor speaks. A timestamp survives the list being rebuilt, and resolves to nothing when
+    // the event itself is gone (deleted, or scrolled out of the window).
+    var selectedTs by remember { mutableStateOf<Long?>(null) }
     var badgeSize by remember { mutableStateOf(IntSize.Zero) }
+    val selected = selectedTs?.let { ts -> clusters.firstOrNull { it.ts == ts } }
 
     Box(modifier) {
         Canvas(
@@ -203,13 +211,13 @@ fun GlucoseGraph(
                         }
                         val cluster = cand?.first
                         when {
-                            // A marker standing for exactly ONE identified record opens that record —
-                            // the meal or the dose itself, not the full history.
-                            cluster != null && cluster.events.size == 1 && cluster.events[0].id != 0L ->
-                                onEventClick(cluster.events[0])
-                            // A meal + a dose logged together: show the preview so the user picks.
-                            cluster != null -> { selected = cluster; selectedPos = cand.second }
-                            selected != null -> selected = null
+                            // TAPPING A MARKER SHOWS IT, IT DOES NOT OPEN IT. A single identified
+                            // record used to jump straight into its editor, so a finger landing on a
+                            // dot while reading the curve threw the user into a form they never
+                            // asked for — and the preview that says WHAT the dot is never appeared.
+                            // Look first, then decide: the badge itself is the door to the editor.
+                            cluster != null -> selectedTs = cluster.ts
+                            selected != null -> selectedTs = null
                             else -> onBackgroundClick()
                         }
                     }
@@ -329,11 +337,17 @@ fun GlucoseGraph(
         // Tap preview over the chart (closeable). Lists every event in the tapped cluster, so a
         // coincident meal + dose both show.
         selected?.let { cl ->
-            // Place the badge ~6 px from the tapped marker (above-right), not at the chart centre,
-            // clamped so it never spills off the chart. Flips below the marker if there's no room above.
-            val bx = (selectedPos.x + 6f).coerceIn(0f, (canvasSize.width - badgeSize.width).coerceAtLeast(0).toFloat())
-            val above = selectedPos.y - badgeSize.height - 6f
-            val by = (if (above >= 0f) above else selectedPos.y + 18f)
+            // Place the badge ~6 px from the marker (above-right), not at the chart centre, clamped
+            // so it never spills off the chart. Flips below the marker if there's no room above.
+            // Recomputed from the event's TIME rather than from the pixel the finger landed on, so it
+            // stays glued to its dot when a new reading re-scales the curve under it.
+            val plotW = (canvasSize.width - leftPad - rightPad).coerceAtLeast(1f)
+            val plotH = (canvasSize.height - topPad - bottomPad).coerceAtLeast(1f)
+            val mx = leftPad + (cl.ts - t0).toFloat() / span * plotW
+            val my = topPad + (maxV - valueAt(cl.ts).coerceIn(minV, maxV)) / rangeV * plotH
+            val bx = (mx + 6f).coerceIn(0f, (canvasSize.width - badgeSize.width).coerceAtLeast(0).toFloat())
+            val above = my - badgeSize.height - 6f
+            val by = (if (above >= 0f) above else my + 18f)
                 .coerceIn(0f, (canvasSize.height - badgeSize.height).coerceAtLeast(0).toFloat())
             Surface(
                 color = CardWhite,
@@ -349,11 +363,12 @@ fun GlucoseGraph(
                 ) {
                     Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
                         for (e in cl.events.sortedBy { it.ts }) {
-                            // Each line opens ITS OWN record, which is how a meal and a dose logged
-                            // at the same minute stay separately reachable.
+                            // Each line opens ITS OWN record — the only way into the editor, and how
+                            // a meal and a dose logged at the same minute stay separately reachable.
+                            val openable = e.id != 0L
                             Row(
                                 verticalAlignment = Alignment.CenterVertically,
-                                modifier = if (e.id != 0L) Modifier.clickable { selected = null; onEventClick(e) } else Modifier
+                                modifier = if (openable) Modifier.clickable { selectedTs = null; onEventClick(e) } else Modifier
                             ) {
                                 Box(
                                     Modifier.padding(end = 8.dp).size(10.dp)
@@ -363,10 +378,20 @@ fun GlucoseGraph(
                                     Text(e.label, color = InkPrimary, fontSize = 12.sp, fontWeight = FontWeight.Bold)
                                     Text(sdfFull.format(Date(e.ts)), color = InkDim, fontSize = 10.sp)
                                 }
+                                // A chevron, because "tap this line to edit it" has to be visible now
+                                // that the tap on the dot no longer does it. No text: this badge sits
+                                // over the chart in both languages.
+                                if (openable) {
+                                    Icon(
+                                        Icons.Filled.ChevronRight, contentDescription = null,
+                                        tint = if (e.insulin) InsulinMarker else MealMarker,
+                                        modifier = Modifier.padding(start = 6.dp).size(16.dp)
+                                    )
+                                }
                             }
                         }
                     }
-                    IconButton(onClick = { selected = null }, modifier = Modifier.size(32.dp)) {
+                    IconButton(onClick = { selectedTs = null }, modifier = Modifier.size(32.dp)) {
                         Icon(Icons.Outlined.Close, contentDescription = "Fermer", tint = InkMuted, modifier = Modifier.size(15.dp))
                     }
                 }
