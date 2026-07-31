@@ -111,6 +111,10 @@ function toGuardProfile(p: any): GuardProfile | null {
 }
 
 function buildSystem(lang: string, p: any, cur: number | null, pr: Record<string, string>, hint: string): string {
+  // WHERE THE PRODUCT WAS BOUGHT. The recipe follows the market: the same can is 4.6 g per 100 ml in
+  // Spain and 10.6 where the classic formula is sold. Without this the model answers for an average
+  // country that exists nowhere.
+  const country = (p?.country || "").trim();
   const curTxt = cur != null ? `${cur} mg/dL` : (lang === "es" ? "desconocida" : "inconnue");
   const profileBits: string[] = [];
   if (p?.age) profileBits.push(lang === "es" ? `${p.age} años` : `${p.age} ans`);
@@ -127,6 +131,7 @@ function buildSystem(lang: string, p: any, cur: number | null, pr: Record<string
       P(pr, "scan.persona", `Eres Doctor Claude, un asistente de salud directo para alguien con diabetes tipo 1.`),
       `PERFIL: ${profileLine}. GLUCOSA actual: ${curTxt}.`,
       `Recibes la FOTO de un producto alimentario (etiqueta, envase o plato). IDENTIFICACIÓN: nombra EXACTAMENTE lo que VES, según los indicios visuales (forma, textura, relleno, color, texto del envase) — NO lo sustituyas por un primo parecido (un pain au chocolat/napolitana NO es un brioche; un cruasán NO es un pan de leche; una salchicha NO es una merguez). Si el envase muestra un nombre o una tabla nutricional, LÉELA y usa sus carbohidratos (para la porción REAL, no por 100 g). Si dudas entre dos productos, elige el más probable y DI tu duda en "reply". Estima la porción y los carbohidratos totales en gramos y rellena "meal". Sé PRUDENTE con la porción: ante la duda, mejor subestimar, y di en "reply" que es una ESTIMACIÓN a verificar (el usuario puede corregir los carbohidratos). Si no logras identificarlo con seguridad, dilo y pide otra foto más clara.`,
+      country ? `PAÍS: la persona está en ${country}. Si reconoces una MARCA, BUSCA su ficha nutricional oficial PARA ESE PAÍS (carbohidratos por 100 g o 100 ml) antes de responder, y multiplícala por la porción que ves. La misma marca no tiene la misma receta en todos los países. Di en "reply" de dónde sale la cifra (etiqueta leída en la foto, ficha oficial, o estimación).` : "",
       carbEstimationRules(lang),
       hint ? `SITUACIÓN (la calcula el sistema): ${hint}.` : "",
       P(pr, "scan.sugar", `Un producto con carbohidratos —aunque sea muy azucarado— se CUBRE con insulina, no se rechaza ni se sustituye. No propongas una "opción más suave" ni moralices.`),
@@ -138,6 +143,7 @@ function buildSystem(lang: string, p: any, cur: number | null, pr: Record<string
     P(pr, "scan.persona", `Tu es Doctor Claude, un assistant santé direct pour une personne qui a un diabète de type 1.`),
     `PROFIL : ${profileLine}. GLYCÉMIE actuelle : ${curTxt}.`,
     `Tu reçois la PHOTO d'un produit alimentaire (étiquette, emballage ou plat). IDENTIFICATION : nomme EXACTEMENT ce que tu VOIS, d'après les indices visuels (forme, texture, garniture, couleur, texte de l'emballage) — NE remplace PAS le produit par un cousin proche (un pain au chocolat N'EST PAS une brioche ; un croissant N'EST PAS un pain au lait ; une saucisse N'EST PAS une merguez). Si l'emballage montre un nom ou un tableau nutritionnel, LIS-LE et utilise ses glucides (pour la portion RÉELLE, pas pour 100 g). Si tu hésites entre deux produits, choisis le plus probable et DIS ton hésitation dans "reply". Estime la portion et les glucides totaux en grammes et remplis "meal". Sois PRUDENT sur la portion : en cas de doute, sous-estime plutôt, et précise dans "reply" que c'est une ESTIMATION à vérifier (l'utilisateur peut corriger les glucides). Si tu ne peux pas l'identifier avec certitude, dis-le et demande une photo plus nette.`,
+    country ? `PAYS : la personne est en ${country}. Si tu reconnais une MARQUE, CHERCHE sa fiche nutritionnelle officielle POUR CE PAYS (glucides pour 100 g ou 100 ml) avant de répondre, et multiplie par la portion que tu vois. La même marque n'a pas la même recette selon le pays. Dis dans "reply" d'où vient le chiffre (étiquette lue sur la photo, fiche officielle, ou estimation).` : "",
     carbEstimationRules(lang),
     hint ? `SITUATION (calculée par le système) : ${hint}.` : "",
     P(pr, "scan.sugar", `Un produit glucidique —même très sucré— se COUVRE avec de l'insuline, il ne se refuse pas et ne se remplace pas. Ne propose pas d'"alternative moins sucrée" et ne fais pas la morale.`),
@@ -180,10 +186,16 @@ async function geminiVision(sys: string, userText: string, imageBase64: string, 
     const r = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${geminiKey}`, {
       method: "POST",
       headers: { "content-type": "application/json" },
+      // SEE THE PRODUCT, THEN LOOK IT UP. Recognising a package is perception; knowing how much
+      // carbohydrate is in THAT country's recipe is a fact that belongs in a search, not in a
+      // model's memory — a 33 cl 7UP is 16 g in Spain and 35 g where the classic recipe is sold.
+      // Grounding cannot be combined with a forced JSON mime type, so the JSON is asked for in the
+      // prompt; the retry below drops the tool if the model or account lacks it.
       body: JSON.stringify({
         systemInstruction: { parts: [{ text: sys }] },
         contents: [{ parts: [{ text: userText }, { inline_data: { mime_type: mime, data: imageBase64 } }] }],
-        generationConfig: { temperature: 0.3, maxOutputTokens: 1200, responseMimeType: "application/json" },
+        tools: [{ google_search: {} }],
+        generationConfig: { temperature: 0.3, maxOutputTokens: 1600 },
       }),
     });
     if (r.ok) {
@@ -194,6 +206,24 @@ async function geminiVision(sys: string, userText: string, imageBase64: string, 
     lastBody = await r.text();
     lastStatus = r.status;
     lastErr = `Gemini ${r.status} (${model}): ${lastBody.slice(0, 120)}`;
+    // Search unavailable for this model/account: same model, same image, no tool. Losing the scan
+    // entirely because a lookup was offered is far worse than a scan that reasons from memory.
+    if (r.status === 400 || r.status === 403) {
+      const r2 = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${geminiKey}`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          systemInstruction: { parts: [{ text: sys }] },
+          contents: [{ parts: [{ text: userText }, { inline_data: { mime_type: mime, data: imageBase64 } }] }],
+          generationConfig: { temperature: 0.3, maxOutputTokens: 1200, responseMimeType: "application/json" },
+        }),
+      });
+      if (r2.ok) {
+        const j2 = await r2.json();
+        const parts2 = j2?.candidates?.[0]?.content?.parts ?? [];
+        return { raw: parts2.map((p: any) => p?.text ?? "").join("").trim() };
+      }
+    }
     if (r.status !== 404 && r.status !== 400) return { error: lastErr, kind: classifyLlmError(r.status, lastBody), status: r.status };
   }
   return { error: lastErr, kind: classifyLlmError(lastStatus, lastBody), status: lastStatus };

@@ -1,7 +1,7 @@
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "jsr:@supabase/supabase-js@2";
 import { accessSubject } from "../_shared/access.ts";
-import { mealCarbSpeed, carbSpeedAdvice, type CarbSpeed } from "../_shared/doseGuard.ts";
+import { mealCarbSpeed, carbSpeedAdvice, stripInsulinNumbers, type CarbSpeed } from "../_shared/doseGuard.ts";
 import { chatJson, llmErrorKind, llmErrorMessage } from "../_shared/llm.ts";
 
 // Doctor Claude — DIÉTÉTIQUE. Analyses the LOGGED FOOD over the last N days against the glucose
@@ -189,6 +189,14 @@ Deno.serve(async (req: Request) => {
       alerts = Array.isArray(p.alerts) ? p.alerts.filter((x: any) => typeof x === "string" && x.trim()).map((x: string) => x.trim()).slice(0, 3) : [];
       goodPoints = Array.isArray(p.goodPoints) ? p.goodPoints.filter((x: any) => typeof x === "string" && x.trim()).map((x: string) => x.trim()).slice(0, 3) : [];
       tip = typeof p.tip === "string" ? p.tip.trim() : "";
+      // THE SECOND LOCK, which this tab never had. Every other LLM surface strips dose figures in
+      // code as well as forbidding them in the prompt; the Diététique tab relied on the prompt alone,
+      // so "pense à 2 u avant le goûter" would have gone straight to the screen. Nothing here is ever
+      // an instruction to inject: this page reviews what was eaten, it does not dose.
+      summary = stripInsulinNumbers(summary) || summary;
+      tip = stripInsulinNumbers(tip) || tip;
+      alerts = alerts.map((a) => stripInsulinNumbers(a) || a);
+      goodPoints = goodPoints.map((g) => stripInsulinNumbers(g) || g);
     } catch (e) {
       // AI down → still return the DATA (the cards stay useful) + a code-owned fallback summary.
       const kind = llmErrorKind(e);

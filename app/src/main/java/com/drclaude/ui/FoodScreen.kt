@@ -72,6 +72,8 @@ fun FoodScreen(
     var loading by remember { mutableStateOf(true) }
     var busy by remember { mutableStateOf(false) }
     var saveError by remember { mutableStateOf(false) } // a write failed → show it (no silent close)
+    // Provenance of the carb figure the server just computed — shown once, under the list.
+    var carbSourceNote by remember { mutableStateOf("") }
     var scanning by remember { mutableStateOf(false) }
     var scanResult by remember { mutableStateOf("") }
     var showCamera by remember { mutableStateOf(false) }
@@ -281,11 +283,21 @@ fun FoodScreen(
 
         Text(s.foodVoiceHint, color = InkMuted, fontSize = 11.sp, lineHeight = 15.sp)
 
+        // Where the carbs of the meal just added came from. An estimate says so in the same breath as
+        // the number, so a figure worth checking on the packet is never mistaken for one already read
+        // off it. Cleared as soon as the next meal is added.
+        if (carbSourceNote.isNotBlank()) {
+            Text(
+                carbSourceNote,
+                color = InkMuted, fontSize = 12.sp, lineHeight = 16.sp,
+                modifier = Modifier.fillMaxWidth().padding(bottom = 6.dp)
+            )
+        }
         // Pinned bottom row: 2 ways to add — manual (opens the form) or camera scan. The gallery
         // pick now lives as a small icon INSIDE the camera screen, so this row is less cluttered.
         Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             Button(
-                onClick = { if (patientId != null) { editingMeal = null; desc = ""; carbs = ""; qty = "1"; mealWhen = null; saveError = false; showAdd = true } },
+                onClick = { if (patientId != null) { editingMeal = null; desc = ""; carbs = ""; qty = "1"; mealWhen = null; saveError = false; carbSourceNote = ""; showAdd = true } },
                 enabled = patientId != null,
                 colors = ButtonDefaults.buttonColors(containerColor = AccentGreen, contentColor = LightBg),
                 shape = RoundedCornerShape(12.dp), contentPadding = PaddingValues(horizontal = 4.dp),
@@ -372,9 +384,21 @@ fun FoodScreen(
                             // timestamp — a null one omits the field and the server silently keeps the
                             // meal's old time, which read as the button doing nothing.
                             val editTs = mealWhen ?: System.currentTimeMillis()
+                            var added: com.drclaude.ai.MealsService.AddResult? = null
                             val ok = if (em != null) service.update(patientId, em.id, desc.trim(), carbs.toIntOrNull(), tsMs = editTs, quantity = qn)
                                      else service.add(patientId, desc.trim(), carbs.toIntOrNull(), false, tsMs = mealWhen, quantity = qn)
+                                         .also { added = it }.ok
                             if (ok) {
+                                // SAY WHERE THE NUMBER CAME FROM. A figure read off a product and a
+                                // figure a model guessed are not the same claim, and printing both
+                                // the same way is how "35 g" for a 16 g can went unquestioned. Only
+                                // shown when the user did NOT type the carbs themselves.
+                                carbSourceNote = when (added?.carbSource) {
+                                    "label_barcode" -> bgS.carbFromLabel
+                                    "product_db" -> added?.productName?.let { String.format(bgS.carbFromDbNamed, it) } ?: bgS.carbFromDb
+                                    "estimate" -> bgS.carbFromEstimate
+                                    else -> ""
+                                }
                                 desc = ""; carbs = ""; qty = "1"; mealWhen = null; editingMeal = null
                                 meals = service.list(patientId)
                                 onDataChanged() // refresh home IOB/markers (so a HIGH alarm re-evaluates)

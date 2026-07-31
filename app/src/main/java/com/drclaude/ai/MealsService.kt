@@ -52,16 +52,24 @@ class MealsService {
         }
     }
 
-    suspend fun add(patientId: String, description: String, carbsG: Int?, planned: Boolean, tsMs: Long? = null, quantity: Int = 1): Boolean =
+    /** WHERE the carb figure came from, so a label and a guess are never shown the same way.
+     *  "user" typed it · "label_barcode" read off the product · "product_db" a country listing ·
+     *  "estimate" the model. Null when an older server doesn't say. */
+    data class AddResult(val ok: Boolean, val carbSource: String? = null, val productName: String? = null)
+
+    suspend fun add(patientId: String, description: String, carbsG: Int?, planned: Boolean, tsMs: Long? = null, quantity: Int = 1): AddResult =
         withContext(Dispatchers.IO) {
             try {
                 val meal = JSONObject().put("description", description).put("planned", planned).put("quantity", quantity)
                 if (carbsG != null) meal.put("carbsG", carbsG) // per-unit; server stores per-unit × quantity
                 if (tsMs != null) meal.put("ts", tsMs) // backdate a forgotten meal
                 val j = post(JSONObject().put("action", "add").put("subject", subjectOf(patientId)).put("meal", meal))
-                j != null && !(j.has("error") && !j.isNull("error"))
+                val ok = j != null && !(j.has("error") && !j.isNull("error"))
+                val src = j?.optString("carbSource")?.takeIf { it.isNotBlank() }
+                val name = j?.optJSONObject("carbFact")?.optString("name")?.takeIf { it.isNotBlank() }
+                AddResult(ok, src, name)
             } catch (e: Exception) {
-                Log.e(TAG, "add failed", e); false
+                Log.e(TAG, "add failed", e); AddResult(false)
             }
         }
 

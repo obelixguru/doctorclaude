@@ -28,6 +28,29 @@ const num = (v: unknown): number | null => {
   return Number.isFinite(n) && n > 0 ? n : null;
 };
 
+// PLAUSIBILITY BOUNDS ON THE RATIOS THE GUARD DOSES WITH. Any number above zero used to be stored
+// exactly as typed, and these three feed the dose directly: a carb ratio entered as 1 instead of 12
+// multiplies every meal bolus by twelve, a correction factor of 5 instead of 50 turns a high into
+// tens of units. The ranges below are deliberately WIDE — they hold every real paediatric and adult
+// value with room to spare, so they reject typing accidents and never a clinician's number.
+// Out of range is REJECTED rather than clamped: a silently corrected ratio is one nobody notices.
+const RANGES: Record<string, [number, number]> = {
+  carb_ratio: [2, 60],           // g of carbohydrate covered by 1 u
+  correction_factor: [10, 300],  // mg/dL dropped by 1 u
+  target_mgdl: [80, 180],
+  weight_kg: [2, 300],
+  age: [0, 120],
+  hba1c: [3, 20],
+  rapid_units_per_day: [0.5, 200],
+  basal_units_per_day: [0.5, 200],
+};
+const inRange = (field: string, v: number | null): number | null => {
+  if (v == null) return null;
+  const r = RANGES[field];
+  if (!r) return v;
+  return v >= r[0] && v <= r[1] ? v : null;
+};
+
 // Years elapsed since an ISO date string (for honeymoon recompute on a partial save). null if unparseable.
 const yearsSince = (d: unknown): number | null => {
   if (typeof d !== "string" || !d) return null;
@@ -133,19 +156,19 @@ Deno.serve(async (req: Request) => {
     // The user "has" their own ratios as soon as they give the two that matter — carb ratio AND
     // correction factor. Target is optional (defaults to a safe 110, or 120 for under-6s), so a
     // two-field entry sticks as the user's ratios instead of silently staying "estimated".
-    const ageN = num(pick("age"));
-    const weightN = num(pick("weight_kg"));
-    const rapidPerDay = num(pick("rapid_units_per_day"));
-    const basalPerDay = num(pick("basal_units_per_day"));
-    const carbN = num(pick("carb_ratio"));
-    const corrN = num(pick("correction_factor"));
+    const ageN = inRange("age", num(pick("age")));
+    const weightN = inRange("weight_kg", num(pick("weight_kg")));
+    const rapidPerDay = inRange("rapid_units_per_day", num(pick("rapid_units_per_day")));
+    const basalPerDay = inRange("basal_units_per_day", num(pick("basal_units_per_day")));
+    const carbN = inRange("carb_ratio", num(pick("carb_ratio")));
+    const corrN = inRange("correction_factor", num(pick("correction_factor")));
     const hasDoctorRatios = !!(carbN && corrN);
     const est = hasDoctorRatios ? null : estimateRatios({
       rapid_units_per_day: rapidPerDay, basal_units_per_day: basalPerDay,
       weight_kg: weightN, age: ageN, diagnosis_years: dxYearsKnown,
     });
 
-    const targetN = num(pick("target_mgdl"));
+    const targetN = inRange("target_mgdl", num(pick("target_mgdl")));
     const defaultTarget = (ageN != null && ageN < 6) ? 120 : 110;
     const row: Record<string, unknown> = {
       subject,
@@ -163,7 +186,7 @@ Deno.serve(async (req: Request) => {
       target_mgdl: targetN != null ? Math.round(targetN) : (est?.target_mgdl ?? (hasDoctorRatios ? defaultTarget : null)),
       ratios_estimated: !hasDoctorRatios,
       // Last lab HbA1c the user typed (%). Merged like the rest: absent in a partial save → keep stored.
-      hba1c: num(pick("hba1c")),
+      hba1c: inRange("hba1c", num(pick("hba1c"))),
       lang: pick("lang") ?? null,
       // WHERE the person is. Not a formality: the same packaged product carries up to twice the sugar
       // depending on the market — Spanish 7UP is 4.6 g per 100 ml, the classic recipe 10.6 — so an

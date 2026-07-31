@@ -107,6 +107,13 @@ fun InsulinScreen(
     var editingDose by remember { mutableStateOf<AnalysisService.InsulinDose?>(null) } // non-null = the dialog edits this dose
 
     LaunchedEffect(patientId) {
+        // BLANK THE SETTINGS FIRST — they belong to whoever was on screen a moment ago. Each line
+        // below only overwrites when the NEW profile carries that key, so a patient without stored
+        // ratios kept showing the previous one's: an adult's carb ratio displayed on a child's
+        // Insulin tab, next to their doses. Same defect as the Profile screen, same repair.
+        rapidName = ""; basalName = ""
+        carbRatio = null; correction = null; target = null
+        ratiosEstimated = true; hasSettings = false
         if (patientId != null) {
             profileSvc.load(patientId)?.let { p ->
                 if (!p.isNull("rapid_insulin")) { rapidName = p.optString("rapid_insulin"); if (name.isBlank()) name = rapidName }

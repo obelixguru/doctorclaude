@@ -280,8 +280,28 @@ class MainActivity : ComponentActivity() {
         var history24 by remember { mutableStateOf<List<GlucoseReading>>(emptyList()) }
         // Re-fetch the 24h server history whenever a new live reading lands (not only at login), so
         // the homepage curve stays as fresh as the history screen instead of freezing at login time.
+        // WHOSE 24 h ARE CURRENTLY ON SCREEN. Everything below was only ever assigned when the new
+        // answer was non-empty, so switching to a patient with no server history left the PREVIOUS
+        // person's curve, average and time-in-range sitting under the new person's name — a parent
+        // reading their own 85% next to their child's photo. Clearing on the change of patient makes
+        // an empty screen the honest answer while the data loads.
+        var statsPatient by remember { mutableStateOf<String?>(null) }
         LaunchedEffect(state.isLoggedIn, state.patientId, state.current?.timestampMs, dataVersion) {
             if (state.isLoggedIn && state.patientId != null) {
+                if (statsPatient != state.patientId) {
+                    history24 = emptyList(); homeEvents = emptyList()
+                    stat24Avg = null; stat24Tir = null; stat24High = null; stat24Low = null
+                    // ...and the ANALYSIS with it. A report carries a dose line — "Action : 2 u de
+                    // Fiasp maintenant" — computed for whoever it was written about. The manual
+                    // switcher already cleared it; the paths that change patient WITHOUT being asked
+                    // (the silent self-heal adoption, the pinned-device switch) did not, so an adult's
+                    // action line could sit under a child's record until something else replaced it.
+                    if (statsPatient != null) {
+                        aiText = ""; aiAt = 0L; aiIsReport = false
+                        reportsPatient = null
+                    }
+                    statsPatient = state.patientId
+                }
                 val h = ai.history(state.patientId, 1)
                 if (h.readings.isNotEmpty()) history24 = h.readings
                 homeEvents = com.drclaude.ui.buildGraphEvents(h.insulin, h.meals)

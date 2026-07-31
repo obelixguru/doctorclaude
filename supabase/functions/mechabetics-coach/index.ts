@@ -452,13 +452,45 @@ function dayLows(stats: any): { pct: number | null; min: number | null; any: boo
   };
 }
 
+/**
+ * Distinct hypo EPISODES in the merged series, and how many went severe. A percentage of the day is
+ * not the same information: 6% below 70 can be one long night or six separate crashes, and those are
+ * different problems with different causes. Neither count existed anywhere in the repo.
+ *
+ * An episode ends only after the glucose has been back above the threshold for RECOVERED_MIN — a
+ * curve bouncing 68/71/69 around the line is one episode, not three.
+ */
+const EPISODE_RECOVERED_MIN = 20;
+function hypoEpisodes(sorted: { ts: number; value: number }[]): { count: number; severe: number; lowestNight: number | null } {
+  let count = 0, severe = 0;
+  let inEpisode = false, episodeSevere = false, aboveSince: number | null = null;
+  let lowestNight: number | null = null;
+  for (const p of sorted || []) {
+    const h = new Date(p.ts).getHours();
+    if ((h >= 23 || h < 7) && p.value < LOW_MGDL) lowestNight = lowestNight == null ? p.value : Math.min(lowestNight, p.value);
+    if (p.value < LOW_MGDL) {
+      if (!inEpisode) { inEpisode = true; episodeSevere = false; count++; }
+      aboveSince = null;
+      if (p.value < SEVERE_LOW_MGDL && !episodeSevere) { episodeSevere = true; severe++; }
+    } else if (inEpisode) {
+      if (aboveSince == null) aboveSince = p.ts;
+      else if ((p.ts - aboveSince) / 60000 >= EPISODE_RECOVERED_MIN) { inEpisode = false; aboveSince = null; }
+    }
+  }
+  return { count, severe, lowestNight };
+}
+
 /** Code-owned sentence about the day's lows, injected into the prompt. Empty when the day stayed
  *  above 70 — so its mere presence tells the model the subject may not be skipped. */
-function hypoDayNote(stats: any, lang: string): string {
+function hypoDayNote(stats: any, lang: string, sorted?: { ts: number; value: number }[]): string {
   const l = dayLows(stats);
-  if (!l.any) return "";
+  const ep = hypoEpisodes(sorted ?? []);
+  if (!l.any && ep.count === 0) return "";
   const es = lang === "es";
   const parts = [
+    ep.count > 0 ? (es ? `${ep.count} episodio(s) por debajo de 70` : `${ep.count} épisode(s) sous 70`) : "",
+    ep.severe > 0 ? (es ? `${ep.severe} por debajo de 54` : `${ep.severe} sous 54`) : "",
+    ep.lowestNight != null ? (es ? `de noche, hasta ${ep.lowestNight} mg/dL` : `dont la nuit, jusqu'à ${ep.lowestNight} mg/dL`) : "",
     l.pct != null && l.pct > 0 ? (es ? `${l.pct}% del día por debajo de 70` : `${l.pct}% de la journée sous 70`) : "",
     l.min != null ? (es ? `mínimo ${l.min} mg/dL` : `minimum ${l.min} mg/dL`) : "",
   ].filter(Boolean).join(", ");
@@ -596,7 +628,7 @@ function mealSpikeNote(meals: any[], sorted: { ts: number; value: number }[], no
   return "";
 }
 
-function buildPrompt(cur: number | null, s: any, lang: string, ctx: string, swing: string, pr: Record<string, string>, hint: string, recent: string, stability: { word: string; note: string }, signalLost: boolean, staleMin: number, sensorExpired: boolean, actionLine: string, noDose: boolean): string {
+function buildPrompt(cur: number | null, s: any, lang: string, ctx: string, swing: string, pr: Record<string, string>, hint: string, recent: string, stability: { word: string; note: string }, signalLost: boolean, staleMin: number, sensorExpired: boolean, actionLine: string, noDose: boolean, sortedForPrompt: { ts: number; value: number }[] = []): string {
   const curMg = cur != null ? `${cur} mg/dL` : (lang === "es" ? "desconocida" : "inconnue");
   const evo = evoLine(s, lang);
   const quality = dayQuality(s, lang); // the day's VERDICT (from time-in-range), not the stability word
@@ -637,7 +669,7 @@ function buildPrompt(cur: number | null, s: any, lang: string, ctx: string, swin
         : "",
       day,
       recent,
-      hypoDayNote(s, lang),
+      hypoDayNote(s, lang, sortedForPrompt),
       `VEREDICTO DEL DÍA (lo calcula el sistema según el TIEMPO EN OBJETIVO **y los pasos por debajo de 70**): día ${quality} (${tToday ?? "?"}% en objetivo hoy, desde las 8 h). ESE es el balance del día — EMPIEZA por esa palabra. NO escribas tú el porcentaje (el sistema añade la línea con cifras).`,
       `ESTABILIDAD (SOLO las oscilaciones): ${stability.word} (${stability.note}). Describe ÚNICAMENTE si la curva está calmada o agitada, NO si el día fue bueno. NUNCA digas "día estable" como balance del día: un día plano pero a menudo por encima del objetivo es un día DIFÍCIL — el tiempo en objetivo manda sobre la regularidad. SIMÉTRICAMENTE, e igual de importante: un día con pasos por debajo de 70 no es "bueno" ni "tranquilo", aunque la curva parezca calmada — una hipoglucemia larga y plana no genera ni variación rápida ni variabilidad alta, así que es INVISIBLE en la palabra de estabilidad. Si arriba existe la línea HIPOGLUCEMIAS, tu frase debe nombrarlas.`,
       `Evolución: ${evo}`,
@@ -677,7 +709,7 @@ function buildPrompt(cur: number | null, s: any, lang: string, ctx: string, swin
       : "",
     day,
     recent,
-    hypoDayNote(s, lang),
+    hypoDayNote(s, lang, sortedForPrompt),
     `VERDICT DE LA JOURNÉE (calculé par le système d'après le TEMPS DANS LA CIBLE **et les passages sous 70**) : journée ${quality} (${tToday ?? "?"}% dans la cible aujourd'hui, depuis 8 h). C'EST le bilan de la journée — COMMENCE par ce mot. Ne cite PAS le pourcentage toi-même (le système ajoute la ligne chiffrée).`,
     `STABILITÉ (les oscillations UNIQUEMENT) : ${stability.word} (${stability.note}). Ça décrit SEULEMENT si la courbe est calme ou agitée, PAS si la journée est bonne. NE dis JAMAIS « journée stable » comme bilan : une journée plate mais souvent au-dessus de la cible est une journée DIFFICILE — le temps dans la cible prime sur la régularité. SYMÉTRIQUEMENT, et c'est tout aussi important : une journée avec des passages sous 70 n'est ni « bonne » ni « tranquille », même si la courbe a l'air calme — une hypo longue et plate ne fait ni variation rapide ni variabilité élevée, elle est donc INVISIBLE dans le mot de stabilité. Si la ligne HYPOS ci-dessus existe, ta phrase doit les nommer.`,
     `Évolution : ${evo}`,
@@ -1024,7 +1056,7 @@ Deno.serve(async (req: Request) => {
       ctx + (mealNudgeNote ? " " + mealNudgeNote : "") + (spikeNote ? " " + spikeNote : "")
         + (recentHypoNote ? " " + recentHypoNote : ""),
       swing, pr, hint, recent, stability, signalLost, staleMin, sensorExpired,
-      actionLine, noDoseDue(guard),
+      actionLine, noDoseDue(guard), sorted,
     );
     let raw = "";
     try {
