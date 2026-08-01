@@ -1,0 +1,238 @@
+/* Design tokens lifted from the app's ui/theme/Color.kt so the two clients look like one product. */
+:root {
+  --bg: #F8FAFC;
+  --card: #FFFFFF;
+  --border: #E6ECF3;
+  --ink: #0F172A;
+  --ink-muted: #64748B;
+  --ink-dim: #94A3B8;
+  --accent: #059669;
+  --accent-2: #10B981;
+  --amber: #F59E0B;
+  --rose: #FB7185;
+  --rose-strong: #E11D48;
+  --on-color: #FFFFFF;
+
+  --good: #10B981;
+  --good-2: #059669;
+  --good-wash: #EAFBF3;
+  --warn: #F59E0B;
+  --warn-2: #EA8A0C;
+  --warn-wash: #FEF5E6;
+  --danger: #FB7185;
+  --danger-2: #E11D48;
+  --danger-wash: #FDEAEE;
+
+  --signal-top: #EF4444;
+  --signal-bottom: #B91C1C;
+
+  --radius: 16px;
+  --shadow: 0 1px 2px rgba(15, 23, 42, .04), 0 4px 16px rgba(15, 23, 42, .06);
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  padding: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+  -webkit-text-size-adjust: 100%;
+  -webkit-font-smoothing: antialiased;
+}
+
+body {
+  /* The home-screen PWA runs under the notch and over the home indicator; these keep content clear
+     of both. Without them the top card slides under the status bar on an iPhone. */
+  padding: env(safe-area-inset-top) env(safe-area-inset-right) 0 env(safe-area-inset-left);
+  overscroll-behavior-y: contain;   /* no rubber-band bounce revealing the page background */
+  min-height: 100vh;
+}
+
+button, input, select, textarea {
+  font: inherit;
+  color: inherit;
+}
+
+button { cursor: pointer; -webkit-tap-highlight-color: transparent; }
+
+/* iOS zooms the whole page when a font-size < 16px input is focused. Never go below 16px here. */
+input, select, textarea { font-size: 16px; }
+
+#app { max-width: 560px; margin: 0 auto; padding: 8px 14px 96px; }
+
+/* ── Typography ─────────────────────────────────────────────────────────── */
+.eyebrow { font-size: 11px; font-weight: 700; letter-spacing: .09em; color: var(--ink-dim); text-transform: uppercase; }
+.h1 { font-size: 21px; font-weight: 800; letter-spacing: -.01em; margin: 0; }
+.muted { color: var(--ink-muted); }
+.dim { color: var(--ink-dim); }
+.small { font-size: 13px; }
+.tiny { font-size: 11px; }
+.center { text-align: center; }
+
+/* ── Cards ──────────────────────────────────────────────────────────────── */
+.card {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+  padding: 16px;
+  margin-bottom: 12px;
+}
+.card.tight { padding: 12px; }
+/* A card that is also a button. Kept a real <button> for keyboard and VoiceOver, restyled so it
+   does not inherit the browser's button chrome. */
+button.card.cardlink { width: 100%; display: block; text-align: left; font: inherit; color: inherit; }
+button.card.cardlink:active { background: var(--bg); }
+.row { display: flex; align-items: center; gap: 10px; }
+.row.between { justify-content: space-between; }
+.col { display: flex; flex-direction: column; gap: 4px; }
+.grow { flex: 1; min-width: 0; }
+.stack > * + * { margin-top: 10px; }
+
+/* ── The headline glucose card ──────────────────────────────────────────── */
+.glucose {
+  border-radius: var(--radius);
+  padding: 18px;
+  color: var(--on-color);
+  margin-bottom: 12px;
+  box-shadow: var(--shadow);
+}
+.glucose.good { background: linear-gradient(135deg, var(--good), var(--good-2)); }
+.glucose.warning { background: linear-gradient(135deg, var(--warn), var(--warn-2)); }
+.glucose.danger { background: linear-gradient(135deg, var(--danger), var(--danger-2)); }
+.glucose.lost { background: linear-gradient(135deg, var(--signal-top), var(--signal-bottom)); }
+.glucose .value { font-size: 62px; font-weight: 800; line-height: 1; letter-spacing: -.03em; }
+.glucose .unit { font-size: 15px; font-weight: 600; opacity: .9; }
+.glucose .arrow { font-size: 34px; font-weight: 700; }
+.glucose .eyebrow { color: rgba(255,255,255,.85); }
+.glucose .sub { color: rgba(255,255,255,.92); font-size: 13px; }
+
+/* ── Stats ──────────────────────────────────────────────────────────────── */
+.stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; }
+.stat { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 10px; text-align: center; }
+.stat .n { font-size: 19px; font-weight: 800; }
+
+.tir { height: 8px; border-radius: 99px; overflow: hidden; display: flex; background: var(--border); }
+.tir > i { display: block; height: 100%; }
+
+/* ── Buttons ────────────────────────────────────────────────────────────── */
+.btn {
+  border: 0; border-radius: 12px; padding: 13px 16px; font-weight: 700; font-size: 14px;
+  letter-spacing: .03em; background: var(--accent); color: var(--on-color); width: 100%;
+  min-height: 46px;
+}
+.btn:active { filter: brightness(.94); }
+.btn[disabled] { opacity: .5; }
+.btn.ghost { background: transparent; color: var(--accent); border: 1px solid var(--border); }
+.btn.subtle { background: var(--bg); color: var(--ink); border: 1px solid var(--border); }
+.btn.danger { background: var(--danger-2); }
+.btn.auto { width: auto; }
+.btn.sm { padding: 8px 12px; min-height: 0; font-size: 12px; border-radius: 10px; }
+
+.btn-row { display: flex; gap: 8px; }
+.btn-row > * { flex: 1; }
+
+/* ── Fields ─────────────────────────────────────────────────────────────── */
+.field { display: block; margin-bottom: 10px; }
+.field > span { display: block; font-size: 12px; font-weight: 600; color: var(--ink-muted); margin-bottom: 5px; }
+.field input, .field select, .field textarea {
+  width: 100%; padding: 12px; border: 1px solid var(--border); border-radius: 12px;
+  background: var(--card); outline: none;
+}
+.field input:focus, .field textarea:focus, .field select:focus { border-color: var(--accent-2); }
+textarea { resize: vertical; min-height: 76px; }
+
+.switch { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 0; }
+.switch + .switch { border-top: 1px solid var(--border); }
+/* Native checkboxes and range inputs, tinted to the brand. Kept native on purpose: they are already
+   accessible, and a hand-built toggle would have to re-earn that. */
+.switch input, input[type="range"] { accent-color: var(--accent); }
+.switch input[type="checkbox"] { width: 26px; height: 26px; flex: none; }
+
+/* ── Chart ──────────────────────────────────────────────────────────────── */
+.chart-wrap { position: relative; }
+canvas.chart { width: 100%; height: 190px; display: block; touch-action: pan-y; }
+
+.badge-pop {
+  position: absolute; z-index: 5; background: var(--card); border: 1px solid var(--border);
+  border-radius: 12px; box-shadow: var(--shadow); padding: 9px 11px; font-size: 12px; max-width: 200px;
+}
+.badge-pop b { display: block; font-size: 12px; }
+.badge-pop .go { color: var(--accent); font-weight: 700; margin-top: 6px; display: block; }
+
+/* ── Lists ──────────────────────────────────────────────────────────────── */
+.item { display: flex; gap: 10px; align-items: flex-start; padding: 11px 0; border-top: 1px solid var(--border); }
+.item:first-child { border-top: 0; }
+.dot { width: 10px; height: 10px; border-radius: 99px; margin-top: 5px; flex: none; }
+.dot.meal { background: var(--rose); }
+.dot.insulin { background: var(--accent); }
+.tag { font-size: 10px; font-weight: 700; padding: 2px 7px; border-radius: 99px; background: var(--bg); border: 1px solid var(--border); color: var(--ink-muted); text-transform: uppercase; letter-spacing: .05em; }
+
+/* ── Tabs ───────────────────────────────────────────────────────────────── */
+.tabs {
+  position: fixed; left: 0; right: 0; bottom: 0; z-index: 20;
+  display: flex; background: rgba(255,255,255,.94);
+  -webkit-backdrop-filter: blur(12px); backdrop-filter: blur(12px);
+  border-top: 1px solid var(--border);
+  padding-bottom: env(safe-area-inset-bottom);
+}
+.tabs button {
+  flex: 1; background: none; border: 0; padding: 9px 2px 7px; color: var(--ink-dim);
+  font-size: 10px; font-weight: 700; letter-spacing: .02em;
+  display: flex; flex-direction: column; align-items: center; gap: 3px;
+}
+.tabs button .ico { font-size: 19px; line-height: 1; }
+.tabs button.on { color: var(--accent); }
+/* `display: flex` above outranks the browser's built-in `[hidden] { display: none }`, so without
+   this the tab bar stayed on screen during login and consent — the two moments there is nothing to
+   navigate to. */
+.tabs[hidden] { display: none; }
+
+.seg { display: flex; background: var(--bg); border: 1px solid var(--border); border-radius: 12px; padding: 3px; gap: 3px; }
+.seg button { flex: 1; border: 0; background: none; padding: 8px; border-radius: 9px; font-size: 12px; font-weight: 700; color: var(--ink-muted); }
+.seg button.on { background: var(--card); color: var(--ink); box-shadow: var(--shadow); }
+
+/* ── Banners ────────────────────────────────────────────────────────────── */
+.banner { border-radius: 12px; padding: 11px 13px; font-size: 13px; margin-bottom: 12px; border: 1px solid transparent; }
+.banner.warn { background: var(--warn-wash); border-color: #F6D9A6; color: #7A4A05; }
+.banner.bad { background: var(--danger-wash); border-color: #F6C2CC; color: #8A1030; }
+.banner.info { background: var(--good-wash); border-color: #B9EBD8; color: #0A5C42; }
+
+.disclaimer { font-size: 11px; color: var(--ink-dim); line-height: 1.45; margin-top: 8px; }
+
+/* ── Modal ──────────────────────────────────────────────────────────────── */
+.scrim {
+  position: fixed; inset: 0; background: rgba(15, 23, 42, .45); z-index: 40;
+  display: flex; align-items: flex-end; justify-content: center;
+}
+.sheet {
+  background: var(--card); border-radius: 20px 20px 0 0; width: 100%; max-width: 560px;
+  padding: 18px 16px calc(18px + env(safe-area-inset-bottom));
+  max-height: 88vh; overflow-y: auto; -webkit-overflow-scrolling: touch;
+}
+.sheet h2 { margin: 0 0 12px; font-size: 17px; }
+
+/* ── The alarm overlay ──────────────────────────────────────────────────── */
+.alarm {
+  position: fixed; inset: 0; z-index: 60; color: #fff;
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  gap: 14px; padding: 28px; text-align: center;
+  animation: pulse 1.1s ease-in-out infinite;
+}
+.alarm.low { background: linear-gradient(160deg, #FB7185, #9F1239); }
+.alarm.high { background: linear-gradient(160deg, #F59E0B, #B45309); }
+.alarm .big { font-size: 74px; font-weight: 800; line-height: 1; }
+.alarm .ttl { font-size: 20px; font-weight: 800; letter-spacing: .05em; }
+@keyframes pulse { 0%, 100% { filter: brightness(1); } 50% { filter: brightness(1.14); } }
+@media (prefers-reduced-motion: reduce) { .alarm { animation: none; } }
+
+.spinner {
+  width: 17px; height: 17px; border: 2px solid var(--border); border-top-color: var(--accent);
+  border-radius: 99px; animation: spin .7s linear infinite; display: inline-block; vertical-align: -3px;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+
+.skeleton { background: linear-gradient(90deg, var(--border), #F1F5F9, var(--border)); background-size: 200% 100%; animation: sk 1.2s linear infinite; border-radius: 8px; height: 13px; }
+@keyframes sk { to { background-position: -200% 0; } }
