@@ -420,7 +420,12 @@ fun InsulinScreen(
                             busy = false
                         }
                     }
-                ) { Text(if (editingDose != null) s.editSave else s.foodAdd, color = AccentGreen, fontWeight = FontWeight.Bold) }
+                ) {
+                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        if (busy) CircularProgressIndicator(color = AccentGreen, strokeWidth = 2.dp, modifier = Modifier.size(15.dp))
+                        Text(if (editingDose != null) s.editSave else s.foodAdd, color = AccentGreen, fontWeight = FontWeight.Bold)
+                    }
+                }
             },
             dismissButton = { TextButton(onClick = { if (!busy) { showAdd = false; editingDose = null; saveError = false } }) { Text(s.cancel, color = InkMuted) } },
             containerColor = CardWhite

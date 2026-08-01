@@ -404,6 +404,11 @@ fun FoodScreen(
                     // to exist while the food is still a decision. On demand rather than on every
                     // keystroke: when the carbs aren't typed the server has to look the product up,
                     // and that is a real call, not a free one.
+                    // ...only when ADDING. Editing a row is correcting the past, and the server
+                    // rightly refuses a prospective dose for food already eaten — so the button
+                    // could only ever answer "repas déjà mangé". A question with one possible
+                    // answer is not a question.
+                    if (editingMeal == null) {
                     TextButton(
                         enabled = !planning && !busy && desc.isNotBlank() && patientId != null,
                         onClick = {
@@ -456,6 +461,7 @@ fun FoodScreen(
                                 modifier = Modifier.padding(12.dp)
                             )
                         }
+                    }
                     }
                     // Editing an existing meal → delete it from here (no separate trash icon / confirm),
                     // mirroring how the insulin-dose dialog handles deletion.
@@ -524,7 +530,15 @@ fun FoodScreen(
                             busy = false
                         }
                     }
-                ) { Text(if (editingMeal != null) s.editSave else s.foodAdd, color = AccentGreen, fontWeight = FontWeight.Bold) }
+                ) {
+                    // A SAVE THAT LOOKS LIKE NOTHING HAPPENED gets pressed again. This write now
+                    // asks the server for the carbs AND the dose, so it can take seconds — the
+                    // button went quiet for the whole time and read as broken.
+                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        if (busy) CircularProgressIndicator(color = AccentGreen, strokeWidth = 2.dp, modifier = Modifier.size(15.dp))
+                        Text(if (editingMeal != null) s.editSave else s.foodAdd, color = AccentGreen, fontWeight = FontWeight.Bold)
+                    }
+                }
             },
             dismissButton = { TextButton(onClick = { if (!busy) { showAdd = false; editingMeal = null; saveError = false } }) { Text(s.cancel, color = InkMuted) } },
             containerColor = CardWhite
