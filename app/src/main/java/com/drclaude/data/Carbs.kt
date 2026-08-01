@@ -122,7 +122,20 @@ data class GlucoseBalance(
     val riseMgdl: Int,      // (cob / carb ratio) × correction factor, discounted
     val landingMgdl: Int,   // glucose + rise − drop
     val headroomMgdl: Int,  // how far above 70 that lands (negative = under)
+    // The same question over the next hour. Totals cannot answer "am I going low", because the two
+    // sides do not arrive at the same speed — a pizza's grams land after the insulin has done its
+    // work. MIRRORS the soon-half of glucoseBalance on the server.
+    val riseSoonMgdl: Int = riseMgdl,
+    val dropSoonMgdl: Int = dropMgdl,
+    val landingSoonMgdl: Int = landingMgdl,
 ) {
+    val headroomSoonMgdl get() = landingSoonMgdl - 70
+    /** The total lands fine but the hour does not: food that arrives too late to stop the fall. */
+    val slowFoodMismatch get() = headroomMgdl >= 0 && headroomSoonMgdl < 0
+    /** MIRRORS the server's `late` test, which is broader than the mismatch flag: food whose
+     *  near-term delivery is less than half its total is arriving late whether or not the totals
+     *  happen to balance. Without this the widget stayed silent on the flagship pizza case. */
+    val foodArrivesLate get() = slowFoodMismatch || (riseMgdl > 0 && riseSoonMgdl * 2 < riseMgdl)
     val sugarWins get() = riseMgdl > dropMgdl * 1.15
     val insulinWins get() = dropMgdl > riseMgdl * 1.15
 }
@@ -133,6 +146,10 @@ fun glucoseBalance(
     cobGrams: Double,
     carbRatio: Int?,
     correctionFactor: Int?,
+    /** Grams landing / units acting within the hour ([carbsLandingWithin], [insulinActingWithin]).
+     *  Null → the near-term half falls back to the totals. */
+    gramsSoon: Double? = null,
+    unitsSoon: Double? = null,
 ): GlucoseBalance? {
     val g = glucoseMgdl ?: return null
     if (g <= 0) return null
@@ -141,9 +158,63 @@ fun glucoseBalance(
     // No carb ratio: the food counts as zero here — the safe side, never a guessed rise.
     val rise = carbRatio?.takeIf { it > 0 }?.let { cobGrams.coerceAtLeast(0.0) / it * isf * COB_TRUST_FRACTION } ?: 0.0
     val landing = g + rise - drop
+    val riseSoon = gramsSoon?.let { gs ->
+        carbRatio?.takeIf { it > 0 }?.let { gs.coerceAtLeast(0.0) / it * isf * COB_TRUST_FRACTION } ?: 0.0
+    } ?: rise
+    val dropSoon = unitsSoon?.let { it.coerceAtLeast(0.0) * isf } ?: drop
     return GlucoseBalance(
         glucoseMgdl = g, iobUnits = iobUnits.coerceAtLeast(0.0), cobGrams = cobGrams.coerceAtLeast(0.0),
         dropMgdl = Math.round(drop).toInt(), riseMgdl = Math.round(rise).toInt(),
         landingMgdl = Math.round(landing).toInt(), headroomMgdl = Math.round(landing).toInt() - 70,
+        riseSoonMgdl = Math.round(riseSoon).toInt(), dropSoonMgdl = Math.round(dropSoon).toInt(),
+        landingSoonMgdl = Math.round(g + riseSoon - dropSoon).toInt(),
     )
+}
+
+/** The window the "next hour" half of the balance looks at. MIRRORS BALANCE_HORIZON_MIN. */
+const val BALANCE_HORIZON_MIN = 60
+
+/** How long before a food STARTS delivering. MIRRORS carbOnsetMin on the server.
+ *  A longer window is not a slower start: pasta's 4 h matches rapid insulin's 4 h, so duration alone
+ *  can never explain why a pizza drops you at two hours. The delay is what does. */
+private fun carbOnsetMin(speed: CarbSpeed): Int = when (speed) {
+    CarbSpeed.FAST -> 10
+    CarbSpeed.FATTY -> 35
+    CarbSpeed.SLOW -> 25
+    else -> 15
+}
+
+/** Grams that will actually be absorbed within [horizonMin] — the food's delivery ramped from its
+ *  onset to the end of its window, integrated over that horizon. NOT a share of what is left:
+ *  [carbsOnBoard] says how much has yet to arrive, this says how much arrives in time to matter. */
+fun carbsLandingWithin(
+    meals: List<AnalysisService.RecentMeal>, nowMs: Long, horizonMin: Int = BALANCE_HORIZON_MIN,
+): Double = meals.sumOf { m ->
+    val carbs = (m.carbsG ?: 0).toDouble()
+    if (carbs <= 0 || m.ts > nowMs) return@sumOf 0.0
+    val speed = mealCarbSpeed(m.description)
+    val win = cobWindowMin(speed).toDouble()
+    val onset = minOf(carbOnsetMin(speed).toDouble(), win - 1)
+    val mins = (nowMs - m.ts) / 60000.0
+    fun doneBy(x: Double) = ((x - onset) / (win - onset)).coerceIn(0.0, 1.0)
+    // Never more than carbsOnBoard says is left: the ramp and the plain decay are two curves over
+    // the same food, and near the end of a long window the ramp overtakes it.
+    val stillLeft = carbs * (1 - mins / win).coerceAtLeast(0.0)
+    minOf(carbs * (doneBy(mins + horizonMin) - doneBy(mins)), stillLeft)
+}.coerceAtLeast(0.0)
+
+/** Units that will act within [horizonMin]: what is on board now minus what will still be then. */
+fun insulinActingWithin(
+    doses: List<AnalysisService.InsulinDose>, nowMs: Long, horizonMin: Int = BALANCE_HORIZON_MIN,
+    /** The profile's rapid insulin, used for a dose logged without a name — the server does the
+     *  same. Left out, a nameless dose of Actrapid (6 h) was treated as a 4 h analog, and since this
+     *  figure is a one-hour SLICE the 3% error on the total became 50% on the slice. */
+    profileInsulin: String? = null,
+): Double {
+    fun iobAt(t: Long) = doses.filter { it.kind != "basal" && it.ts <= nowMs }.sumOf { d ->
+        val dur = (insulinActionMinutes(d.name) ?: insulinActionMinutes(profileInsulin) ?: DEFAULT_INSULIN_ACTION_MIN).toDouble()
+        val mins = (t - d.ts) / 60000.0
+        if (mins in 0.0..dur) d.units * (1 - mins / dur) else 0.0
+    }
+    return (iobAt(nowMs) - iobAt(nowMs + horizonMin * 60_000L)).coerceAtLeast(0.0)
 }

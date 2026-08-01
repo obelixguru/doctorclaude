@@ -10,6 +10,7 @@ import {
   activeIob,
   insulinActionMinutes,
   carbsOnBoard,
+  balanceRates,
   minutesSinceLastRescue,
   MEAL_COVER_WINDOW_MIN,
   MEAL_COVER_FRACTION,
@@ -155,6 +156,7 @@ async function planContext(subject: string, nowMs: number, excludeMealId?: unkno
   minSinceRescue: number | null;
   recentHypo: boolean;
   doses: any[];
+  rates: ReturnType<typeof balanceRates>;
 }> {
   const [profRes, readRes, insRes, mealRes] = await Promise.all([
     db.from("mechabetics_profiles")
@@ -203,6 +205,8 @@ async function planContext(subject: string, nowMs: number, excludeMealId?: unkno
     minSinceRescue: minutesSinceLastRescue(allMeals, nowMs),
     recentHypo: recentHypoFrom(rds, nowMs),
     doses,
+    // Arrival rates, so a slow meal's carbs are not counted as protection they cannot give in time.
+    rates: balanceRates(forCob as any, doses as any, nowMs, dia),
   };
 }
 
@@ -245,7 +249,8 @@ async function mealDoseAnswer(
   }
   const plan = planMealDose({
     glucoseMgdl: ctx.cur, trend: ctx.trend, staleMin: ctx.staleMin, iobUnits: ctx.iob,
-    carbsG, description, cobGrams: ctx.cob, minutesUntilMeal: untilMin > 0 ? untilMin : 0,
+    carbsG, description, cobGrams: ctx.cob, rates: ctx.rates,
+    minutesUntilMeal: untilMin > 0 ? untilMin : 0,
     minSinceRescue: ctx.minSinceRescue, recentHypo: ctx.recentHypo, profile: ctx.gp,
   });
   return { plan, planLine: mealPlanLine(plan, lang, ctx.gp) };

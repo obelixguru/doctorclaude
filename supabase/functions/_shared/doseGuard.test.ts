@@ -45,6 +45,9 @@ import {
   speakable,
   glucoseBalance,
   balanceSystemLine,
+  balanceRates,
+  carbsLandingWithin,
+  insulinActingWithin,
 } from "./doseGuard.ts";
 
 const prof = { carbRatio: 12, correctionFactor: 50, targetMgdl: 110, weightKg: 38, rapidInsulin: "NovoRapid" };
@@ -1403,5 +1406,134 @@ test("every 'where is this heading' answer reads the SAME balance", () => {
     const plan = planMealDose({ glucoseMgdl: g, trend: "stable", staleMin: 1, iobUnits: iob, carbsG: 30, cobGrams: cob, profile: mcdo });
     assert.equal(plan.floorMgdl, b.landingMgdl,
       `the plan's floor disagrees with the balance at ${g}/${iob}u/${cob}g`);
+  }
+});
+
+// ─── Speed, not just quantity. Fifteen minutes into a 60 g meal, juice and pasta leave almost the
+// same grams on board — and mean completely different things against four units of rapid working
+// now. The pizza problem: you go low at two hours and high at five. ──────────────────────────────
+
+const speedNow = new Date("2026-07-31T20:00:00Z").getTime();
+const mealOf = (desc: string, g: number, minsAgo: number) =>
+  [{ ts: speedNow - minsAgo * 60_000, carbs_g: g, description: desc }];
+
+test("carbsLandingWithin: the same grams arrive at very different speeds", () => {
+  // 60 g, 15 min in. Juice starts within ten minutes and spreads over 2 h.
+  const juiceSoon = carbsLandingWithin(mealOf("jus d'orange", 60, 15) as any, speedNow, 60);
+  assert.ok(juiceSoon > 28 && juiceSoon < 36, `juice lands ${juiceSoon} g in the hour`);
+  // Pasta waits 30 min, then spreads over the rest of its 4 h window — barely half as much arrives.
+  const pasta = carbsLandingWithin(mealOf("pâtes", 60, 15) as any, speedNow, 60);
+  assert.ok(pasta > 10 && pasta < 18, `pasta lands ${pasta} g in the hour`);
+  assert.ok(juiceSoon > pasta * 1.8, `juice ${juiceSoon} must far outpace pasta ${pasta}`);
+  // A fatty meal barely starts inside the first hour at all: that is the pizza.
+  const pizza = carbsLandingWithin(mealOf("pizza", 60, 10) as any, speedNow, 60);
+  assert.ok(pizza < pasta, `pizza ${pizza} g must trail pasta ${pasta} g`);
+  // ...while what is LEFT on board barely distinguishes them at all — the reason totals mislead.
+  const juiceLeft = carbsOnBoard(mealOf("jus d'orange", 60, 15) as any, speedNow);
+  const pastaLeft = carbsOnBoard(mealOf("pâtes", 60, 15) as any, speedNow);
+  assert.ok(Math.abs(juiceLeft - pastaLeft) < 5, `totals look alike: ${juiceLeft} vs ${pastaLeft}`);
+  // Nothing left to absorb once the window has passed.
+  assert.equal(carbsLandingWithin(mealOf("jus d'orange", 60, 130) as any, speedNow, 60), 0);
+});
+
+test("insulinActingWithin: what works in the next hour, not what is left in total", () => {
+  const dose = [{ ts: speedNow - 60 * 60_000, units: 6, kind: "rapid", insulin_name: "Fiasp" }];
+  const total = activeIob(dose as any, speedNow, 240);
+  const soon = insulinActingWithin(dose as any, speedNow, 240, 60);
+  assert.equal(Math.round(total * 10) / 10, 4.5);   // 6 × (1 − 60/240)
+  assert.equal(Math.round(soon * 10) / 10, 1.5);    // one hour of a four-hour decay
+  // A dose not yet injected is not insulin about to work.
+  const planned = [{ ts: speedNow + 30 * 60_000, units: 6, kind: "rapid", insulin_name: "Fiasp" }];
+  assert.equal(insulinActingWithin(planned as any, speedNow, 240, 60), 0);
+});
+
+test("the balance separates the race from the fall: juice holds, pasta does not", () => {
+  const doses = [{ ts: speedNow - 10 * 60_000, units: 4, kind: "rapid", insulin_name: "Fiasp" }];
+  const at = (desc: string) => {
+    const meals = mealOf(desc, 60, 15);
+    const rates = balanceRates(meals as any, doses as any, speedNow, 240, 60);
+    return glucoseBalance(110, activeIob(doses as any, speedNow, 240), carbsOnBoard(meals as any, speedNow), prof, rates)!;
+  };
+  const juice = at("jus d'orange");
+  const pasta = at("pâtes");
+  // By TOTAL they are nearly the same — which is exactly what used to drive the decision.
+  assert.ok(Math.abs(juice.landingMgdl - pasta.landingMgdl) < 25);
+  // Within the hour they are not: the juice arrives, the pasta does not.
+  assert.ok(juice.riseSoonMgdl > pasta.riseSoonMgdl * 1.8,
+    `juice ${juice.riseSoonMgdl} vs pasta ${pasta.riseSoonMgdl} mg/dL landing within the hour`);
+  assert.ok(juice.landingSoonMgdl > pasta.landingSoonMgdl);
+});
+
+test("slow food that arrives too late is flagged, and the warning says so", () => {
+  // 120 g of pizza 5 min ago at 85 mg/dL, covered with 7 u: by total it lands at 85, but the pizza
+  // has barely started delivering while a chunk of the insulin already has. Low within the hour.
+  const meals = mealOf("pizza", 120, 5);
+  const doses = [{ ts: speedNow - 5 * 60_000, units: 7, kind: "rapid", insulin_name: "Fiasp" }];
+  const rates = balanceRates(meals as any, doses as any, speedNow, 240, 60);
+  const iob = activeIob(doses as any, speedNow, 240);
+  const b = glucoseBalance(85, iob, carbsOnBoard(meals as any, speedNow), prof, rates)!;
+  assert.ok(b.headroomMgdl >= 0, "by total it looks fine");
+  assert.ok(b.headroomSoonMgdl < 0, "within the hour it goes low");
+  assert.equal(b.slowFoodMismatch, true);
+  const readings = [{ ts: speedNow - 10 * 60_000, value: 90 }, { ts: speedNow, value: 85 }];
+  const fr = inRangeActionLine(meals as any, doses as any, readings, speedNow, prof, "fr", iob, rates);
+  assert.match(fr, /TROP TARD/);
+  assert.match(fr, /repas lent/);
+  const es = inRangeActionLine(meals as any, doses as any, readings, speedNow, prof, "es", iob, rates);
+  assert.match(es, /DEMASIADO TARDE/);
+  // The model is told the same thing, in its own line.
+  assert.match(balanceSystemLine(b, "fr"), /DANS L'HEURE QUI VIENT/);
+  assert.match(balanceSystemLine(b, "fr"), /arrive trop tard/);
+});
+
+test("no rates supplied → the old behaviour, unchanged", () => {
+  const b = glucoseBalance(121, 3.85, 105, mcdo)!;
+  assert.equal(b.riseSoonMgdl, b.riseMgdl);
+  assert.equal(b.dropSoonMgdl, b.dropMgdl);
+  assert.equal(b.landingSoonMgdl, b.landingMgdl);
+  assert.equal(b.slowFoodMismatch, false);
+});
+
+test("THE INVARIANT: the hour may only ADD caution, never remove it", () => {
+  // The mistake this asserts against: judging the hold on the hour ALONE. Insulin decays linearly,
+  // so any dose with more than an hour left contributes exactly a quarter of itself to that hour —
+  // whatever its size. Eight units injected five minutes ago therefore looked survivable, the hold
+  // came off in 1783 states against 85 gained, and the app would have advised a second full meal
+  // bolus on top of the first. A dose decided now acts for four hours; a one-hour glance may notice
+  // a danger the total misses, but it may never clear one the total sees.
+  let added = 0, removed = 0;
+  for (const food of ["pizza", "pâtes", "riz", "jus d'orange"]) {
+    for (const g of [85, 95, 105, 115, 130, 150]) {
+      for (const carbs of [0, 40, 60, 90, 120]) {
+        for (const u of [3, 5, 7, 9]) {
+          for (const ago of [5, 10, 20, 40, 70, 110]) {
+            const meals = carbs > 0 ? [{ ts: speedNow - ago * 60_000, carbs_g: carbs, description: food }] : [];
+            const doses = [{ ts: speedNow - ago * 60_000, units: u, kind: "rapid", insulin_name: "Fiasp" }];
+            const rates = balanceRates(meals as any, doses as any, speedNow, 240, 60);
+            const iob = activeIob(doses as any, speedNow, 240);
+            const cob = carbsOnBoard(meals as any, speedNow);
+            const withRates = mealBolusHeldByIob(g, iob, prof, cob, rates);
+            const totalsOnly = mealBolusHeldByIob(g, iob, prof, cob);
+            if (withRates && !totalsOnly) added++;
+            if (!withRates && totalsOnly) removed++;
+          }
+        }
+      }
+    }
+  }
+  assert.equal(removed, 0, `the hour removed ${removed} holds — it may only add`);
+  assert.ok(added > 0, "and it must actually catch the slow-food case it exists for");
+});
+
+test("a meal can never deliver more in an hour than it has left in total", () => {
+  // Two different curves over the same food — the ramp overtakes the plain decay near the end of a
+  // long window — so "arriving soon" could exceed "still to arrive" by up to 23%.
+  for (const food of ["jus d'orange", "riz", "pâtes", "pizza"]) {
+    for (let ago = 0; ago <= 250; ago += 5) {
+      const meal = mealOf(food, 100, ago);
+      const soon = carbsLandingWithin(meal as any, speedNow, 60);
+      const left = carbsOnBoard(meal as any, speedNow);
+      assert.ok(soon <= left + 1e-9, `${food} at ${ago} min: ${soon} g arriving vs ${left} g left`);
+    }
   }
 });

@@ -28,6 +28,8 @@ import com.drclaude.data.CredentialsStore
 import com.drclaude.data.insulinActionMinutes
 import com.drclaude.data.DEFAULT_INSULIN_ACTION_MIN
 import com.drclaude.data.carbsOnBoard
+import com.drclaude.data.carbsLandingWithin
+import com.drclaude.data.insulinActingWithin
 import com.drclaude.data.GlucoseBalance
 import com.drclaude.data.glucoseBalance
 import com.drclaude.data.carbsStillActive
@@ -176,6 +178,14 @@ fun InsulinScreen(
     // Carbs-on-board (sugar side of the tug), now speed-aware via data/Carbs.kt: juice fades in ~2 h,
     // pasta over ~4 h — a flat 2 h window made every food decay like sugar. Meals announced for later
     // aren't digesting yet. It stays an ESTIMATE, illustrative, never a dose instruction.
+    // The gramless "j'ai pris du sucre" rows, materialised ONCE at 15 g (rule of 15) so both halves
+    // of the balance see the same food. Fed only to carbsOnBoard, the fastest carb in the app came
+    // out as "repas lent, arrive trop tard" — it contributed to the total and to nothing else.
+    val mealsForBalance = remember(recentMeals, nowTick) {
+        recentMeals.map { m ->
+            if ((m.carbsG ?: 0) <= 0 && isSugarRescue(m.description)) m.copy(carbsG = 15) else m
+        }
+    }
     val cob = remember(recentMeals, nowTick) {
         val now = nowTick
         // A SUGAR RESCUE logged WITHOUT grams counts as ~15 g (rule of 15), so a quick "j'ai pris du
@@ -189,8 +199,12 @@ fun InsulinScreen(
     // ...and the balance that says where the rope actually ends up, from the glucose you are at now.
     // Same maths as the server's glucoseBalance (data/Carbs.kt mirrors it), so the widget and the
     // analysis can never announce different winners for the same moment.
-    val balance = remember(currentMgdl, iob, cob, carbRatio, correction) {
-        glucoseBalance(currentMgdl, iob, cob, carbRatio, correction)
+    val balance = remember(currentMgdl, iob, cob, carbRatio, correction, doses, recentMeals, nowTick, rapidName) {
+        glucoseBalance(
+            currentMgdl, iob, cob, carbRatio, correction,
+            gramsSoon = carbsLandingWithin(mealsForBalance, nowTick),
+            unitsSoon = insulinActingWithin(doses, nowTick, profileInsulin = rapidName.takeIf { it.isNotBlank() }),
+        )
     }
 
     Column(modifier = Modifier.fillMaxSize().background(LightBg)) {
@@ -486,10 +500,16 @@ private fun SugarVsInsulinTug(
             // neither: what changes the next hour is the landing. Under 70 it is said plainly, since
             // that is the one outcome worth acting on.
             balance?.let { b ->
-                val goesLow = b.headroomMgdl < 0
+                val goesLow = b.headroomMgdl < 0 || b.headroomSoonMgdl < 0
                 Text(
-                    if (goesLow) String.format(bgS.tugLandsLow, b.glucoseMgdl)
-                    else String.format(bgS.tugLands, b.glucoseMgdl, b.landingMgdl),
+                    when {
+                        // The total balances, the hour does not: a pizza's grams arrive after the
+                        // insulin has done its work. Saying "ça se compense" here would be the
+                        // widget contradicting the analysis on the same moment.
+                        b.foodArrivesLate && goesLow -> String.format(bgS.tugLandsLate, b.landingSoonMgdl)
+                        goesLow -> String.format(bgS.tugLandsLow, b.glucoseMgdl)
+                        else -> String.format(bgS.tugLands, b.glucoseMgdl, b.landingMgdl)
+                    },
                     color = if (goesLow) GlucoseStatus.DANGER.strong else InkMuted,
                     fontSize = 12.sp, lineHeight = 16.sp, textAlign = TextAlign.Center,
                     fontWeight = if (goesLow) FontWeight.Bold else FontWeight.Normal,

@@ -14,6 +14,7 @@ import {
   iobStatusPhrase,
   iobSystemLine,
   glucoseBalance,
+  balanceRates,
   balanceSystemLine,
   combinedActionLine,
   situationHint,
@@ -974,7 +975,10 @@ Deno.serve(async (req: Request) => {
     // what the food still has to give, what the insulin still has to take, and where that lands.
     // It had an authoritative line about the insulin and nothing at all about the sugar, so its
     // narrative could only ever describe one side of a two-sided race.
-    const balance = glucoseBalance(cur, iob, cob, gp);
+    // How fast each side is arriving, not just how much of it is left — a slow meal's grams cannot
+    // hold back insulin that is working now (see BALANCE_HORIZON_MIN).
+    const rates = balanceRates(meals ?? [], insulin ?? [], nowMs, rapidDur);
+    const balance = glucoseBalance(cur, iob, cob, gp, rates);
     const guard = computeGuard({ glucoseMgdl: cur, trend, staleMin, iobUnits: iob, recentHypo, minSinceRescue, profile: gp });
     const hint = situationHint(guard, lang);
 
@@ -1047,18 +1051,18 @@ Deno.serve(async (req: Request) => {
         // The food already eaten is weighed against that insulin (cob) — judged on the insulin
         // alone, this held the bolus for a ~110 g menu because a dose from three hours before was
         // still tailing off.
-        if (plan.units > 0 && mealBolusHeldByIob(cur, iob, gp, cob)) {
+        if (plan.units > 0 && mealBolusHeldByIob(cur, iob, gp, cob, rates)) {
           return mealBolusHeldLine(cur as number, iob, gp, lang, cob);
         }
         if (plan.planned && plan.carbsG != null) {
           return mealPlanLine(planMealDose({
             glucoseMgdl: cur, trend, staleMin, iobUnits: iob,
-            carbsG: plan.carbsG, description: null, cobGrams: cob,
+            carbsG: plan.carbsG, description: null, cobGrams: cob, rates,
             minSinceRescue, recentHypo, profile: gp,
           }), lang, gp, true); // concise: the ANALYSE card is a summary + ONE action line
         }
         if (guard.reason === "in_range" && plan.units <= 0) {
-          return inRangeActionLine(meals ?? [], insulin ?? [], sorted, nowMs, gp, lang, iob);
+          return inRangeActionLine(meals ?? [], insulin ?? [], sorted, nowMs, gp, lang, iob, rates);
         }
         return combinedActionLine(guard, plan.units, lang, gp, plan.planned,
           { description: plan.description, carbsG: plan.carbsG, minutesAgo: plan.minutesAgo });

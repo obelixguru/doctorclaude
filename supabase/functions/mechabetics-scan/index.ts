@@ -11,6 +11,7 @@ import {
   mealBolusUnits,
   mealBolusHeldByIob,
   carbsOnBoard,
+  balanceRates,
   mealBolusHeldLine,
   planMealDose,
   mealPlanLine,
@@ -340,6 +341,7 @@ Deno.serve(async (req: Request) => {
     const minSinceRescue = minutesSinceLastRescue(meals, nowMs);
     // Sugar still on board — the counterweight to `iob` (see mealBolusHeldByIob).
     const cob = carbsOnBoard(meals ?? [], nowMs);
+    const rates = balanceRates(meals ?? [], insulinDoses ?? [], nowMs, dia);
     const guard = computeGuard({ glucoseMgdl: cur, trend, staleMin, iobUnits: iob, recentHypo, minSinceRescue, profile: gp });
     const hint = situationHint(guard, lang);
 
@@ -376,7 +378,7 @@ Deno.serve(async (req: Request) => {
     // was reachable from here exactly as it was from the home screen. The insulin already in keeps
     // going whatever the number on screen says.
     const mealUnitsRaw = mealBolusUnits(mealCarbs, gp);
-    const mealHeld = mealUnitsRaw > 0 && mealBolusHeldByIob(cur, iob, gp, cob);
+    const mealHeld = mealUnitsRaw > 0 && mealBolusHeldByIob(cur, iob, gp, cob, rates);
     const mealUnits = mealHeld ? 0 : mealUnitsRaw;
     // THE PHOTO ANSWERS THE SAME QUESTION AS THE VOICE. Photographing a plate used to return a bare
     // unit count off mealBolusUnits — no timing, no idea where the food would take you uncovered —
@@ -387,7 +389,7 @@ Deno.serve(async (req: Request) => {
     const plan = (!signalLost && mealCarbs && mealCarbs > 0)
       ? planMealDose({
         glucoseMgdl: cur, trend, staleMin, iobUnits: iob, carbsG: mealCarbs,
-        description: parsed.meal?.description, cobGrams: cob,
+        description: parsed.meal?.description, cobGrams: cob, rates,
         minSinceRescue, recentHypo, profile: gp,
       })
       : null;

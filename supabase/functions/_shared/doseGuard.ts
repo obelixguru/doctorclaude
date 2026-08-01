@@ -589,6 +589,123 @@ export interface GlucoseBalance {
   /** How far that landing sits above the low threshold (negative = it goes under). */
   headroomMgdl: number;
   winner: "carbs" | "insulin" | "balanced";
+
+  // ---- THE SAME QUESTION, OVER THE NEXT HOUR ----------------------------------------------------
+  // Totals answer "where does this all end up". They do NOT answer "am I going low", because the two
+  // sides do not arrive at the same speed. Fifteen minutes into a 60 g meal, juice and pasta look
+  // almost identical by total — 53 g against 56 g — while the juice lands inside the hour and the
+  // pasta spreads over three and a half. Against four units of rapid doing most of their work right
+  // now, one of those is a race and the other is a fall with the sugar arriving too late to matter.
+  // That is the pizza problem, and comparing totals is exactly how an app walks into it.
+  /** How far ahead the "soon" figures look. */
+  horizonMin: number;
+  /** Carbs (converted to mg/dL) that actually LAND inside the horizon. */
+  riseSoonMgdl: number;
+  /** Insulin (converted to mg/dL) that actually ACTS inside the horizon. */
+  dropSoonMgdl: number;
+  /** Where the glucose goes within the horizon — the number a hypo warning must be judged on. */
+  landingSoonMgdl: number;
+  headroomSoonMgdl: number;
+  /** True when the two horizons disagree about going low: the total says fine, the hour says not.
+   *  The signature of a slow or fatty meal that will arrive after the insulin has done its damage. */
+  slowFoodMismatch: boolean;
+}
+
+/** How fast each side is actually arriving. Built from the rows themselves, because a rate cannot be
+ *  recovered from a total: 50 g "still on board" is 45 minutes of juice or three hours of pasta. */
+export interface BalanceRates {
+  gramsSoon: number;
+  unitsSoon: number;
+  horizonMin: number;
+}
+
+/** The window the "soon" half of the balance looks at. One hour: it is where rapid insulin does the
+ *  bulk of its work, and it is the horizon a hypo actually develops over — long enough for a fast
+ *  carb to land, short enough that a fatty meal's late tail cannot be counted as protection. */
+export const BALANCE_HORIZON_MIN = 60;
+
+/**
+ * How long before a food STARTS delivering. A longer window is not the same thing as a slower start,
+ * and conflating them is why the first version of this could not express the problem it was written
+ * for: pasta's 4 h window equals rapid insulin's 4 h duration, so both sides shrank by the same
+ * factor over any horizon and the two views could never disagree. What actually makes a pizza
+ * dangerous is that it delivers almost NOTHING in the first hour while the insulin delivers a
+ * quarter of itself — you go low at two hours and high at five. That is a delay, not a duration.
+ */
+export function carbOnsetMin(speed: CarbSpeed): number {
+  // Calibrated against the reference loops rather than invented: Loop applies a flat 10 min delay to
+  // every food, Nightscout's cob.js 20 min, oref0 measures it from the curve instead. Nobody uses 0
+  // — swallowed sugar needs ten minutes to reach the blood and a CGM lags ten more — and nobody
+  // claims a food delivers literally nothing for three quarters of an hour.
+  if (speed === "fast") return 10;
+  if (speed === "fatty") return 35;
+  if (speed === "slow") return 25;
+  return 15;
+}
+
+/**
+ * Carbs that will actually be absorbed within the next `horizonMin`, in grams: the food's delivery
+ * ramped from its onset to the end of its window, integrated over that horizon — NOT a share of
+ * what is left. `carbsOnBoard` answers "how much has yet to arrive"; this answers "how much arrives
+ * in time to matter", and only the second one can be weighed against insulin working right now.
+ */
+export function carbsLandingWithin(meals: MealRow[], nowMs: number, horizonMin = BALANCE_HORIZON_MIN): number {
+  let g = 0;
+  for (const m of meals || []) {
+    if (!m || !isEatenBy(m, nowMs)) continue;
+    const carbs = Number(m.carbs_g ?? m.carbsG ?? 0);
+    if (!Number.isFinite(carbs) || carbs <= 0) continue;
+    const t = typeof m.ts === "number" ? m.ts : new Date(m.ts).getTime();
+    if (!Number.isFinite(t)) continue;
+    const mins = (nowMs - t) / 60000;
+    if (mins < 0) continue;
+    const speed = mealCarbSpeed(m.description);
+    const win = cobWindowMin(speed);
+    const onset = Math.min(carbOnsetMin(speed), win - 1);
+    // Fraction delivered by a given minute: nothing before the onset, then linear to the window end.
+    const doneBy = (min: number) => Math.max(0, Math.min(1, (min - onset) / (win - onset)));
+    // NEVER MORE THAN IS LEFT. This ramp and carbsOnBoard's plain linear decay are two different
+    // curves over the same food, and in the last hour of a long window the ramp overtakes it — the
+    // hour would be credited with up to 23% more sugar than the total says remains. Clamped to what
+    // carbsOnBoard would report, so "arriving soon" can never exceed "still to arrive".
+    const stillLeft = carbs * Math.max(0, 1 - mins / win);
+    g += Math.min(carbs * (doneBy(mins + horizonMin) - doneBy(mins)), stillLeft);
+  }
+  return Math.max(0, g);
+}
+
+/** Insulin that will act within the next `horizonMin`, in units — what is left NOW minus what will
+ *  still be left THEN. Doses not yet injected are excluded from both ends, so a planned dose cannot
+ *  appear as insulin about to work. */
+export function insulinActingWithin(
+  doses: { ts: string | number; units: number; kind?: string; name?: string | null; insulin_name?: string | null }[],
+  nowMs: number,
+  durationMin = 240,
+  horizonMin = BALANCE_HORIZON_MIN,
+): number {
+  const taken = (doses || []).filter((d) => {
+    if (!d) return false;
+    const t = typeof d.ts === "number" ? d.ts : new Date(d.ts).getTime();
+    return Number.isFinite(t) && t <= nowMs;
+  });
+  const now = activeIob(taken, nowMs, durationMin);
+  const later = activeIob(taken, nowMs + horizonMin * 60000, durationMin);
+  return Math.max(0, now - later);
+}
+
+/** Both rates in one call, for the callers that hold the rows. */
+export function balanceRates(
+  meals: MealRow[],
+  doses: { ts: string | number; units: number; kind?: string; name?: string | null; insulin_name?: string | null }[],
+  nowMs: number,
+  durationMin = 240,
+  horizonMin = BALANCE_HORIZON_MIN,
+): BalanceRates {
+  return {
+    gramsSoon: carbsLandingWithin(meals, nowMs, horizonMin),
+    unitsSoon: insulinActingWithin(doses, nowMs, durationMin, horizonMin),
+    horizonMin,
+  };
 }
 
 /** The balance, or null when it cannot be computed honestly (no glucose, or no ratios to convert
@@ -598,6 +715,9 @@ export function glucoseBalance(
   iobUnits: number,
   cobGrams: number,
   profile: GuardProfile | null,
+  /** The two arrival RATES. Without them the "soon" half falls back to the totals — the old
+   *  behaviour, which is right only when both sides happen to move at the same speed. */
+  rates?: BalanceRates | null,
 ): GlucoseBalance | null {
   const g = Number(glucoseMgdl);
   if (!Number.isFinite(g) || g <= 0) return null;
@@ -607,10 +727,22 @@ export function glucoseBalance(
   const landing = g + rise - drop;
   // A 15% band, so "balanced" means genuinely level rather than "the last decimal decided".
   const winner = rise > drop * 1.15 ? "carbs" : drop > rise * 1.15 ? "insulin" : "balanced";
+
+  const riseSoon = rates ? (pendingRiseMgdl(rates.gramsSoon, profile) ?? 0) : rise;
+  const dropSoon = rates ? (pendingDropMgdl(rates.unitsSoon, profile) ?? 0) : drop;
+  const landingSoon = g + riseSoon - dropSoon;
+  const headroomSoon = landingSoon - LOW_MGDL;
   return {
-    glucoseMgdl: Math.round(g), iobUnits: Math.max(0, iobUnits || 0), cobGrams: Math.max(0, cobGrams || 0),
+    glucoseMgdl: Math.round(g), iobUnits: Math.max(0, iobUnits || 0), cobGrams: Math.round(Math.max(0, cobGrams || 0)),
     dropMgdl: Math.round(drop), riseMgdl: Math.round(rise),
     landingMgdl: Math.round(landing), headroomMgdl: Math.round(landing - LOW_MGDL), winner,
+    horizonMin: rates?.horizonMin ?? BALANCE_HORIZON_MIN,
+    riseSoonMgdl: Math.round(riseSoon), dropSoonMgdl: Math.round(dropSoon),
+    landingSoonMgdl: Math.round(landingSoon), headroomSoonMgdl: Math.round(headroomSoon) || 0,
+    // The total says you land fine, the hour says you go under: food that arrives too late to stop
+    // what the insulin is doing right now. Computed on the ROUNDED figures the callers actually
+    // test, or a landing of 69.99999999999999 makes the flag fire while every consumer sees 70.
+    slowFoodMismatch: !!rates && Math.round(landing - LOW_MGDL) >= 0 && (Math.round(headroomSoon) || 0) < 0,
   };
 }
 
@@ -631,9 +763,14 @@ export function balanceSystemLine(b: GlucoseBalance | null, lang: string): strin
   const land = b.landingMgdl < 20
     ? (es ? "por debajo de 20" : "sous 20")
     : `~${b.landingMgdl}`;
+  // The hour ahead, stated separately — the two horizons answer different questions and the model
+  // must not blur them. When they disagree, that disagreement IS the story of the next hour.
+  const soon = es
+    ? ` EN LA PRÓXIMA HORA: +${b.riseSoonMgdl} mg/dL de azúcar contra −${b.dropSoonMgdl} mg/dL de insulina, o sea ~${b.landingSoonMgdl} mg/dL.${b.slowFoodMismatch ? " ATENCIÓN: el total sale bien pero la comida es LENTA y llega demasiado tarde — dentro de una hora la glucosa está baja." : ""}`
+    : ` DANS L'HEURE QUI VIENT : +${b.riseSoonMgdl} mg/dL de sucre contre −${b.dropSoonMgdl} mg/dL d'insuline, soit ~${b.landingSoonMgdl} mg/dL.${b.slowFoodMismatch ? " ATTENTION : le total tombe juste mais le repas est LENT et arrive trop tard — dans une heure la glycémie est basse." : ""}`;
   return es
-    ? `BALANCE AZÚCAR/INSULINA (calculado por el sistema, NO lo recalcules): ahora ${b.glucoseMgdl} mg/dL · el azúcar aún por absorber (~${b.cobGrams} g) empuja +${b.riseMgdl} mg/dL · la insulina aún activa (~${fmtUnits(roundToHalf(b.iobUnits))} u) tira −${b.dropMgdl} mg/dL · sin nada más, esto termina en ${land} mg/dL — ${verdict}. Usa ESTAS cifras cuando expliques hacia dónde va la glucosa.`
-    : `BALANCE SUCRE/INSULINE (calculé par le système, NE le recalcule PAS) : maintenant ${b.glucoseMgdl} mg/dL · le sucre encore à absorber (~${b.cobGrams} g) pousse de +${b.riseMgdl} mg/dL · l'insuline encore active (~${fmtUnits(roundToHalf(b.iobUnits))} u) tire de −${b.dropMgdl} mg/dL · sans rien d'autre, ça finit vers ${land} mg/dL — ${verdict}. Appuie-toi sur CES chiffres quand tu expliques où va la glycémie.`;
+    ? `BALANCE AZÚCAR/INSULINA (calculado por el sistema, NO lo recalcules): ahora ${b.glucoseMgdl} mg/dL · el azúcar aún por absorber (~${b.cobGrams} g) empuja +${b.riseMgdl} mg/dL · la insulina aún activa (~${fmtUnits(roundToHalf(b.iobUnits))} u) tira −${b.dropMgdl} mg/dL · sin nada más, esto termina en ${land} mg/dL — ${verdict}.${soon} Usa ESTAS cifras cuando expliques hacia dónde va la glucosa.`
+    : `BALANCE SUCRE/INSULINE (calculé par le système, NE le recalcule PAS) : maintenant ${b.glucoseMgdl} mg/dL · le sucre encore à absorber (~${b.cobGrams} g) pousse de +${b.riseMgdl} mg/dL · l'insuline encore active (~${fmtUnits(roundToHalf(b.iobUnits))} u) tire de −${b.dropMgdl} mg/dL · sans rien d'autre, ça finit vers ${land} mg/dL — ${verdict}.${soon} Appuie-toi sur CES chiffres quand tu expliques où va la glycémie.`;
 }
 
 /**
@@ -658,9 +795,18 @@ export function mealBolusHeldByIob(
   profile: GuardProfile | null,
   /** Carbs still being absorbed (grams) — from `carbsOnBoard`. 0 = count the insulin alone. */
   cobGrams = 0,
+  /** Arrival rates, from `balanceRates`. With them the hold is judged on the NEXT HOUR, which is the
+   *  only window a hypo actually happens in — sugar that lands in three hours cannot hold back
+   *  insulin working now. Without them it falls back to totals. */
+  rates?: BalanceRates | null,
 ): boolean {
-  const b = glucoseBalance(glucoseMgdl, iobUnits, cobGrams, profile);
-  return !!b && b.headroomMgdl < 0;
+  const b = glucoseBalance(glucoseMgdl, iobUnits, cobGrams, profile, rates);
+  // EITHER HORIZON HOLDS IT. The near-term view exists to catch food that arrives too late — it may
+  // only ADD holds. Judged on the hour ALONE it did the opposite: insulin decays linearly, so any
+  // dose with more than an hour left contributes exactly a quarter of itself to the hour whatever
+  // its size, and eight units injected five minutes ago looked survivable. The hold was released in
+  // 1783 states against 85 gained, and the app would have advised six more units on top.
+  return !!b && (b.headroomMgdl < 0 || b.headroomSoonMgdl < 0);
 }
 
 /** Why no meal bolus is due right now, in the user's language. Names the CURRENT glucose next to the
@@ -1384,6 +1530,8 @@ export function inRangeActionLine(
   profile: GuardProfile | null,
   lang: string,
   iobUnits = 0,
+  /** Arrival rates (`balanceRates`). Without them this compares totals, as it used to. */
+  rates?: BalanceRates | null,
 ): string {
   const es = lang === "es";
   const uncovered = findUncoveredMeal(meals, doses, nowMs, profile, readings);
@@ -1404,16 +1552,19 @@ export function inRangeActionLine(
   const cob = carbsOnBoard(meals || [], nowMs);
   // ONE balance, read twice: once counting the insulin alone (does the question even arise?) and
   // once with the food on the other side (does it survive contact with what is still digesting?).
-  const bare = glucoseBalance(cur, iobUnits, 0, profile);
-  const bal = glucoseBalance(cur, iobUnits, cob, profile);
-  if (bare && bare.headroomMgdl < 0) {
-    const drop = bare.dropMgdl;
+  const bare = glucoseBalance(cur, iobUnits, 0, profile, rates ? { ...rates, gramsSoon: 0 } : null);
+  const bal = glucoseBalance(cur, iobUnits, cob, profile, rates);
+  // Opens on EITHER horizon, and food stands it down only when BOTH clear. On the hour alone the
+  // threshold loosened by the ratio of insulin duration to horizon — four times — and six units
+  // injected minutes earlier at 130 mg/dL came back as "dans la cible, rien à corriger".
+  if (bare && (bare.headroomMgdl < 0 || bare.headroomSoonMgdl < 0)) {
+    const drop = Math.max(bare.dropMgdl, bare.dropSoonMgdl);
     const g = bare.glucoseMgdl;
     const grams = Math.round(cob);
     // Food on board covers the pending drop: not a hypo warning, a watch. The advice that changes is
     // the dangerous half ("eat sugar now, no insulin at all"); the recheck stays.
-    if (bal && bal.headroomMgdl >= 0) {
-      const rise = bal.riseMgdl;
+    if (bal && bal.headroomSoonMgdl >= 0 && bal.headroomMgdl >= 0) {
+      const rise = Math.min(bal.riseMgdl, bal.riseSoonMgdl);
       // Balanced ON PAPER is not the same as comfortable: down at the bottom of the range the margin
       // for a carb count being wrong is gone, so the sugar stays within reach even here.
       const near = g < FALL_WATCH_BELOW
@@ -1423,9 +1574,16 @@ export function inRangeActionLine(
         ? `estás a ${g} mg/dL: la insulina activa aún tiene ~${drop} mg/dL de bajada por delante, pero los ~${grams} g que sigues digiriendo tiran hacia arriba (~${rise} mg/dL). Por ahora se compensan — ${near}, recontrola en 15 min y decide con la nueva medición.`
         : `tu es à ${g} mg/dL : l'insuline active a encore ~${drop} mg/dL de baisse à délivrer, mais les ~${grams} g encore en digestion tirent vers le haut (~${rise} mg/dL). Les deux se compensent pour l'instant — ${near}, recontrôle dans 15 min et décide sur la nouvelle mesure.`;
     }
-    const food = grams > 0
-      ? (es ? ` Los ~${grams} g que aún digieres no alcanzan.` : ` Les ~${grams} g encore en digestion ne suffiront pas.`)
-      : "";
+    // Not enough food, or food that arrives too late — two different situations, and the second one
+    // is the pizza: the grams are there, they simply land after the insulin has done its work.
+    const late = !!bal?.slowFoodMismatch || (bal && grams > 0 && bal.riseSoonMgdl * 2 < bal.riseMgdl);
+    const food = grams === 0
+      ? ""
+      : late
+        ? (es
+          ? ` Los ~${grams} g que digieres llegan DEMASIADO TARDE (comida lenta): en la próxima hora solo entran ~${bal!.riseSoonMgdl} mg/dL de ellos.`
+          : ` Les ~${grams} g en digestion arrivent TROP TARD (repas lent) : dans l'heure qui vient il n'en arrive que ~${bal!.riseSoonMgdl} mg/dL.`)
+        : (es ? ` Los ~${grams} g que aún digieres no alcanzan.` : ` Les ~${grams} g encore en digestion ne suffiront pas.`);
     return es
       ? `estás a ${g} mg/dL y la insulina que sigue activa aún tiene ~${drop} mg/dL de bajada por delante: sin azúcar bajas de 70.${food} Ten azúcar a mano AHORA, recontrola en 15 min, y ninguna insulina más (tampoco para una comida) mientras no haya vuelto a subir.`
       : `tu es à ${g} mg/dL et l'insuline encore active a ~${drop} mg/dL de baisse à délivrer : sans sucre tu passes sous 70.${food} Garde du sucre à portée MAINTENANT, recontrôle dans 15 min, et aucune insuline en plus (repas compris) tant que ce n'est pas remonté.`;
@@ -1604,6 +1762,8 @@ export interface MealPlanInput {
    *  the insulin on board pushes DOWN — without them the floor test below reads every properly
    *  bolused meal as an incoming hypo. NOT the carbs of the meal being planned: those are `carbsG`. */
   cobGrams?: number | null;
+  /** Arrival rates for the two sides (`balanceRates`). Without them the plan compares totals. */
+  rates?: BalanceRates | null;
   minSinceRescue?: number | null;
   recentHypo?: boolean;
   profile: GuardProfile | null;
@@ -1666,7 +1826,7 @@ export function planMealDose(input: MealPlanInput): MealPlanResult {
   // The tug-of-war as it stands BEFORE this meal's own carbs join it: earlier food still landing
   // against the insulin still working. Same function every other "where is this heading" question
   // uses, so the plan's floor and the analysis can never disagree about the same moment.
-  const balance = glucoseBalance(g, iobUnits, Number(input.cobGrams) || 0, profile);
+  const balance = glucoseBalance(g, iobUnits, Number(input.cobGrams) || 0, profile, input.rates ?? null);
   const cobRise = balance?.riseMgdl ?? 0;
 
   // What these carbs do UNBOLUSED: (carbs / ICR) units' worth of glucose, i.e. × ISF mg/dL. Insulin
@@ -1687,7 +1847,12 @@ export function planMealDose(input: MealPlanInput): MealPlanResult {
   // active is ~150 mg/dL of drop still to come, and the plan used to answer "10 u" with no caveat.
   // 121 mg/dL with 4 u active but a menu still digesting is not a floor of −33, it is a glucose on
   // its way up: cobRise (above) is netted in here too.
-  const floorMgdl = balance ? balance.landingMgdl : null;
+  // The floor a MEAL BOLUS is judged against is the WORSE of the two horizons. The near-term one
+  // catches food arriving in three hours against insulin working now; the total catches insulin
+  // working for four hours against a one-hour glance. Taking only the near-term one deleted the
+  // "eat first, inject once it climbs" caveat in 7132 states against 340 gained — including, with
+  // some irony, the pizza this horizon was added for.
+  const floorMgdl = balance ? Math.min(balance.landingMgdl, balance.landingSoonMgdl) : null;
   const lowBeforeMeal = !hypoFirst && carbsG > 0 && (
     (floorMgdl != null && floorMgdl < LOW_MGDL) ||
     (falling && g != null && g < FALL_WATCH_BELOW + 10)

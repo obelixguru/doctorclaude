@@ -11,6 +11,7 @@ import {
   insulinActionMinutes,
   iobSystemLine,
   glucoseBalance,
+  balanceRates,
   balanceSystemLine,
   mealBolusUnits,
   mealBolusHeldByIob,
@@ -365,7 +366,8 @@ Deno.serve(async (req: Request) => {
     const guard = computeGuard({ glucoseMgdl: cur, trend, staleMin, iobUnits: iob, recentHypo, minSinceRescue, profile: gp });
     const hint = situationHint(guard, lang);
 
-    const balance = glucoseBalance(cur, iob, cob, gp);
+    const rates = balanceRates(meals ?? [], insulinDoses ?? [], nowMs, dia);
+    const balance = glucoseBalance(cur, iob, cob, gp, rates);
     // The sugar side of insCtx, which never had one. Appended to it so the model reads the two
     // forces together instead of hearing about the insulin and guessing about the food.
     const balCtx = balanceSystemLine(balance, lang);
@@ -422,7 +424,7 @@ Deno.serve(async (req: Request) => {
     const mealUnitsRaw = mealStated ? mealBolusUnits(mealCarbs, gp) : 0;
     // Weighed against the FOOD too: judged on the insulin alone this refused the bolus for a whole
     // menu because a dose from three hours earlier was still tailing off (the McDo report).
-    const mealHeld = mealUnitsRaw > 0 && mealBolusHeldByIob(cur, iob, gp, cob);
+    const mealHeld = mealUnitsRaw > 0 && mealBolusHeldByIob(cur, iob, gp, cob, rates);
     const mealUnits = mealHeld ? 0 : mealUnitsRaw;
     const mealEstimated = !!mealCarbs && !mealStated;
     // An ANNOUNCED future meal ("je vais manger un McDo"): its bolus happens AT EATING TIME, never
@@ -514,7 +516,7 @@ Deno.serve(async (req: Request) => {
         const line = mealPlanned && (mealCarbs ?? 0) > 0
           ? mealPlanLine(planMealDose({
               glucoseMgdl: cur, trend, staleMin, iobUnits: iob,
-              carbsG: mealCarbs, description: parsed.meal?.description, cobGrams: cob,
+              carbsG: mealCarbs, description: parsed.meal?.description, cobGrams: cob, rates,
               minutesUntilMeal: minutesUntil(parsed.meal?.minutesAgo),
               minSinceRescue, recentHypo, profile: gp,
             }), lang, gp)
