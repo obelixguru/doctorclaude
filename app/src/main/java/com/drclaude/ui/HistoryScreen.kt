@@ -76,14 +76,24 @@ fun HistoryScreen(
     val keyFmt = remember { SimpleDateFormat("yyyy-MM-dd", Locale.getDefault()) }
     val chipFmt = remember { SimpleDateFormat("dd/MM", Locale.getDefault()) }
 
-    var serverReadings by remember { mutableStateOf<List<GlucoseReading>>(emptyList()) }
-    var analyses by remember { mutableStateOf<List<AnalysisService.PastAnalysis>>(emptyList()) }
-    var events by remember { mutableStateOf<List<GraphEvent>>(emptyList()) }
+    // KEYED ON patientId — everything fetched here belongs to ONE person and must go when the person
+    // does. Home already does this (MainActivity: "a parent reading their own 85% next to their
+    // child's photo"); this screen did not, and it is the screen that shows a WEEK. Unkeyed, the
+    // stored series survived the switch, and `if (isNotEmpty())` below then refused to replace it
+    // whenever the new patient's fetch came back empty — so the previous person's readings stayed,
+    // merged with the new person's live feed into one curve, and the time-in-range under a name was
+    // computed over two people at once. Keyed, the switch empties the screen and the honest "waiting"
+    // shows until this patient's own data lands.
+    var serverReadings by remember(patientId) { mutableStateOf<List<GlucoseReading>>(emptyList()) }
+    var analyses by remember(patientId) { mutableStateOf<List<AnalysisService.PastAnalysis>>(emptyList()) }
+    var events by remember(patientId) { mutableStateOf<List<GraphEvent>>(emptyList()) }
     var refreshKey by remember { mutableStateOf(0) }
     var loading by remember { mutableStateOf(false) }
     LaunchedEffect(patientId, refreshKey, lang) {
         loading = true
         val r = ai.history(patientId, 14, lang.code.lowercase())
+        // Still guarded, but now it can only ever hold THIS patient's own earlier answer: a flaky
+        // refresh must not blank a good curve, while a patient switch always starts from empty.
         if (r.readings.isNotEmpty()) serverReadings = r.readings
         analyses = r.analyses
         events = buildGraphEvents(r.insulin, r.meals)
