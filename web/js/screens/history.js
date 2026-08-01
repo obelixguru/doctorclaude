@@ -8,7 +8,7 @@ import { el, clear, mount, hhmm, ddmm } from "../util.js";
 import { t } from "../i18n.js";
 import * as store from "../store.js";
 import { state } from "../store.js";
-import { statusOf, LOW_WARN, HIGH } from "../zones.js";
+import { statusOf, LOW_WARN, HIGH, timeInRange } from "../zones.js";
 import { drawGraph } from "../graph.js";
 
 export function history() {
@@ -74,19 +74,12 @@ export function history() {
     requestAnimationFrame(() => drawGraph(canvas, readings, events));
 
     // Time in range over the shown window, computed from the readings themselves so the figure
-    // always matches the curve above it.
-    const n = readings.length;
-    // Out of range is what the app itself calls out of range: the red zones that ring (< 70 / > 180),
-    // not the amber watch band. Counting 171–180 as "haut" charged the family for every reading in a
-    // band zones.js documents as "shown, never alerts" — and 70–180 is also the standard the clinic
-    // reads time-in-range against. Alarm thresholds are untouched: HIGH_WARN still drives zoneOf,
+    // always matches the curve above it — and by the same method as the phone (zones.js
+    // timeInRange, a port of ui/HistoryScreen.kt:410), so one family cannot read two different
+    // numbers for the same person. Alarm thresholds are untouched: HIGH_WARN still drives zoneOf,
     // which webZonesParity.test.ts sweeps against the server and the phone.
-    const low = readings.filter((r) => r.value < LOW_WARN).length;
-    const high = readings.filter((r) => r.value > HIGH).length;
-    const pLow = Math.round((low / n) * 100);
-    const pHigh = Math.round((high / n) * 100);
-    const tir = Math.max(0, 100 - pLow - pHigh);
-    const avg = Math.round(readings.reduce((s, r) => s + r.value, 0) / n);
+    const { low: pLow, inRange: tir, high: pHigh } = timeInRange(readings);
+    const avg = Math.round(readings.reduce((s, r) => s + r.value, 0) / readings.length);
 
     wrap.append(el("div.card", {}, [
       el("div.eyebrow", { text: days === 1 ? t("periodLast24h") : t("periodOverDays", days) }),

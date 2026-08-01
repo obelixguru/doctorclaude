@@ -40,6 +40,37 @@ export function statusOf(v) {
 export const zoneAlerts = (z) => z === "red_low" || z === "red_high";
 
 /**
+ * Time-weighted low / in-range / high percentages over a window of `{ ts, value }` readings.
+ *
+ * A port of `tirSplit` in the phone's ui/HistoryScreen.kt:410 ("same method as the server +
+ * DayStats"), kept here beside the thresholds so one family can never read two different numbers
+ * for the same person on two screens. Two things it does NOT do, both of which it used to:
+ *
+ *   • It does not count readings. Each reading holds until the next one, capped at 30 min, so a
+ *     sensor gap or a night with the phone off cannot swallow the window — and a dense stretch of
+ *     readings cannot outweigh a sparse one.
+ *   • It does not treat the amber watch band as out of range. Out is < LOW_WARN / > HIGH: what the
+ *     app actually rings for, and the range time-in-range is read against clinically. 171–180 is
+ *     "shown, never alerts" per the zone table above, so it counts as in range.
+ */
+export function timeInRange(readings) {
+  const pts = (readings ?? [])
+    .filter((r) => r && Number.isFinite(r.ts) && Number.isFinite(r.value))
+    .sort((a, b) => a.ts - b.ts);
+  let low = 0, inRange = 0, high = 0, total = 0;
+  for (let k = 0; k < pts.length - 1; k++) {
+    const w = Math.min(Math.max((pts[k + 1].ts - pts[k].ts) / 60000, 0), 30);
+    total += w;
+    const v = pts[k].value;
+    if (v < LOW_WARN) low += w;
+    else if (v > HIGH) high += w;
+    else inRange += w;
+  }
+  const pct = (x) => (total > 0 ? Math.round((x / total) * 100) : 0);
+  return { low: pct(low), inRange: pct(inRange), high: pct(high) };
+}
+
+/**
  * Should this new reading raise an alert, and why? Null means silence.
  *
  * Ported from `alertZones.zoneAlert`: entering a worse zone alerts once, sitting in a zone is
