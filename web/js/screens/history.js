@@ -8,7 +8,7 @@ import { el, clear, mount, hhmm, ddmm } from "../util.js";
 import { t } from "../i18n.js";
 import * as store from "../store.js";
 import { state } from "../store.js";
-import { statusOf, LOW_WARN, HIGH_WARN } from "../zones.js";
+import { statusOf, LOW_WARN, HIGH } from "../zones.js";
 import { drawGraph } from "../graph.js";
 
 export function history() {
@@ -16,9 +16,20 @@ export function history() {
   let tab = "general";
   let days = 7;
 
-  store.loadHistory(days);
   render();
+  reload();
   return root;
+
+  // The load is async, and this screen is NOT one of the two app.js repaints from the store
+  // (app.js:204 — only the dashboard and an active alarm do). Without an explicit repaint the card
+  // showed whatever the store already held: the 14-day series loaded at boot (app.js:197 calls
+  // loadHistory() with no argument → days = 14), under a "sur 7 jours" heading. Right after a
+  // patient switch it was worse — setPatient empties the store precisely so "another person's
+  // numbers must never linger on screen" (store.js:142), so the card sat empty and never filled.
+  async function reload() {
+    await store.loadHistory(days);
+    render();
+  }
 
   function render() {
     clear(root);
@@ -38,7 +49,7 @@ export function history() {
       [1, 7, 14].map((d) => el("button", {
         class: days === d ? "on" : "",
         text: d === 1 ? t("periodLast24h") : t("periodOverDays", d),
-        onclick: async () => { days = d; await store.loadHistory(d); render(); },
+        onclick: () => { days = d; render(); reload(); },
       })));
   }
 
@@ -65,8 +76,13 @@ export function history() {
     // Time in range over the shown window, computed from the readings themselves so the figure
     // always matches the curve above it.
     const n = readings.length;
+    // Out of range is what the app itself calls out of range: the red zones that ring (< 70 / > 180),
+    // not the amber watch band. Counting 171–180 as "haut" charged the family for every reading in a
+    // band zones.js documents as "shown, never alerts" — and 70–180 is also the standard the clinic
+    // reads time-in-range against. Alarm thresholds are untouched: HIGH_WARN still drives zoneOf,
+    // which webZonesParity.test.ts sweeps against the server and the phone.
     const low = readings.filter((r) => r.value < LOW_WARN).length;
-    const high = readings.filter((r) => r.value > HIGH_WARN).length;
+    const high = readings.filter((r) => r.value > HIGH).length;
     const pLow = Math.round((low / n) * 100);
     const pHigh = Math.round((high / n) * 100);
     const tir = Math.max(0, 100 - pLow - pHigh);
@@ -85,7 +101,7 @@ export function history() {
         el("i", { style: `width:${pHigh}%;background:var(--warn)` }),
       ]),
       el("div.row.between.tiny.dim", { style: "margin-top:6px" }, [
-        el("span", { text: `${LOW_WARN}–${HIGH_WARN} mg/dL` }),
+        el("span", { text: `${LOW_WARN}–${HIGH} mg/dL` }),
         el("span", { text: `${tir}%` }),
       ]),
     ]));
