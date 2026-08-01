@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="fr">
+<head>
+  <meta charset="utf-8">
+  <!-- viewport-fit=cover lets the page run under the notch; the safe-area insets in app.css are
+       what keep content clear of it. user-scalable=no is deliberately NOT set: pinch-zoom is an
+       accessibility feature, and this app is read by parents at 3 a.m. -->
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="light">
+  <meta name="theme-color" content="#059669">
+
+  <title>Doctor Claude</title>
+
+  <!-- Home-screen install on iOS. `apple-mobile-web-app-capable` is what makes it open WITHOUT the
+       Safari chrome; without it the app launches in a normal browser tab. -->
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="default">
+  <meta name="apple-mobile-web-app-title" content="Dr Claude">
+  <link rel="apple-touch-icon" href="icons/icon-180.png">
+
+  <link rel="manifest" href="manifest.webmanifest">
+  <link rel="icon" href="icons/icon-192.png">
+  <link rel="stylesheet" href="css/app.css">
+</head>
+<body>
+  <div id="app">
+    <div class="card"><div class="skeleton" style="width:60%"></div></div>
+  </div>
+  <nav class="tabs" id="tabs" hidden></nav>
+
+  <script type="module" src="js/app.js"></script>
+</body>
+</html>
