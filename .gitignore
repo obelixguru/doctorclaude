@@ -27,3 +27,6 @@ supabase/.temp/
 
 # Logs
 *.log
+
+# Agent instructions, local only (contient une description de dosage d insuline)
+CLAUDE.md
