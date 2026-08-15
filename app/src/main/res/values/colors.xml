@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="bg_deep">#FF020617</color>
+    <color name="surface_card">#FF0F172A</color>
+    <color name="border_subtle">#FF1E293B</color>
+    <color name="accent_green">#FF059669</color>
+    <color name="danger_rose">#FFF43F5E</color>
+    <color name="white">#FFFFFFFF</color>
+    <color name="black">#FF000000</color>
+</resources>
