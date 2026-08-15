@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<paths>
+    <!-- Temp product photos captured for the scan feature live in the app cache. -->
+    <cache-path name="scan" path="." />
+</paths>

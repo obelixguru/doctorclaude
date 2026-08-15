@@ -1,0 +1,863 @@
+package com.drclaude.ui
+
+import android.content.Context
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.graphics.Matrix
+import android.media.ExifInterface
+import android.net.Uri
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.PickVisualMediaRequest
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.outlined.Delete
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.core.content.FileProvider
+import com.drclaude.ai.AnalysisService
+import com.drclaude.ai.MealsService
+import com.drclaude.data.GlucoseReading
+import com.drclaude.data.carbsStillActive
+import com.drclaude.ui.theme.*
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import java.io.ByteArrayOutputStream
+import java.io.File
+import java.text.SimpleDateFormat
+import java.util.Locale
+import java.util.TimeZone
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun FoodScreen(
+    patientId: String?,
+    service: MealsService,
+    ai: AnalysisService,
+    lang: Lang,
+    history: List<GlucoseReading>,
+    header: @Composable () -> Unit = {},
+    /** Bumped by the header's refresh chip (MainActivity) to re-run the loader below. */
+    refreshKey: Int = 0,
+    onDataChanged: () -> Unit = {},
+    /** Row id to open the edit dialog on as soon as the meals are loaded — set when the user taps
+     *  that meal's marker on the glucose curve. Consumed once, via [onOpenEditConsumed]. */
+    openEditId: Long? = null,
+    onOpenEditConsumed: () -> Unit = {},
+) {
+    val s = LocalStrings.current
+    val bgS = bgStringsFor(lang)
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    var meals by remember { mutableStateOf<List<MealsService.Meal>>(emptyList()) }
+    var desc by remember { mutableStateOf("") }
+    var carbs by remember { mutableStateOf("") }
+    var loading by remember { mutableStateOf(true) }
+    var busy by remember { mutableStateOf(false) }
+    var saveError by remember { mutableStateOf(false) } // a write failed → show it (no silent close)
+    // Provenance of the carb figure the server just computed — shown once, under the list.
+    var carbSourceNote by remember { mutableStateOf("") }
+    // THE ANSWER THE APP EXISTS FOR: how much insulin for the meal being logged. Code-computed
+    // server-side (doseGuard), never by a model, and never recomputed here — the phone displays the
+    // sentence it was handed. Shown for the meal just saved, and available BEFORE saving from the
+    // form itself, which is the only moment where the number can still change what happens.
+    var doseLine by remember { mutableStateOf("") }
+    var planLine by remember { mutableStateOf("") }   // the in-dialog preview, before anything is written
+    var planning by remember { mutableStateOf(false) }
+    // A plan request outlives the form that asked for it (a product lookup takes seconds). Without a
+    // stamp, cancelling and opening another meal lets the FIRST answer land in the SECOND dialog —
+    // meal A's dose shown as meal B's, and A's carbs written into B's field.
+    var planSeq by remember { mutableStateOf(0) }
+    // Where the carbs in the field came from when the app filled them in. Typing a number the server
+    // estimated makes it indistinguishable from one read off a packet: the save would then report
+    // carbSource "user" and the "glucides ESTIMÉS, vérifie l'emballage" warning would never appear.
+    var filledSource by remember { mutableStateOf<String?>(null) }
+    var filledProduct by remember { mutableStateOf<String?>(null) }
+    var scanning by remember { mutableStateOf(false) }
+    var scanResult by remember { mutableStateOf("") }
+    var showCamera by remember { mutableStateOf(false) }
+    var showAdd by remember { mutableStateOf(false) }   // manual-entry fields live in a dialog now
+    var mealWhen by remember { mutableStateOf<Long?>(null) } // null = now; set to backdate a forgotten meal
+    var editingMeal by remember { mutableStateOf<MealsService.Meal?>(null) } // non-null = the dialog edits this row
+    var qty by remember { mutableStateOf("1") } // quantity multiplier (ate the same item N times)
+    var foodTab by remember { mutableStateOf(0) } // 0 = REPAS & SUCRES (log), 1 = DIÉTÉTIQUE (analysis)
+
+    LaunchedEffect(patientId, refreshKey) {
+        loading = true
+        if (patientId != null) meals = service.list(patientId)
+        loading = false
+    }
+
+    // Carbs still being absorbed, recomputed every minute so the figure visibly decays. Mirrors the
+    // server's carbsOnBoard (data/Carbs.kt): each food fades over ITS own window — juice ~2 h, pasta
+    // ~4 h. A meal announced for later isn't counted until its time comes.
+    var nowTick by remember { mutableStateOf(System.currentTimeMillis()) }
+    LaunchedEffect(Unit) {
+        while (true) { kotlinx.coroutines.delay(60_000); nowTick = System.currentTimeMillis() }
+    }
+    val cobGrams = remember(meals, nowTick) {
+        meals.sumOf { m ->
+            val ts = tsToMs(m.ts) ?: 0L
+            if (ts <= 0L || ts > nowTick) 0.0 else carbsStillActive(m.carbsG, m.description, ts, nowTick)
+        }
+    }
+
+    // Arriving from a tap on the curve: open that meal's editor once the list is in.
+    LaunchedEffect(openEditId, meals) {
+        val id = openEditId ?: return@LaunchedEffect
+        val m = meals.firstOrNull { it.id == id } ?: return@LaunchedEffect
+        editingMeal = m
+        desc = m.description
+        qty = m.quantity.coerceAtLeast(1).toString()
+        carbs = m.carbsG?.let { (it / m.quantity.coerceAtLeast(1)).toString() } ?: ""
+        mealWhen = tsToMs(m.ts)
+        planLine = ""; planSeq += 1; filledSource = null; filledProduct = null
+        showAdd = true
+        onOpenEditConsumed()
+    }
+
+    // Capture handler for the in-app camera: downscale the photo + send it to the scan function.
+    val runScan: (File) -> Unit = { file ->
+        showCamera = false
+        if (patientId != null) {
+            scanning = true; scanResult = ""; doseLine = "" // the card described the PREVIOUS meal
+            scope.launch {
+                val bytes = withContext(Dispatchers.IO) { processImage(file) }
+                if (bytes == null || bytes.isEmpty()) {
+                    scanResult = s.foodScanFail; scanning = false
+                } else {
+                    val r = ai.scan(bytes, patientId, lang.code.lowercase(), history)
+                    scanResult = r.text
+                    meals = service.list(patientId)
+                    scanning = false
+                }
+                runCatching { file.delete() }
+            }
+        }
+    }
+
+    // Reliable fallback to the (sometimes flaky) in-app camera: the Android photo picker needs NO
+    // permission and works on every device — take the photo with the normal camera, then pick it.
+    val pickMedia = rememberLauncherForActivityResult(ActivityResultContracts.PickVisualMedia()) { uri ->
+        if (uri != null && patientId != null) {
+            scanning = true; scanResult = ""; doseLine = "" // the card described the PREVIOUS meal
+            scope.launch {
+                val bytes = withContext(Dispatchers.IO) { processUri(context, uri) }
+                if (bytes == null || bytes.isEmpty()) {
+                    scanResult = s.foodScanFail; scanning = false
+                } else {
+                    val r = ai.scan(bytes, patientId, lang.code.lowercase(), history)
+                    scanResult = r.text
+                    meals = service.list(patientId)
+                    scanning = false
+                }
+            }
+        }
+    }
+
+    if (showCamera) {
+        CameraCapture(
+            lang = lang,
+            onCancel = { showCamera = false },
+            onCaptured = runScan,
+            // Gallery pick now lives as a discreet icon inside the camera: close it, open the picker.
+            onPickGallery = { showCamera = false; pickMedia.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)) }
+        )
+        return
+    }
+
+    Column(
+        modifier = Modifier.fillMaxSize().background(LightBg).padding(start = 16.dp, end = 16.dp, top = 20.dp, bottom = 16.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp)
+    ) {
+        header()
+
+
+        // Two tabs: REPAS & SUCRES (log + scan meals) | DIÉTÉTIQUE (the AI food analysis).
+        val es = lang == Lang.ES
+        TabRow(selectedTabIndex = foodTab, containerColor = LightBg, contentColor = AccentGreen) {
+            Tab(selected = foodTab == 0, onClick = { foodTab = 0 }) {
+                Text(if (es) "COMIDAS Y AZÚCAR" else "REPAS & SUCRES",
+                    color = if (foodTab == 0) AccentGreen else InkMuted, fontSize = 12.sp,
+                    fontWeight = FontWeight.Bold, letterSpacing = 0.5.sp, modifier = Modifier.padding(vertical = 12.dp))
+            }
+            Tab(selected = foodTab == 1, onClick = { foodTab = 1 }) {
+                Text(if (es) "DIETÉTICA" else "DIÉTÉTIQUE",
+                    color = if (foodTab == 1) AccentGreen else InkMuted, fontSize = 12.sp,
+                    fontWeight = FontWeight.Bold, letterSpacing = 0.5.sp, modifier = Modifier.padding(vertical = 12.dp))
+            }
+        }
+
+        if (foodTab == 1) {
+            DietetiqueTab(patientId, ai, lang, Modifier.weight(1f))
+        } else {
+        // The scan spinner + product analysis and the meal list now share ONE scroll (the LazyColumn
+        // below) as header items. Before, the analysis sat ABOVE the weighted meal box at its natural
+        // (unbounded) height, so a long product analysis pushed the meal list down to a ~20 px sliver
+        // you couldn't read or scroll. As scrolling header items the whole thing scrolls together, and
+        // the analysis carries a ✕ to dismiss it.
+        Box(Modifier.weight(1f).fillMaxWidth()) {
+            if (loading) {
+                Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                    CircularProgressIndicator(color = AccentGreen, strokeWidth = 2.dp, modifier = Modifier.size(26.dp))
+                }
+            } else {
+                LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    // "Sucre encore actif" — the food counterpart of "insuline encore active" on the
+                    // insulin page. Knowing how much of a meal is still to come is what makes the
+                    // difference between correcting now and waiting.
+                    // ALWAYS SHOWN, 0 g INCLUDED — exactly like the insulin card on the Insuline
+                    // tab. Hiding it at zero made "no carbs left" and "the app is not computing"
+                    // look identical, and "how much food is still to come" is precisely the number
+                    // you need before deciding to correct. An absent figure is not a reassuring
+                    // figure; it is no figure at all.
+                    item {
+                            Surface(
+                                color = CardWhite, shape = RoundedCornerShape(14.dp),
+                                border = BorderStroke(1.dp, AccentGreen.copy(alpha = 0.4f)),
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Column(Modifier.padding(14.dp)) {
+                                    Text(
+                                        bgS.carbsActiveTitle, color = InkMuted, fontSize = 11.sp,
+                                        fontWeight = FontWeight.Bold, letterSpacing = 1.5.sp
+                                    )
+                                    Spacer(Modifier.height(4.dp))
+                                    val grams = Math.round(cobGrams).toInt()
+                                    val cubes = if (grams <= 0) 0 else Math.max(1, Math.round(cobGrams / 4.0).toInt())
+                                    Text(
+                                        String.format(bgS.carbsActiveValue, grams, cubes),
+                                        // Grey at zero: nothing is landing, so nothing to watch.
+                                        color = if (grams > 0) AccentGreen else InkMuted,
+                                        fontSize = 22.sp, fontWeight = FontWeight.Black
+                                    )
+                                    Spacer(Modifier.height(4.dp))
+                                    Text(bgS.carbsActiveExplain, color = InkDim, fontSize = 11.sp, lineHeight = 15.sp)
+                                }
+                            }
+                    }
+                    // "Pour ce repas : N u" — the dose for the meal that was just logged, with its
+                    // timing and what the food does uncovered. Every figure comes from the server's
+                    // dose guard, so this card can never disagree with the analysis or the voice.
+                    if (doseLine.isNotBlank()) {
+                        item {
+                            Surface(
+                                color = CardWhite, shape = RoundedCornerShape(14.dp),
+                                border = BorderStroke(1.dp, AccentGreen.copy(alpha = 0.4f)),
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Column(Modifier.padding(start = 14.dp, end = 6.dp, top = 4.dp, bottom = 14.dp)) {
+                                    Row(verticalAlignment = Alignment.CenterVertically) {
+                                        Text(
+                                            bgS.mealDoseTitle, color = AccentGreen, fontSize = 11.sp,
+                                            fontWeight = FontWeight.Black, letterSpacing = 1.5.sp,
+                                            modifier = Modifier.weight(1f)
+                                        )
+                                        IconButton(onClick = { doseLine = "" }, modifier = Modifier.size(32.dp)) {
+                                            Icon(Icons.Filled.Close, contentDescription = if (es) "Cerrar" else "Fermer", tint = InkMuted, modifier = Modifier.size(20.dp))
+                                        }
+                                    }
+                                    Text(doseLine, color = InkPrimary, fontSize = 14.sp, lineHeight = 20.sp, modifier = Modifier.padding(end = 8.dp))
+                                }
+                            }
+                        }
+                        item { DoseDisclaimer() }
+                    }
+                    if (scanning) {
+                        item {
+                            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                                CircularProgressIndicator(color = AccentGreen, strokeWidth = 2.dp, modifier = Modifier.size(20.dp))
+                                Text(s.foodScanning, color = InkMuted, fontSize = 13.sp)
+                            }
+                        }
+                    }
+                    if (scanResult.isNotEmpty()) {
+                        item {
+                            Surface(
+                                color = CardWhite, shape = RoundedCornerShape(14.dp),
+                                border = BorderStroke(1.dp, AccentGreen.copy(alpha = 0.4f)), modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Column(Modifier.padding(start = 14.dp, end = 6.dp, top = 4.dp, bottom = 14.dp)) {
+                                    Row(verticalAlignment = Alignment.CenterVertically) {
+                                        Text(
+                                            if (es) "Análisis del producto" else "Analyse du produit",
+                                            color = AccentGreen, fontSize = 11.sp, fontWeight = FontWeight.Black,
+                                            letterSpacing = 0.5.sp, modifier = Modifier.weight(1f)
+                                        )
+                                        IconButton(onClick = { scanResult = "" }, modifier = Modifier.size(32.dp)) {
+                                            Icon(Icons.Filled.Close, contentDescription = if (es) "Cerrar" else "Fermer", tint = InkMuted, modifier = Modifier.size(20.dp))
+                                        }
+                                    }
+                                    Text(scanResult, color = InkPrimary, fontSize = 14.sp, lineHeight = 20.sp, modifier = Modifier.padding(end = 8.dp))
+                                }
+                            }
+                        }
+                        item { DoseDisclaimer() }
+                    }
+                    if (meals.isEmpty()) {
+                        if (!scanning) item { Text(s.foodEmpty, color = InkDim, fontSize = 13.sp) }
+                    } else {
+                        items(meals, key = { it.id }) { m ->
+                            MealRow(m, s, lang,
+                                stillActiveG = (tsToMs(m.ts) ?: 0L).let { ts ->
+                                    if (ts <= 0L || ts > nowTick) 0.0 else carbsStillActive(m.carbsG, m.description, ts, nowTick)
+                                },
+                                stillActiveLabel = bgS.carbsActiveRow,
+                                onEdit = {
+                                    editingMeal = m; desc = m.description
+                                    qty = m.quantity.coerceAtLeast(1).toString()
+                                    // Show carbs PER UNIT (stored carbs_g is the total = per-unit × quantity).
+                                    carbs = m.carbsG?.let { (it / m.quantity.coerceAtLeast(1)).toString() } ?: ""
+                                    mealWhen = tsToMs(m.ts); planLine = ""; planSeq += 1
+                                    filledSource = null; filledProduct = null; showAdd = true
+                                })
+                        }
+                    }
+                }
+            }
+        }
+
+        Text(s.foodVoiceHint, color = InkMuted, fontSize = 11.sp, lineHeight = 15.sp)
+
+        // Where the carbs of the meal just added came from. An estimate says so in the same breath as
+        // the number, so a figure worth checking on the packet is never mistaken for one already read
+        // off it. Cleared as soon as the next meal is added.
+        if (carbSourceNote.isNotBlank()) {
+            Text(
+                carbSourceNote,
+                color = InkMuted, fontSize = 12.sp, lineHeight = 16.sp,
+                modifier = Modifier.fillMaxWidth().padding(bottom = 6.dp)
+            )
+        }
+        // Pinned bottom row: 2 ways to add — manual (opens the form) or camera scan. The gallery
+        // pick now lives as a small icon INSIDE the camera screen, so this row is less cluttered.
+        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Button(
+                onClick = { if (patientId != null) { editingMeal = null; desc = ""; carbs = ""; qty = "1"; mealWhen = null; saveError = false; carbSourceNote = ""; doseLine = ""; planLine = ""; planSeq += 1
+                    filledSource = null; filledProduct = null; showAdd = true } },
+                enabled = patientId != null,
+                colors = ButtonDefaults.buttonColors(containerColor = AccentGreen, contentColor = LightBg),
+                shape = RoundedCornerShape(12.dp), contentPadding = PaddingValues(horizontal = 4.dp),
+                modifier = Modifier.weight(1f).height(48.dp)
+            ) { Text(s.foodAdd, fontWeight = FontWeight.Black, fontSize = 13.sp, maxLines = 1) }
+
+            OutlinedButton(
+                onClick = { if (patientId != null && !scanning) showCamera = true },
+                enabled = !scanning && patientId != null,
+                border = BorderStroke(1.dp, AccentGreen), shape = RoundedCornerShape(12.dp),
+                contentPadding = PaddingValues(horizontal = 4.dp),
+                modifier = Modifier.weight(1f).height(48.dp)
+            ) { Text(s.foodScanShort, color = AccentGreen, fontWeight = FontWeight.Black, fontSize = 13.sp, maxLines = 1) }
+        }
+        }
+    }
+
+    // Manual add: the fields are hidden until the user taps AJOUTER, then saved here.
+    if (showAdd) {
+        AlertDialog(
+            onDismissRequest = { if (!busy) { showAdd = false; editingMeal = null; saveError = false } },
+            title = { Text(if (editingMeal != null) s.editTitle else s.foodAddTitle, color = InkPrimary, fontSize = 16.sp, fontWeight = FontWeight.Bold) },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    if (saveError) Text(s.saveFailed, color = GlucoseStatus.DANGER.strong, fontSize = 12.sp, fontWeight = FontWeight.Bold, lineHeight = 16.sp)
+                    OutlinedTextField(
+                        value = desc, onValueChange = { desc = it },
+                        label = { Text(s.foodDescHint, color = InkMuted, fontSize = 12.sp) },
+                        singleLine = true, modifier = Modifier.fillMaxWidth(), colors = fdColors()
+                    )
+                    OutlinedTextField(
+                        value = carbs, onValueChange = { carbs = it },
+                        label = { Text(s.foodCarbsHint, color = InkMuted, fontSize = 12.sp) },
+                        singleLine = true, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                        modifier = Modifier.fillMaxWidth(), colors = fdColors()
+                    )
+                    // Quantity multiplier — log "ate it 3×" without re-scanning/re-typing.
+                    OutlinedTextField(
+                        value = qty, onValueChange = { qty = it.filter { c -> c.isDigit() }.take(2) },
+                        label = { Text(s.foodQtyHint, color = InkMuted, fontSize = 12.sp) },
+                        singleLine = true, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                        modifier = Modifier.fillMaxWidth(), colors = fdColors()
+                    )
+                    val perU = carbs.toIntOrNull(); val q = qty.toIntOrNull() ?: 1
+                    if (perU != null && q > 1) {
+                        Text(String.format(s.foodQtyTotal, perU * q), color = AccentGreen, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                    }
+                    // allowFuture: a meal you're GOING to eat can be logged ahead — the server marks
+                    // a future-dated meal "prévu" (planned) and the coach times its bolus at eating.
+                    WhenPicker(
+                        mealWhen, { mealWhen = it }, AccentGreen,
+                        allowFuture = true, tomorrowLabel = bgS.whenTomorrow,
+                        showSteppers = true,
+                    )
+
+                    // "SI JE MANGE ÇA, COMBIEN ?" — asked here, before anything is written. Reacting
+                    // to the glucose afterwards can never catch a 110 g meal in time; the number has
+                    // to exist while the food is still a decision. On demand rather than on every
+                    // keystroke: when the carbs aren't typed the server has to look the product up,
+                    // and that is a real call, not a free one.
+                    // ...only when ADDING. Editing a row is correcting the past, and the server
+                    // rightly refuses a prospective dose for food already eaten — so the button
+                    // could only ever answer "repas déjà mangé". A question with one possible
+                    // answer is not a question.
+                    if (editingMeal == null) {
+                    TextButton(
+                        enabled = !planning && !busy && desc.isNotBlank() && patientId != null,
+                        onClick = {
+                            val pid = patientId ?: return@TextButton
+                            planSeq += 1
+                            val mySeq = planSeq
+                            planning = true; planLine = ""
+                            scope.launch {
+                                val q = qty.toIntOrNull()?.coerceIn(1, 50) ?: 1
+                                val r = service.plan(pid, desc.trim(), carbs.toIntOrNull(), tsMs = mealWhen, quantity = q, lang = lang.code.lowercase())
+                                // The spinner must stop whatever happens, INCLUDING when the answer
+                                // is dropped below: leaving it set disabled the button for the rest
+                                // of the screen's life, with "Calcul de la dose…" frozen on it.
+                                planning = false
+                                // Answer for a form the user has since left or changed → drop it.
+                                if (mySeq != planSeq) return@launch
+                                planLine = r.planLine ?: when {
+                                    r.alreadyEaten -> bgS.mealDoseTooLate
+                                    // The server answered, and its answer is "no carbs": that is a
+                                    // result, not a failure — retrying could never change it.
+                                    r.ok && r.carbsG == 0 -> bgS.mealDoseNoCarbs
+                                    else -> bgS.mealDoseFailed
+                                }
+                                // The server may have had to estimate the carbs to answer — show the
+                                // figure it used, so the dose and the number it came from agree, and
+                                // REMEMBER that it was estimated so the save still says so.
+                                if (carbs.isBlank()) (r.carbsPerUnit ?: r.carbsG?.let { it / q })?.let { perUnit ->
+                                    if (perUnit > 0) {
+                                        carbs = perUnit.toString()
+                                        filledSource = r.carbSource
+                                        filledProduct = r.productName
+                                    }
+                                }
+                            }
+                        }
+                    ) {
+                        Text(
+                            if (planning) bgS.mealDoseAsking else bgS.mealDoseAsk,
+                            color = AccentGreen, fontWeight = FontWeight.Bold, fontSize = 13.sp
+                        )
+                    }
+                    if (planLine.isNotBlank()) {
+                        Surface(
+                            color = LightBg, shape = RoundedCornerShape(12.dp),
+                            border = BorderStroke(1.dp, AccentGreen.copy(alpha = 0.4f)),
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Text(
+                                planLine, color = InkPrimary, fontSize = 13.sp, lineHeight = 18.sp,
+                                modifier = Modifier.padding(12.dp)
+                            )
+                        }
+                    }
+                    }
+                    // Editing an existing meal → delete it from here (no separate trash icon / confirm),
+                    // mirroring how the insulin-dose dialog handles deletion.
+                    editingMeal?.let { em ->
+                        TextButton(onClick = {
+                            if (patientId == null || busy) return@TextButton
+                            busy = true; saveError = false
+                            scope.launch {
+                                val okDel = service.delete(patientId, em.id)
+                                if (okDel) {
+                                    meals = service.list(patientId)
+                                    onDataChanged()
+                                    doseLine = "" // a dose for a meal that no longer exists
+                                    desc = ""; carbs = ""; qty = "1"; mealWhen = null; editingMeal = null; showAdd = false
+                                } else saveError = true
+                                busy = false
+                            }
+                        }) { Text(s.deleteEntry, color = GlucoseStatus.DANGER.strong, fontWeight = FontWeight.Bold) }
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(
+                    enabled = !busy && desc.isNotBlank(),
+                    onClick = {
+                        if (patientId == null || desc.isBlank() || busy) return@TextButton
+                        busy = true; saveError = false
+                        scope.launch {
+                            val em = editingMeal
+                            val qn = qty.toIntOrNull()?.coerceIn(1, 50) ?: 1
+                            // Editing: "Maintenant" (mealWhen == null) means NOW, so send an explicit
+                            // timestamp — a null one omits the field and the server silently keeps the
+                            // meal's old time, which read as the button doing nothing.
+                            val editTs = mealWhen ?: System.currentTimeMillis()
+                            val added = if (em != null)
+                                service.update(patientId, em.id, desc.trim(), carbs.toIntOrNull(), tsMs = editTs, quantity = qn, lang = lang.code.lowercase())
+                            else
+                                service.add(patientId, desc.trim(), carbs.toIntOrNull(), false, tsMs = mealWhen, quantity = qn, lang = lang.code.lowercase())
+                            val ok = added.ok
+                            if (ok) {
+                                // The dose for what was just logged, carried out of the dialog onto
+                                // the page — a number that disappears with the form it was computed
+                                // in is a number nobody can act on.
+                                doseLine = added.planLine ?: ""
+                                // SAY WHERE THE NUMBER CAME FROM. A figure read off a product and a
+                                // figure a model guessed are not the same claim, and printing both
+                                // the same way is how "35 g" for a 16 g can went unquestioned. Only
+                                // shown when the user did NOT type the carbs themselves.
+                                // If the preview filled the field for us, the server now sees a
+                                // "typed" figure and reports carbSource "user" — so the provenance
+                                // it gave us BEFORE is the one that tells the truth.
+                                val src = filledSource ?: added.carbSource
+                                val prod = filledProduct ?: added.productName
+                                carbSourceNote = when {
+                                    // The meal IS saved; only its carb figure is still coming. Say
+                                    // that, or a blank "— g" reads as a save that half-failed.
+                                    added.carbsPending ->
+                                        if (lang == Lang.ES) "Comida guardada. Calculando los carbohidratos…"
+                                        else "Repas enregistré. Calcul des glucides en cours…"
+                                    src == "label_barcode" -> bgS.carbFromLabel
+                                    src == "product_db" -> prod?.let { String.format(bgS.carbFromDbNamed, it) } ?: bgS.carbFromDb
+                                    src == "estimate" -> bgS.carbFromEstimate
+                                    else -> ""
+                                }
+                                desc = ""; carbs = ""; qty = "1"; mealWhen = null; editingMeal = null
+                                planLine = ""; filledSource = null; filledProduct = null
+                                meals = service.list(patientId)
+                                onDataChanged() // refresh home IOB/markers (so a HIGH alarm re-evaluates)
+                                showAdd = false
+                                // The carbs land on the row seconds after the answer, so the list we
+                                // just read is already stale. Re-read it twice, without blocking the
+                                // screen — otherwise the number only appears if the user happens to
+                                // leave the page and come back.
+                                if (added.carbsPending) {
+                                    scope.launch {
+                                        for (waitMs in listOf(7_000L, 12_000L)) {
+                                            kotlinx.coroutines.delay(waitMs)
+                                            val fresh = service.list(patientId)
+                                            if (fresh.isNotEmpty()) meals = fresh
+                                            if (fresh.any { it.id == added.mealId && it.carbsG != null }) {
+                                                carbSourceNote = bgS.carbFromEstimate
+                                                onDataChanged()
+                                                break
+                                            }
+                                        }
+                                    }
+                                }
+                            } else saveError = true // keep the dialog open so the meal isn't lost silently
+                            busy = false
+                        }
+                    }
+                ) {
+                    // A SAVE THAT LOOKS LIKE NOTHING HAPPENED gets pressed again. This write now
+                    // asks the server for the carbs AND the dose, so it can take seconds — the
+                    // button went quiet for the whole time and read as broken.
+                    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        if (busy) CircularProgressIndicator(color = AccentGreen, strokeWidth = 2.dp, modifier = Modifier.size(15.dp))
+                        Text(if (editingMeal != null) s.editSave else s.foodAdd, color = AccentGreen, fontWeight = FontWeight.Bold)
+                    }
+                }
+            },
+            dismissButton = { TextButton(onClick = { if (!busy) { showAdd = false; editingMeal = null; saveError = false } }) { Text(s.cancel, color = InkMuted) } },
+            containerColor = CardWhite
+        )
+    }
+
+}
+
+@Composable
+private fun MealRow(
+    m: MealsService.Meal, s: Strings, lang: Lang,
+    stillActiveG: Double = 0.0, stillActiveLabel: String = "",
+    onEdit: () -> Unit,
+) {
+    Surface(
+        color = CardWhite, shape = RoundedCornerShape(12.dp),
+        border = BorderStroke(1.dp, BorderLight), modifier = Modifier.fillMaxWidth()
+    ) {
+        Row(
+            modifier = Modifier.padding(start = 14.dp, end = 14.dp, top = 6.dp, bottom = 6.dp).fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Column(Modifier.weight(1f).clickable(onClick = onEdit)) {
+                Text(
+                    m.description + if (m.quantity > 1) "  ×${m.quantity}" else "",
+                    color = InkPrimary, fontSize = 14.sp, fontWeight = FontWeight.Bold
+                )
+                val sub = buildString {
+                    if (m.carbsG != null) {
+                        // Make grams tangible with the sugar-cube equivalent (~4 g each).
+                        val cubes = Math.max(1, Math.round(m.carbsG / 4.0).toInt())
+                        val word = if (lang == Lang.ES) "terrón(es)" else "sucre(s)"
+                        append("~${m.carbsG} g (≈ $cubes $word)")
+                    }
+                    val t = shortTime(m.ts)
+                    if (t.isNotEmpty()) { if (isNotEmpty()) append("   ·   "); append(t) }
+                    // How much of THIS meal is still being absorbed right now.
+                    val active = Math.round(stillActiveG).toInt()
+                    if (active >= 1) { if (isNotEmpty()) append("   ·   "); append(String.format(stillActiveLabel, active)) }
+                }
+                if (sub.isNotEmpty()) Text(sub, color = InkDim, fontSize = 11.sp)
+            }
+            Surface(
+                color = (if (m.planned) AccentGreen else GlucoseStatus.GOOD.strong).copy(alpha = 0.15f),
+                shape = RoundedCornerShape(8.dp)
+            ) {
+                Text(
+                    if (m.planned) s.foodPlanned else s.foodEaten,
+                    color = if (m.planned) AccentGreen else GlucoseStatus.GOOD.strong2,
+                    fontSize = 10.sp, fontWeight = FontWeight.Bold,
+                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
+                )
+            }
+        }
+    }
+}
+
+/** Meal `ts` comes from Postgres in UTC (ISO). Parse the first 19 chars as UTC and render in the
+ *  device's local time — otherwise it reads ~2 h behind for a CEST user (the raw UTC clock). */
+/** The meal's stored ISO ts (UTC) as epoch ms — to prefill the "Quand ?" picker when editing. */
+private fun tsToMs(ts: String): Long? = try {
+    val core = ts.trim().take(19).replace('T', ' ')
+    SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).apply { timeZone = TimeZone.getTimeZone("UTC") }.parse(core)?.time
+} catch (e: Exception) { null }
+
+private fun shortTime(ts: String): String = try {
+    val core = ts.trim().take(19).replace('T', ' ')            // "2026-06-06 18:30:00"
+    val parser = SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.US).apply { timeZone = TimeZone.getTimeZone("UTC") }
+    SimpleDateFormat("dd/MM HH:mm", Locale.getDefault()).format(parser.parse(core)!!)
+} catch (e: Exception) {
+    if (ts.length >= 16) ts.substring(0, 16).replace('T', ' ') else ts
+}
+
+/** Decode the captured photo, fix EXIF rotation, downscale to ~1280px, JPEG-compress. */
+private fun processImage(file: File): ByteArray? {
+    return try {
+        val maxDim = 1280
+        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        BitmapFactory.decodeFile(file.absolutePath, bounds)
+        var sample = 1
+        while (bounds.outWidth / sample > maxDim * 2 || bounds.outHeight / sample > maxDim * 2) sample *= 2
+        var bmp = BitmapFactory.decodeFile(file.absolutePath, BitmapFactory.Options().apply { inSampleSize = sample })
+            ?: return null
+        val scale = maxDim.toFloat() / maxOf(bmp.width, bmp.height)
+        if (scale < 1f) bmp = Bitmap.createScaledBitmap(bmp, (bmp.width * scale).toInt(), (bmp.height * scale).toInt(), true)
+        val deg = when (ExifInterface(file.absolutePath).getAttributeInt(ExifInterface.TAG_ORIENTATION, ExifInterface.ORIENTATION_NORMAL)) {
+            ExifInterface.ORIENTATION_ROTATE_90 -> 90f
+            ExifInterface.ORIENTATION_ROTATE_180 -> 180f
+            ExifInterface.ORIENTATION_ROTATE_270 -> 270f
+            else -> 0f
+        }
+        if (deg != 0f) bmp = Bitmap.createBitmap(bmp, 0, 0, bmp.width, bmp.height, Matrix().apply { postRotate(deg) }, true)
+        val out = ByteArrayOutputStream()
+        bmp.compress(Bitmap.CompressFormat.JPEG, 85, out)
+        out.toByteArray()
+    } catch (e: Exception) {
+        null
+    }
+}
+
+/** Decode a gallery-picked image (content Uri), downscale to ~1280px, JPEG-compress for the scan. */
+private fun processUri(context: Context, uri: Uri): ByteArray? {
+    return try {
+        val bmp0 = context.contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it) } ?: return null
+        var bmp = bmp0
+        val maxDim = 1280
+        val scale = maxDim.toFloat() / maxOf(bmp.width, bmp.height)
+        if (scale < 1f) bmp = Bitmap.createScaledBitmap(bmp, (bmp.width * scale).toInt(), (bmp.height * scale).toInt(), true)
+        val out = ByteArrayOutputStream()
+        bmp.compress(Bitmap.CompressFormat.JPEG, 85, out)
+        out.toByteArray()
+    } catch (e: Exception) {
+        null
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun fdColors() = OutlinedTextFieldDefaults.colors(
+    focusedTextColor = InkPrimary, unfocusedTextColor = InkPrimary,
+    focusedContainerColor = CardWhite, unfocusedContainerColor = CardWhite,
+    focusedBorderColor = AccentGreen, unfocusedBorderColor = BorderLight,
+    cursorColor = AccentGreen
+)
+
+// ───────────────────────── DIÉTÉTIQUE tab — the AI food analysis ─────────────────────────────────
+// Code-owned DATA (from mechabetics-diet) in clean stat cards + the LLM's summary / alerts / good
+// points / tip as compact cards. Minimalist, on-brand (green), visual — never a wall of text.
+
+private fun spikeColor(spike: Int) = when {
+    spike >= 80 -> GlucoseStatus.DANGER.strong
+    spike >= 50 -> GlucoseStatus.WARNING.strong
+    else -> GlucoseStatus.GOOD.strong
+}
+
+@Composable
+private fun DietetiqueTab(patientId: String?, ai: AnalysisService, lang: Lang, modifier: Modifier = Modifier) {
+    val es = lang == Lang.ES
+    val scope = rememberCoroutineScope()
+    var result by remember(patientId) { mutableStateOf<AnalysisService.DietResult?>(null) }
+    var loading by remember(patientId) { mutableStateOf(false) }
+
+    fun load() {
+        if (patientId == null || loading) return
+        loading = true
+        scope.launch {
+            result = ai.diet(patientId, lang.code.lowercase(), 7)
+            loading = false
+        }
+    }
+    // Auto-load on first show; re-fetch on a language switch (the server returns localized prose).
+    LaunchedEffect(patientId, lang) { if (patientId != null) load() }
+
+    Column(
+        modifier.fillMaxSize().verticalScroll(rememberScrollState()),
+        verticalArrangement = Arrangement.spacedBy(12.dp)
+    ) {
+        Spacer(Modifier.height(4.dp))
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(
+                if (es) "Tu alimentación · 7 días" else "Ton alimentation · 7 jours",
+                color = InkPrimary, fontSize = 15.sp, fontWeight = FontWeight.Black, modifier = Modifier.weight(1f)
+            )
+            Surface(
+                color = CardWhite, shape = RoundedCornerShape(10.dp), border = BorderStroke(1.dp, BorderLight),
+                modifier = Modifier.size(38.dp).clickable { if (!loading) load() }
+            ) {
+                Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                    if (loading) CircularProgressIndicator(Modifier.size(16.dp), color = AccentGreen, strokeWidth = 2.dp)
+                    else Icon(Icons.Filled.Refresh, contentDescription = null, tint = InkPrimary, modifier = Modifier.size(18.dp))
+                }
+            }
+        }
+
+        val r = result
+        when {
+            loading && r == null -> Row(Modifier.padding(top = 24.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                CircularProgressIndicator(Modifier.size(20.dp), color = AccentGreen, strokeWidth = 2.dp)
+                Text(if (es) "Analizando la alimentación…" else "Analyse de l'alimentation…", color = InkMuted, fontSize = 13.sp)
+            }
+            r == null -> Text(if (es) "Toca actualizar." else "Touche pour actualiser.", color = InkDim, fontSize = 13.sp)
+            !r.enough -> DietCard(r.summary, AccentGreen)
+            else -> {
+                // Top stat row — the headline numbers.
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                    DietStat(if (es) "COMIDAS" else "REPAS", "${r.mealsCount}", InkPrimary, Modifier.weight(1f))
+                    DietStat(if (es) "CARBS/DÍA" else "GLUCIDES/J", "${r.avgCarbsPerDay} g", AccentGreen, Modifier.weight(1f))
+                    DietStat(if (es) "PICO MEDIO" else "PIC MOYEN", "+${r.avgSpike}", spikeColor(r.avgSpike), Modifier.weight(1f))
+                }
+                if (r.fast + r.slow + r.fatty + r.normal > 0) DietSpeedRow(r, es)
+                if (r.summary.isNotBlank()) DietCard(r.summary, AccentGreen)
+                if (r.alerts.isNotEmpty()) DietList(if (es) "A VIGILAR" else "À SURVEILLER", r.alerts, GlucoseStatus.DANGER.strong)
+                if (r.goodPoints.isNotEmpty()) DietList(if (es) "PUNTOS FUERTES" else "POINTS FORTS", r.goodPoints, GlucoseStatus.GOOD.strong)
+                if (r.topSpikers.isNotEmpty()) DietTopFoods(if (es) "LO QUE MÁS SUBE" else "CE QUI FAIT LE PLUS MONTER", r.topSpikers, es)
+                if (r.tip.isNotBlank()) DietTip(if (es) "CONSEJO" else "CONSEIL", r.tip)
+                if (r.isError) Text(
+                    if (es) "(análisis parcial: IA no disponible; los datos siguen siendo válidos)" else "(analyse partielle : IA indisponible ; les données restent valables)",
+                    color = InkDim, fontSize = 10.sp
+                )
+                Spacer(Modifier.height(8.dp))
+            }
+        }
+    }
+}
+
+@Composable
+private fun DietStat(label: String, value: String, color: androidx.compose.ui.graphics.Color, modifier: Modifier) {
+    Surface(modifier = modifier, color = CardWhite, shape = RoundedCornerShape(12.dp), border = BorderStroke(1.dp, BorderLight)) {
+        Column(Modifier.padding(vertical = 10.dp, horizontal = 6.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+            Text(label, color = InkDim, fontSize = 8.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.sp, maxLines = 1)
+            Spacer(Modifier.height(3.dp))
+            Text(value, color = color, fontSize = 18.sp, fontWeight = FontWeight.Black, maxLines = 1)
+        }
+    }
+}
+
+/** Fast / slow / fatty / normal meal mix, as labelled colour-dot chips. */
+@Composable
+private fun DietSpeedRow(r: AnalysisService.DietResult, es: Boolean) {
+    val items = listOf(
+        Triple(if (es) "Rápidas" else "Rapides", r.fast, GlucoseStatus.DANGER.strong),
+        Triple(if (es) "Lentas" else "Lents", r.slow, GlucoseStatus.GOOD.strong),
+        Triple(if (es) "Grasas" else "Gras", r.fatty, GlucoseStatus.WARNING.strong),
+        Triple(if (es) "Normales" else "Normaux", r.normal, InkDim),
+    ).filter { it.second > 0 }
+    Surface(color = CardWhite, shape = RoundedCornerShape(12.dp), border = BorderStroke(1.dp, BorderLight), modifier = Modifier.fillMaxWidth()) {
+        Row(Modifier.padding(12.dp).fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly, verticalAlignment = Alignment.CenterVertically) {
+            for ((label, n, c) in items) {
+                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(5.dp)) {
+                    Box(Modifier.size(8.dp).background(c, RoundedCornerShape(4.dp)))
+                    Text("$label $n", color = InkPrimary, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun DietCard(text: String, accent: androidx.compose.ui.graphics.Color) {
+    Surface(color = CardWhite, shape = RoundedCornerShape(14.dp), border = BorderStroke(1.dp, accent.copy(alpha = 0.35f)), modifier = Modifier.fillMaxWidth()) {
+        Text(text, color = InkPrimary, fontSize = 13.sp, lineHeight = 19.sp, modifier = Modifier.padding(14.dp))
+    }
+}
+
+/** A titled list (alerts / good points) — each line led by a colour dot. */
+@Composable
+private fun DietList(title: String, items: List<String>, accent: androidx.compose.ui.graphics.Color) {
+    Surface(color = CardWhite, shape = RoundedCornerShape(14.dp), border = BorderStroke(1.dp, BorderLight), modifier = Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Text(title, color = accent, fontSize = 10.sp, fontWeight = FontWeight.Black, letterSpacing = 1.5.sp)
+            for (it in items) {
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Box(Modifier.padding(top = 5.dp).size(7.dp).background(accent, RoundedCornerShape(4.dp)))
+                    Text(it, color = InkPrimary, fontSize = 13.sp, lineHeight = 18.sp, modifier = Modifier.weight(1f))
+                }
+            }
+        }
+    }
+}
+
+/** The foods that raised glucose the most — desc on the left, the +mg/dL rise on the right. */
+@Composable
+private fun DietTopFoods(title: String, foods: List<AnalysisService.DietFood>, es: Boolean) {
+    Surface(color = CardWhite, shape = RoundedCornerShape(14.dp), border = BorderStroke(1.dp, BorderLight), modifier = Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Text(title, color = InkDim, fontSize = 10.sp, fontWeight = FontWeight.Black, letterSpacing = 1.5.sp)
+            for (f in foods) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Column(Modifier.weight(1f)) {
+                        Text(f.desc.ifBlank { if (es) "Comida" else "Repas" }, color = InkPrimary, fontSize = 13.sp, fontWeight = FontWeight.Bold, maxLines = 1)
+                        if (f.carbs != null && f.carbs > 0) Text("~${f.carbs} g", color = InkDim, fontSize = 11.sp)
+                    }
+                    Text("+${f.spike}", color = spikeColor(f.spike), fontSize = 16.sp, fontWeight = FontWeight.Black)
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun DietTip(title: String, text: String) {
+    Surface(color = AccentGreen.copy(alpha = 0.08f), shape = RoundedCornerShape(14.dp), border = BorderStroke(1.dp, AccentGreen.copy(alpha = 0.4f)), modifier = Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+            Text(title, color = AccentGreen, fontSize = 10.sp, fontWeight = FontWeight.Black, letterSpacing = 1.5.sp)
+            Text(text, color = InkPrimary, fontSize = 13.sp, lineHeight = 19.sp)
+        }
+    }
+}
