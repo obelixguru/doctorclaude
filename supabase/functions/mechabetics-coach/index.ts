@@ -2,54 +2,43 @@ import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "jsr:@supabase/supabase-js@2";
 import { accessSubject } from "../_shared/access.ts";
 import {
-  computeGuard,
-  STALE_MIN,
   LOW_MGDL,
   SEVERE_LOW_MGDL,
   trendFromReadings,
-  recentHypoFrom,
-  minutesSinceLastRescue,
-  activeIob,
-  insulinActionMinutes,
   iobStatusPhrase,
   iobSystemLine,
-  glucoseBalance,
-  balanceRates,
-  balanceSystemLine,
-  combinedActionLine,
-  situationHint,
   stripInsulinNumbers,
   enforceInsulinCeiling,
-  noDoseDue,
   softenCorrectionTalk,
   mealCarbSpeed,
-  predictiveAdvice,
-  predictiveLine,
   sugarTimingFact,
-  hypoIobWarning,
-  uncoveredMealWarning,
-  inRangeActionLine,
-  mealBolusPlan,
-  mealBolusHeldByIob,
-  mealBolusHeldLine,
   carbsOnBoard,
-  planMealDose,
-  mealPlanLine,
-  plannedMealNote,
-  activityBolusCut,
-  activityNote,
-  activityLowWatchBump,
-  temperatureNote,
+  insulinActionMinutes,
   temperatureContext,
-  temperatureLowWatchBump,
-  applyActivityCut,
   currentActivity,
-  preSportCarbsLine,
   speakable,
-  toGuardProfile,
-  type GuardProfile,
 } from "../_shared/doseGuard.ts";
+import {
+  decisionHint,
+  anticipate,
+  buildState,
+  decideAction,
+  decisionPayload,
+  engineFacts,
+  forecastLine,
+  sideNotes,
+  timedSeries,
+} from "../_shared/decide.ts";
+import {
+  loadEngineData,
+  refreshModelIfStale,
+  dosePutForward,
+  rememberNamedDose,
+  storePhoneReadings,
+  tzOffsetOf,
+} from "../_shared/engineData.ts";
 import { chatJsonWithin, llmErrorKind, llmErrorMessage } from "../_shared/llm.ts";
+import { isBasalInsulin } from "../_shared/insulins.ts";
 
 // The app waits 80 s for an analysis. Measured 68 s on 2026-08-05 — one slow afternoon away from
 // « Service injoignable ». Past this the model is dropped and the code-owned action stands alone.
@@ -74,11 +63,9 @@ const TREND_HISTORY_HOURS = 24;
 // (correction minus IOB, or fast sugar, or "recheck" — blocked when in-range/falling/stale).
 // On-screen text in mg/dL; spoken voice in the local idiom. 10-min cache saves AI credits.
 
-const db = createClient(
-  Deno.env.get("SUPABASE_URL")!,
-  Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!,
-  { auth: { persistSession: false } },
-);
+const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
+const SERVICE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
+const db = createClient(SUPABASE_URL, SERVICE_KEY, { auth: { persistSession: false } });
 
 const DEEPSEEK_API_KEY = Deno.env.get("MECHABETICS_DEEPSEEK_API_KEY") ?? "";
 const DEEPSEEK_MODEL = Deno.env.get("MECHABETICS_DEEPSEEK_MODEL") ?? "deepseek-v4-flash";
@@ -178,13 +165,17 @@ function statsSummary(s: any, lang: string, stability?: { word: string; note: st
 function agoLabel(mins: number, lang: string): string {
   const es = lang === "es";
   if (mins < 1) return es ? "ahora" : "à l'instant";
-  if (mins >= 90) return es ? `hace ${Math.round(mins / 60)} h` : `il y a ${Math.round(mins / 60)} h`;
-  return es ? `hace ${mins} min` : `il y a ${mins} min`;
+  if (mins < 60) return es ? `hace ${mins} min` : `il y a ${mins} min`;
+  // To the minute: "il y a 3 h" for a dose given 2 h 31 ago reads as finished when a third of it
+  // still has to act, and this figure is what a parent checks the arithmetic against.
+  const h = Math.floor(mins / 60);
+  const m = String(mins % 60).padStart(2, "0");
+  return es ? `hace ${h} h ${m}` : `il y a ${h} h ${m}`;
 }
 
 function profileContext(p: any, meals: any[], lang: string, nowMs: number): string {
+  // No name here, on purpose: the history is pseudonymous and the model does not need it.
   const bits: string[] = [];
-  if (p?.nickname) bits.push(p.nickname);
   if (p?.age) bits.push(lang === "es" ? `${p.age} años` : `${p.age} ans`);
   if (p?.weight_kg) bits.push(`${p.weight_kg} kg`);
   if (p?.diagnosis_date) bits.push(lang === "es" ? `diabético desde ${p.diagnosis_date}` : `diabétique depuis ${p.diagnosis_date}`);
@@ -221,17 +212,17 @@ function profileContext(p: any, meals: any[], lang: string, nowMs: number): stri
 // finished) and the line closes with the SYSTEM total (iobSystemLine) — the model used to see only
 // "4 u il y a 290 min" and estimated the decay ITSELF, writing "insuline presque terminée" while
 // the computed IOB (and the Insuline tab) said 0.
-function insulinContext(doses: any[], iob: number, defaultDur: number, nowMs: number, lang: string): string {
-  const rapid = (doses || []).filter((d: any) => d.kind !== "basal");
+function insulinContext(doses: any[], iob: number, nowMs: number, lang: string): string {
+  const rapid = (doses || []).filter((d: any) => d.kind !== "basal" && !isBasalInsulin(d.insulin_name));
   if (!rapid.length) return "";
   const es = lang === "es";
   const parts = rapid.map((d: any) => {
     const mins = Math.round((nowMs - new Date(d.ts).getTime()) / 60000);
     const what = `${d.units} u${d.insulin_name ? ` ${d.insulin_name}` : ""}`;
     if (mins < -1) return es ? `${what} PREVISTA en ${-mins} min (aún no activa)` : `${what} PRÉVUE dans ${-mins} min (pas encore active)`;
-    const done = mins >= (insulinActionMinutes(d.insulin_name) ?? defaultDur);
+    const done = mins >= (insulinActionMinutes(d.insulin_name) ?? 300);
     const state = done ? (es ? "ya terminó de actuar" : "a fini d'agir") : (es ? "sigue actuando" : "agit encore");
-    return es ? `${what} hace ${Math.max(0, mins)} min (${state})` : `${what} il y a ${Math.max(0, mins)} min (${state})`;
+    return `${what} ${agoLabel(Math.max(0, mins), lang)} (${state})`;
   });
   return es
     ? `INSULINA RÁPIDA RECIENTE: ${parts.join("; ")}. ${iobSystemLine(iob, lang)}`
@@ -250,7 +241,7 @@ function fmtUnits(u: number): string {
 // instead of guessing, and knows to log a missing dose/meal when the system says none is recorded.
 function accountingLine(insulin: any[], meals: any[], iob: number, nowMs: number, lang: string): string {
   const es = lang === "es";
-  const rapid = (insulin || []).filter((d: any) => d.kind !== "basal");
+  const rapid = (insulin || []).filter((d: any) => d.kind !== "basal" && !isBasalInsulin(d.insulin_name));
   // Split PAST (taken) vs FUTURE (planned) doses: "dernière dose" must be a dose actually injected —
   // a planned future dose used to land here as "il y a -53 min" and read as already on board.
   const past = rapid.filter((d: any) => new Date(d.ts).getTime() <= nowMs + 60000);
@@ -266,7 +257,7 @@ function accountingLine(insulin: any[], meals: any[], iob: number, nowMs: number
       ? `insulina ${act} (última dosis ${fmtUnits(Number(d.units))} u ${agoLabel(mins, lang)}, tenida en cuenta)`
       : `insuline ${act} (dernière dose ${fmtUnits(Number(d.units))} u ${agoLabel(mins, lang)}, prise en compte)`;
   } else {
-    insPart = es ? "ninguna insulina registrada" : "aucune insuline loggée";
+    insPart = es ? "ninguna insulina anotada (no se sabe si se ha puesto)" : "aucune insuline notée (on ne sait pas si elle a été faite)";
   }
   if (future.length) {
     const f = future[future.length - 1]; // the soonest upcoming (rows newest-first → last is earliest)
@@ -356,7 +347,9 @@ function swingNote(readings: any[], lang: string): string {
     const ex = bucket.get(b);
     if (!ex || p.t > ex.t) bucket.set(b, p);
   }
-  const day = [...bucket.values()].filter((p) => p.t >= nowMs - 24 * 3600 * 1000).sort((a, b) => a.t - b.t);
+  // Six hours, not twenty-four: one swing from the morning used to headline every analysis until the
+  // next morning, whatever the glucose had done since.
+  const day = [...bucket.values()].filter((p) => p.t >= nowMs - 6 * 3600 * 1000).sort((a, b) => a.t - b.t);
   if (day.length < 2) return "";
   const WIN = 90 * 60 * 1000;
   let danger: { from: number; to: number; min: number } | null = null;
@@ -369,6 +362,7 @@ function swingNote(readings: any[], lang: string): string {
       const mag = Math.abs(delta);
       const mins = Math.round((day[j].t - day[i].t) / 60000);
       if (mins <= 0) continue;
+      if (mag / mins > 6) continue; // no body moves this fast: a sensor artefact, not a swing
       if ((day[i].v > 180 && day[j].v < 80) || (day[i].v < 70 && day[j].v > 180)) {
         // Pick the STEEPEST qualifying swing, not the biggest — otherwise we stretch the duration by
         // pairing the peak with a slightly-lower-but-much-later trough (the "230→65 in 75 min" bug
@@ -384,8 +378,8 @@ function swingNote(readings: any[], lang: string): string {
   }
   if (danger) {
     return lang === "es"
-      ? `OSCILACIÓN BRUSCA: la glucosa pasó de ${danger.from} a ${danger.to} mg/dL en ${danger.min} min. Explica en una frase la causa probable.`
-      : `SWING BRUTAL : la glycémie est passée de ${danger.from} à ${danger.to} mg/dL en ${danger.min} min. Explique en une phrase la cause probable.`;
+      ? `OSCILACIÓN BRUSCA: la glucosa pasó de ${danger.from} a ${danger.to} mg/dL en ${danger.min} min. Si lo anotado la explica, dilo en una frase; si no, di que no se sabe por qué.`
+      : `SWING BRUTAL : la glycémie est passée de ${danger.from} à ${danger.to} mg/dL en ${danger.min} min. Si ce qui est noté l'explique, dis-le en une phrase ; sinon dis qu'on ne sait pas pourquoi.`;
   }
   if (move) {
     const steep = move.rate >= 2;
@@ -680,8 +674,8 @@ function mealSpikeNote(meals: any[], sorted: { ts: number; value: number }[], no
     if (peak >= 185 && peak - atMeal >= 60) {
       if (speed === "fatty") {
         return es
-          ? `🚩 SEÑÁLALO claramente: la comida «${m.desc}» (grasa, hace ${min} min) fue seguida de una fuerte subida hasta ${peak} mg/dL. Las comidas grasas (fast-food, pizza, queso…) se digieren LENTO → la glucosa sube con RETRASO; aconseja un bolo dividido (una parte en la comida, otra ~1-2 h después) o recontrolar 2-3 h después. Sin cifras de dosis.`
-          : `🚩 SIGNALE-LE clairement : le repas «${m.desc}» (gras, il y a ${min} min) a été suivi d'une forte montée jusqu'à ${peak} mg/dL. Les repas gras (fast-food, pizza, fromage…) digèrent LENTEMENT → la glycémie monte en RETARD ; conseille un bolus étalé (une partie au repas, une partie ~1-2 h après) ou de recontrôler 2-3 h après. Aucun chiffre de dose.`;
+          ? `🚩 SEÑÁLALO claramente: la comida «${m.desc}» (grasa, hace ${min} min) fue seguida de una fuerte subida hasta ${peak} mg/dL. Las comidas grasas (fast-food, pizza, queso…) se digieren LENTO → la glucosa sube con RETRASO; aconseja la insulina en dos veces (una parte en la comida, otra ~1-2 h después) o recontrolar 2-3 h después. Sin cifras de dosis.`
+          : `🚩 SIGNALE-LE clairement : le repas «${m.desc}» (gras, il y a ${min} min) a été suivi d'une forte montée jusqu'à ${peak} mg/dL. Les repas gras (fast-food, pizza, fromage…) digèrent LENTEMENT → la glycémie monte en RETARD ; conseille l'insuline en deux fois (une partie au repas, une partie ~1-2 h après) ou de recontrôler 2-3 h après. Aucun chiffre de dose.`;
       }
       if (speed === "fast") {
         // Fast sugar → a quick post-meal spike is EXPECTED; warn against over-correcting it, and
@@ -692,12 +686,12 @@ function mealSpikeNote(meals: any[], sorted: { ts: number; value: number }[], no
       }
       if (speed === "slow") {
         return es
-          ? `🚩 SEÑÁLALO: la comida «${m.desc}» (carbohidratos lentos, hace ${min} min) fue seguida de una subida hasta ${peak} mg/dL. Los carbohidratos lentos (pasta, legumbres, integral) suben TARDE y de forma prolongada → la subida puede durar; recontrola más tarde y revisa el momento del bolo. Sin cifras de dosis.`
-          : `🚩 SIGNALE-LE : le repas «${m.desc}» (glucides lents, il y a ${min} min) a été suivi d'une montée jusqu'à ${peak} mg/dL. Les glucides lents (pâtes, légumineuses, complet) montent TARD et de façon prolongée → la montée peut durer ; recontrôle plus tard et revois le moment du bolus. Aucun chiffre de dose.`;
+          ? `🚩 SEÑÁLALO: la comida «${m.desc}» (carbohidratos lentos, hace ${min} min) fue seguida de una subida hasta ${peak} mg/dL. Los carbohidratos lentos (pasta, legumbres, integral) suben TARDE y de forma prolongada → la subida puede durar; recontrola más tarde y revisa el momento de la insulina. Sin cifras de dosis.`
+          : `🚩 SIGNALE-LE : le repas «${m.desc}» (glucides lents, il y a ${min} min) a été suivi d'une montée jusqu'à ${peak} mg/dL. Les glucides lents (pâtes, légumineuses, complet) montent TARD et de façon prolongée → la montée peut durer ; recontrôle plus tard et revois le moment de l'insuline. Aucun chiffre de dose.`;
       }
       return es
-        ? `🚩 SEÑÁLALO: la comida «${m.desc}» (hace ${min} min) fue seguida de una subida hasta ${peak} mg/dL; sugiere revisar el conteo de carbohidratos o el momento del bolo.`
-        : `🚩 SIGNALE-LE : le repas «${m.desc}» (il y a ${min} min) a été suivi d'une montée jusqu'à ${peak} mg/dL ; suggère de revoir le compte de glucides ou le moment du bolus.`;
+        ? `🚩 SEÑÁLALO: la comida «${m.desc}» (hace ${min} min) fue seguida de una subida hasta ${peak} mg/dL; sugiere revisar el conteo de carbohidratos o el momento de la insulina.`
+        : `🚩 SIGNALE-LE : le repas «${m.desc}» (il y a ${min} min) a été suivi d'une montée jusqu'à ${peak} mg/dL ; suggère de revoir le compte de glucides ou le moment de l'insuline.`;
     }
   }
   // No big spike yet — but a slow OR fatty meal in the last 3 h rises LATE → proactive heads-up.
@@ -714,7 +708,7 @@ function mealSpikeNote(meals: any[], sorted: { ts: number; value: number }[], no
   return "";
 }
 
-function buildPrompt(cur: number | null, s: any, lang: string, ctx: string, swing: string, pr: Record<string, string>, hint: string, recent: string, stability: { word: string; note: string }, signalLost: boolean, staleMin: number, sensorExpired: boolean, actionLine: string, noDose: boolean, sortedForPrompt: { ts: number; value: number }[] = []): string {
+function buildPrompt(cur: number | null, s: any, lang: string, ctx: string, swing: string, pr: Record<string, string>, hint: string, recent: string, stability: { word: string; note: string }, signalLost: boolean, staleMin: number, sensorExpired: boolean, actionLine: string, noDose: boolean, sortedForPrompt: { ts: number; value: number }[] = [], series = "", facts = ""): string {
   const curMg = cur != null ? `${cur} mg/dL` : (lang === "es" ? "desconocida" : "inconnue");
   const evo = evoLine(s, lang);
   const quality = dayQuality(s, lang); // the day's VERDICT (from time-in-range), not the stability word
@@ -755,6 +749,8 @@ function buildPrompt(cur: number | null, s: any, lang: string, ctx: string, swin
         : "",
       day,
       recent,
+      series,
+      facts,
       hypoDayNote(s, lang, sortedForPrompt),
       `VEREDICTO DEL DÍA (lo calcula el sistema según el TIEMPO EN OBJETIVO **y los pasos por debajo de 70**): día ${quality} (${tToday ?? "?"}% en objetivo ${dv.rolling ? "en las últimas 24 h" : "hoy, desde las 8 h"}). ESE es el balance del día — EMPIEZA por esa palabra. NO escribas tú el porcentaje (el sistema añade la línea con cifras).`,
       `ESTABILIDAD (SOLO las oscilaciones): ${stability.word} (${stability.note}). Describe ÚNICAMENTE si la curva está calmada o agitada, NO si el día fue bueno. NUNCA digas "día estable" como balance del día: un día plano pero a menudo por encima del objetivo es un día DIFÍCIL — el tiempo en objetivo manda sobre la regularidad. SIMÉTRICAMENTE, e igual de importante: un día con pasos por debajo de 70 no es "bueno" ni "tranquilo", aunque la curva parezca calmada — una hipoglucemia larga y plana no genera ni variación rápida ni variabilidad alta, así que es INVISIBLE en la palabra de estabilidad. Si arriba existe la línea HIPOGLUCEMIAS, tu frase debe nombrarlas.`,
@@ -766,7 +762,7 @@ function buildPrompt(cur: number | null, s: any, lang: string, ctx: string, swin
       `LONGITUD: el texto mostrado tiene EN TOTAL 4 frases — la línea con cifras (la añade el sistema), TU frase de síntesis, la línea «tenido en cuenta» (sistema) y la acción (sistema). Tu parte es UNA frase. Sé denso, no charlatán.`,
       P(pr, "coach.rules", `REGLAS: habla del DÍA que acaba de pasar y enlázalo con los días previos. El objetivo es 70-180; lo más alto del día no es un techo aceptable — dilo como un pico OBSERVADO, a evitar los próximos días, no como una consigna para ahora. Tono directo, motivador, basado en cifras. Resalta los progresos REALES — pero nunca "resaltes" un progreso callando una hipoglucemia: señalar un paso por debajo de 70 va ANTES que el tono alentador. Sin falsas promesas de cura.`),
       `COMIDAS: la lista « Comidas de hoy » (arriba, con las horas) dice qué se ha COMIDO y cuándo — úsala para ligar las variaciones de glucosa a las comidas (un pico tras tal comida, etc.). NUNCA afirmes que no se registró ninguna comida si la lista contiene alguna.`,
-      `VELOCIDAD DE LOS CARBOHIDRATOS: un azúcar rápido (zumo, refresco, dulces, pan blanco) sube la glucosa MUY RÁPIDO (pico ~15-45 min); los carbohidratos lentos (pasta, legumbres, integral) y las comidas grasas suben DESPACIO y TARDE (pico 2-3 h después). Tenlo en cuenta para EXPLICAR las variaciones y el momento de los picos, y para el TIMING del bolo (azúcar rápido → pre-bolo; lento/graso → más tarde o dividido).`,
+      `VELOCIDAD DE LOS CARBOHIDRATOS: un azúcar rápido (zumo, refresco, dulces, pan blanco) sube la glucosa MUY RÁPIDO (pico ~15-45 min); los carbohidratos lentos (pasta, legumbres, integral) y las comidas grasas suben DESPACIO y TARDE (pico 2-3 h después). Tenlo en cuenta para EXPLICAR las variaciones y el momento de los picos, y para el MOMENTO de la insulina (azúcar rápido → un poco antes de comer; lento/graso → más tarde o dividido).`,
       `AZÚCAR: para una hipo (<70), aconseja SOLO terrones de azúcar — nada de refrescos ni zumos (más fácil de dosificar, evita malos hábitos). Solo se toma azúcar por debajo de 70; si baja pero está en rango (70-180), di que tenga azúcar a mano y vigile, NO que lo tome ya. POR ENCIMA DE 180 (hiper), NO hables de azúcar — hace falta una corrección de insulina, no azúcar.`,
       sugarTimingFact(lang),
       `INSULINA ACTIVA: la línea «INSULINA AÚN ACTIVA (calculada por el sistema)» del contexto manda. Si dice «terminada», NUNCA digas que queda insulina activa ni que «está a punto de terminar»; si da una cifra, es la única válida. Nunca estimes tú lo que queda de una dosis.`,
@@ -795,6 +791,8 @@ function buildPrompt(cur: number | null, s: any, lang: string, ctx: string, swin
       : "",
     day,
     recent,
+    series,
+    facts,
     hypoDayNote(s, lang, sortedForPrompt),
     `VERDICT DE LA JOURNÉE (calculé par le système d'après le TEMPS DANS LA CIBLE **et les passages sous 70**) : journée ${quality} (${tToday ?? "?"}% dans la cible ${dv.rolling ? "sur les dernières 24 h" : "aujourd'hui, depuis 8 h"}). C'EST le bilan de la journée — COMMENCE par ce mot. Ne cite PAS le pourcentage toi-même (le système ajoute la ligne chiffrée).`,
     `STABILITÉ (les oscillations UNIQUEMENT) : ${stability.word} (${stability.note}). Ça décrit SEULEMENT si la courbe est calme ou agitée, PAS si la journée est bonne. NE dis JAMAIS « journée stable » comme bilan : une journée plate mais souvent au-dessus de la cible est une journée DIFFICILE — le temps dans la cible prime sur la régularité. SYMÉTRIQUEMENT, et c'est tout aussi important : une journée avec des passages sous 70 n'est ni « bonne » ni « tranquille », même si la courbe a l'air calme — une hypo longue et plate ne fait ni variation rapide ni variabilité élevée, elle est donc INVISIBLE dans le mot de stabilité. Si la ligne HYPOS ci-dessus existe, ta phrase doit les nommer.`,
@@ -810,7 +808,7 @@ function buildPrompt(cur: number | null, s: any, lang: string, ctx: string, swin
     // observation about the day instead of an instruction for now.
     P(pr, "coach.rules", `RÈGLES : parle de la JOURNÉE écoulée et relie-la aux jours précédents. La cible est 70-180 ; le point le plus haut du jour n'est pas un plafond acceptable — dis-le comme un pic OBSERVÉ, à éviter les prochains jours, pas comme une consigne pour maintenant. Ton direct, motivant, basé sur les chiffres. Souligne les progrès RÉELS — mais ne « souligne » jamais un progrès en taisant une hypo : signaler un passage sous 70 passe AVANT le ton encourageant. Pas de fausse promesse de guérison.`),
     `REPAS : la liste « Repas d'aujourd'hui » (ci-dessus, avec les heures) dit ce qui a été MANGÉ et quand — sers-t'en pour relier les variations de glycémie aux repas (un pic après tel repas, etc.). N'affirme JAMAIS qu'aucun repas n'a été loggé si la liste en contient.`,
-    `VITESSE DES GLUCIDES : un sucre rapide (jus, soda, bonbons, pain blanc) fait monter la glycémie TRÈS VITE (pic ~15-45 min) ; les glucides lents (pâtes, légumineuses, complet) et les repas gras la font monter LENTEMENT et TARD (pic 2-3 h après). Tiens-en compte pour EXPLIQUER les variations et le moment des pics, et pour le TIMING du bolus (sucre rapide → pré-bolus ; lent/gras → plus tard ou étalé).`,
+    `VITESSE DES GLUCIDES : un sucre rapide (jus, soda, bonbons, pain blanc) fait monter la glycémie TRÈS VITE (pic ~15-45 min) ; les glucides lents (pâtes, légumineuses, complet) et les repas gras la font monter LENTEMENT et TARD (pic 2-3 h après). Tiens-en compte pour EXPLIQUER les variations et le moment des pics, et pour le MOMENT de l'insuline (sucre rapide → un peu avant de manger ; lent/gras → plus tard ou en deux fois).`,
     `SUCRE : pour une hypo (<70), conseille UNIQUEMENT des morceaux de sucre — pas de soda ni de jus (plus simple à doser, évite les mauvaises habitudes). On ne prend du sucre que sous 70 ; si ça descend mais reste dans la cible (70-180), dis de garder du sucre à portée et de surveiller, PAS d'en prendre tout de suite. Au-dessus de 180 (hyper), ne parle PAS de sucre — c'est une CORRECTION d'insuline qu'il faut, pas du sucre.`,
     sugarTimingFact(lang),
     `INSULINE ACTIVE : la ligne « INSULINE ENCORE ACTIVE (calculée par le système) » du contexte fait foi. Si elle dit « terminée », ne dis JAMAIS qu'il reste de l'insuline active ni qu'elle « se termine bientôt » ; si elle donne un chiffre, c'est le seul valable. N'estime jamais toi-même ce qui reste d'une dose.`,
@@ -836,10 +834,6 @@ Deno.serve(async (req: Request) => {
     // the CURRENT glucose/IOB (otherwise the user taps ANALYSE at 209 but gets the cached 162
     // report from minutes ago). Auto-greet / language-switch / silent prefetch omit it → cached.
     const force = body.force === true;
-    // The client's UTC offset (minutes) so "today"/"yesterday" TIR are computed on the user's LOCAL
-    // calendar days — matching the History screen's per-day bars (fixes "coach says yesterday 85%
-    // while history shows 67%": that was a rolling 24-48h window, not the calendar day).
-    const tzOffsetMin = Number.isFinite(Number(body.tzOffsetMin)) ? Math.round(Number(body.tzOffsetMin)) : 0;
     // BYOK: a client-supplied Gemini key routes the LLM to the user's free quota (cost ~0 to us).
     const byokGeminiKey = typeof body.geminiKey === "string" ? body.geminiKey.trim() : "";
     // ElevenLabs audio is generated unless the client explicitly opts into native TTS
@@ -856,17 +850,15 @@ Deno.serve(async (req: Request) => {
         : "L'IA n'est pas configurée côté serveur. Préviens-nous.", isError: true });
     }
 
-    // Never store a FUTURE-dated reading, even if a buggy/cached client (e.g. a phone in the wrong
-    // timezone) uploads one — that's what re-polluted the history. Drop anything ahead of now.
-    const upsertNow = Date.now();
-    const rows = readings
-      .filter((r: any) => r && Number(r.value) > 0 && r.ts &&
-        Number(r.ts) <= upsertNow + 120000 &&
-        Number(r.ts) >= upsertNow - 31 * 24 * 3600 * 1000) // reject ancient / seconds-as-ms (1970) timestamps
-      .map((r: any) => ({ subject, ts: new Date(Number(r.ts)).toISOString(), value_mgdl: Math.round(Number(r.value)) }));
-    if (rows.length) {
-      await db.from("mechabetics_readings").upsert(rows, { onConflict: "subject,ts", ignoreDuplicates: true });
-    }
+    // Everything the decision reads, in one place, the same way for every surface. Phone readings are
+    // checked against what the 24/7 monitor recorded for this person before anything is stored: two
+    // sensors shared a phone, and 845 mixed rows got into the history through this very write.
+    const nowMs = Date.now();
+    const data = await loadEngineData(db, subject, nowMs, readings, TREND_HISTORY_HOURS);
+    if (data.rejected) console.warn(`coach: ${data.rejected} phone readings rejected against the monitor`);
+    await storePhoneReadings(db, subject, data.accepted);
+    const profile = data.profile;
+    const tzOffsetMin = tzOffsetOf(body, profile);
 
     // Stats FIRST, so even a cached analysis returns the 24h numbers for the dashboard boxes
     // (otherwise the boxes show "…" forever whenever the analysis is served from cache).
@@ -877,7 +869,7 @@ Deno.serve(async (req: Request) => {
     const { data: prof0 } = await db.from("mechabetics_profiles").select("updated_at").eq("subject", subject).maybeSingle();
     const profUpdatedMs = (prof0 as any)?.updated_at ? new Date((prof0 as any).updated_at).getTime() : 0;
     const { data: lastLog } = await db.from("mechabetics_coach_log")
-      .select("id, message, ts, lang, glucose_at_time, spoken").eq("subject", subject)
+      .select("id, message, ts, lang, glucose_at_time, spoken, decision").eq("subject", subject)
       .order("ts", { ascending: false }).limit(1).maybeSingle();
     if (!force && lastLog?.message && lastLog.lang === lang) {
       const logMs = new Date(lastLog.ts).getTime();
@@ -898,7 +890,7 @@ Deno.serve(async (req: Request) => {
         .select("ts, value_mgdl").eq("subject", subject)
         .gt("ts", lastLog.ts).order("ts", { ascending: false }).limit(60);
       const sinceCache = [
-        ...(readings as any[]).map((r) => ({ ts: Number(r?.ts), value: Number(r?.value) })),
+        ...data.accepted,
         ...((dbSince ?? []) as any[]).map((r) => ({ ts: new Date(r.ts).getTime(), value: Number(r.value_mgdl) })),
       ]
         .filter((r) => Number.isFinite(r.ts) && r.value > 0 && r.ts > logMs)
@@ -920,7 +912,11 @@ Deno.serve(async (req: Request) => {
         // the feature exists for, so a cached answer there is worse than no feature at all.
         const { data: newerActivity } = await db.from("mechabetics_activity")
           .select("id").eq("subject", subject).gt("created_at", lastLog.ts).limit(1).maybeSingle();
-        if (!newerMeal && !newerActivity) {
+        // A DOSE LOGGED SINCE IS THE ANSWER TO THE LAST ANALYSIS. Replayed, "Fais 2 u" came back with its
+        // Done button after the 2 u had been logged in the Insulin tab.
+        const { data: newerInsulin } = await db.from("mechabetics_insulin")
+          .select("id").eq("subject", subject).gt("created_at", lastLog.ts).limit(1).maybeSingle();
+        if (!newerMeal && !newerActivity && !newerInsulin) {
           // Normalize an OLD cached report too, so its paragraphs blank-line on screen like fresh ones.
           const cachedText = lastLog.message.replace(/\s*\|\|\s*/g, "\n\n").replace(/\n+/g, "\n\n").trim();
           // The client is about to READ THIS ALOUD (no premium audio on a cache hit — the on-device
@@ -930,276 +926,87 @@ Deno.serve(async (req: Request) => {
           if (speak && !(lastLog as any).spoken) {
             await db.from("mechabetics_coach_log").update({ spoken: true }).eq("id", (lastLog as any).id);
           }
-          return json({ text: cachedText, audioBase64: null, mime: "audio/mpeg", isError: false, cached: true, stats });
+          return json({
+            text: cachedText, audioBase64: null, mime: "audio/mpeg", isError: false, cached: true, stats,
+            decision: (lastLog as any).decision ?? null,
+          });
         }
       }
     }
 
-    const { data: profile } = await db
-      .from("mechabetics_profiles")
-      .select("nickname, age, weight_kg, diagnosis_date, honeymoon, carb_ratio, correction_factor, target_mgdl, rapid_insulin, basal_insulin, city, country")
-      .eq("subject", subject)
-      .maybeSingle();
-    // The bilan covers the WHOLE day, so pull the last ~26 h of meals (not just the 3 latest).
-    // Before, `limit 3` newest-first let 3 just-scanned PLANNED products crowd out every real
-    // eaten meal, so the analysis reported "no meals logged" while the user had logged the day's
-    // meals. A full-day window lets the model — and the accounting line — actually see them.
-    const { data: meals } = await db
-      .from("mechabetics_meals")
-      .select("ts, description, carbs_g, planned")
-      .eq("subject", subject)
-      .gte("ts", new Date(Date.now() - 26 * 3600 * 1000).toISOString())
-      .order("ts", { ascending: false })
-      .limit(24);
-    const { data: insulin } = await db
-      .from("mechabetics_insulin")
-      .select("ts, units, insulin_name, kind")
-      .eq("subject", subject)
-      .gte("ts", new Date(Date.now() - 6 * 3600 * 1000).toISOString())
-      .order("ts", { ascending: false })
-      .limit(6);
-    // 14 h, not 6: the sensitivity a session leaves behind runs ~12 h (ACTIVITY_TAIL_MIN) and is
-    // exactly what causes the evening/overnight lows after an afternoon match. `duration_min` travels
-    // too — without it every session was assumed to be the default length.
-    const { data: activity } = await db
-      .from("mechabetics_activity")
-      .select("ts, kind, description, intensity, duration_min, planned, outdoor")
-      .eq("subject", subject)
-      .gte("ts", new Date(Date.now() - 14 * 3600 * 1000).toISOString())
-      .order("ts", { ascending: false })
-      .limit(6);
-    const nowMs = Date.now();
-    // IOB FIRST: the insulin context line hands the model the SYSTEM-computed active insulin, so it
-    // never estimates a dose's decay itself (it used to write "presque terminée" off the raw dose
-    // list while the computed IOB — and the Insuline tab — said 0).
-    const gp = toGuardProfile(profile);
-    const rapidDur = insulinActionMinutes(gp?.rapidInsulin) ?? 240; // insulin-type-aware decay
-    const iob = activeIob(insulin ?? [], nowMs, rapidDur);
-    const insCtx = insulinContext(insulin ?? [], iob, rapidDur, nowMs, lang);
-    // SPORT IS PART OF THE ARITHMETIC NOW. It used to reach the model as prose and stop there, while
-    // every number came from doseGuard — which had never heard of it, and which the prompt forbids
-    // the model from overriding. An afternoon of football could not move a single unit.
-    const activityCut = activityBolusCut(activity ?? [], nowMs);
-    // The model is told the SAME cut the code applied, so its prose cannot trim the dose a second time.
-    const actCtx = activityContext(activity ?? [], nowMs, activityCut, lang);
-    // TODAY'S TEMPERATURE, when a city is stored. Heat speeds insulin absorption, cold slows it —
-    // the same vessel-dilation mechanism sport acts on. It moves NO dose (no clinical figure
-    // supports one); it raises vigilance and explains itself. Null on any failure, and the analysis
-    // is then exactly what it was before: weather may never cost us an answer.
-    // `outdoor` comes from what the user ticked on the ACTIVITÉ screen — never from a position.
+    const meals = data.meals;
+    const insulin = data.insulin;
+    const activity = data.activity;
+    // TODAY'S TEMPERATURE, when a city is stored. Heat speeds insulin absorption, cold slows it. It
+    // moves NO dose (no clinical figure supports one); it raises vigilance and explains itself. Null
+    // on any failure, and the analysis is then exactly what it was before.
+    // `outdoor` comes from what the user ticked on the ACTIVITÉ screen, never from a position.
     const weather = await currentWeather((profile as any)?.city, (profile as any)?.country);
-    const outdoor = (activity ?? []).length
-      ? ((activity as any[])[0]?.outdoor ?? null)
-      : null;
+    const outdoor = activity.length ? ((activity as any[])[0]?.outdoor ?? null) : null;
+
+    // THE ONE DECISION: same state, same function as the voice, the photo and the meals screen.
+    const state = buildState({
+      nowMs, lang, tzOffsetMin, profile, readings: data.series, insulin, meals, activity,
+      tempC: weather?.tempC ?? null, outdoor: outdoor === true, place: weather?.place ?? null,
+      sensorExpired: body.sensorExpired === true, model: data.model,
+    });
+    const decision = decideAction(state, { concise: true });
+    const ahead = anticipate(state, decision);
+    const payload = decisionPayload(state, decision, ahead);
+    const { cur, guard, iob, signalLost, sensorExpired, staleMin, trend, predict } = state;
+    const sorted = data.series;
+    const actionLine = decision.line;
+
+    // The learned model refreshes itself in the background, at most once a day.
+    refreshModelIfStale(subject, data.modelFittedAt, nowMs, tzOffsetMin, SUPABASE_URL, SERVICE_KEY);
+    if (body.tzOffsetMin != null && profile && profile.tz_offset_min !== tzOffsetMin) {
+      await db.from("mechabetics_profiles").update({ tz_offset_min: tzOffsetMin }).eq("subject", subject);
+    }
+
+    const recentInsulin = insulin.filter((d: any) => new Date(d.ts).getTime() > nowMs - 8 * 3600000);
+    const insCtx = insulinContext(recentInsulin, iob, nowMs, lang);
+    // The model is told the SAME cut the code applied, so its prose cannot trim the dose a second time.
+    const actCtx = activityContext(activity, nowMs, state.activityCut, lang);
     const tempCtx = temperatureContext(weather?.tempC ?? null, lang, outdoor);
-    const ctx = profileContext(profile, meals ?? [], lang, nowMs)
+    const ctx = profileContext(profile, meals, lang, nowMs)
       + (insCtx ? " " + insCtx : "")
       + (actCtx ? " " + actCtx : "")
       + (tempCtx ? " " + tempCtx : "");
-    // THE TREND READS THE DATABASE, NOT JUST THIS PHONE'S PAYLOAD.
-    //
-    // `readings` is whatever the phone happened to be holding. The phone only polls the patient
-    // currently ON SCREEN, so a followed patient's series is stitched from sparse cloud buckets with
-    // real holes in it — 49, 56 and 75-minute gaps were measured on a live device. A hole straddling
-    // the trend window makes trendFromReadings answer "unknown", and "unknown" above 180 BLOCKS the
-    // correction: a child sat at 234 mg/dL and was told "aucune insuline" because of a gap, not
-    // because of their glucose.
-    //
-    // Meanwhile the 24/7 monitor has been writing every patient's readings to this very table all
-    // along. The history exists; it simply was not being read back. Merging it in costs one indexed
-    // query and closes the holes for the non-active patient — which is exactly who was being hurt.
-    // Union, dedupe per timestamp, phone value wins (it is the freshest source for the live point).
-    const histSinceIso = new Date(nowMs - TREND_HISTORY_HOURS * 3600 * 1000).toISOString();
-    // NEWEST FIRST + AN EXPLICIT LIMIT, and it matters enormously. PostgREST caps a response at a
-    // server-side default (commonly 1000 rows) whether or not you ask for a limit — and 24 h of
-    // once-a-minute readings is ~1440. Ordered ASCENDING, the cap would have silently returned the
-    // OLDEST 1000 and dropped everything recent, so `last` — the value the whole analysis calls
-    // "glycémie actuelle" and the guard doses against — would have been hours stale. Descending makes
-    // any truncation fall on the far end of history, where it costs nothing. Re-sorted below anyway.
-    // PAGINATED, because `.limit()` does not lift PostgREST's server-side cap — this project's
-    // max_rows is 1000 and a day of readings is well past that. Asking for 24 h and being handed 1000
-    // rows looks exactly like a successful 24 h read, so the window would have quietly shrunk to
-    // whatever fits. Newest page first: any page we never reach is the far end of history, which
-    // costs context, while the recent end that decides the dose is always present.
-    const storedReadings: any[] = [];
-    let histErr: { message: string } | null = null;
-    for (let page = 0; page < 3; page++) {
-      const from = page * 1000;
-      const { data, error } = await db.from("mechabetics_readings")
-        .select("ts, value_mgdl").eq("subject", subject)
-        .gte("ts", histSinceIso).order("ts", { ascending: false }).range(from, from + 999);
-      if (error) { histErr = error; break; }
-      const rows = data ?? [];
-      storedReadings.push(...rows);
-      if (rows.length < 1000) break; // short page: that was the last of them
-    }
-    // A silent failure here degrades cleanly back to the phone's payload — which is exactly the
-    // holed series this merge exists to repair, so it must not degrade QUIETLY. A renamed column or
-    // a broken policy would otherwise restore the old behaviour for ever with nothing to show for it.
-    if (histErr) console.error("coach: stored-history read failed:", histErr.message);
-    const byTs = new Map<number, number>();
-    for (const r of storedReadings) {
-      const t = new Date(r.ts).getTime();
-      const v = Number(r.value_mgdl);
-      if (Number.isFinite(t) && v > 0) byTs.set(t, v);
-    }
-    for (const r of readings as any[]) {
-      const t = Number(r?.ts);
-      const v = Number(r?.value);
-      if (Number.isFinite(t) && v > 0) byTs.set(t, v); // phone wins on a tie
-    }
-    const sorted = [...byTs.entries()]
-      .map(([ts, value]) => ({ ts, value }))
-      .sort((a, b) => a.ts - b.ts);
-    const last = sorted[sorted.length - 1];
-    // Current glucose = the LATEST READING only. It used to fall back to the 24 h average, so a
-    // call with no readings made the report assert "Glycémie actuelle : 152" — an average is not a
-    // measurement. Null lets the guard take its no_reading path and the prompt say "inconnue".
-    const cur = last ? Math.round(last.value) : null;
-    const lastTs = last ? last.ts : 0;
-    const staleMin = lastTs ? Math.round((nowMs - lastTs) / 60000) : 999;
-    // Match the client's NO SIGNAL window (GlucoseAlert.FRESHNESS_WINDOW_MS = 5 min): once the last
-    // reading is older than that, the LIVE value is UNKNOWN. The analysis/voice must SAY "signal
-    // perdu" and speak of the LAST KNOWN glucose — never assert "tu es à X" as if it were current.
-    const signalLost = lastTs > 0 && (nowMs - lastTs) > STALE_MIN * 60000;
-    // The CLIENT knows the sensor's expiry (LibreLinkUp activation + 14 d). When it flags it AND the
-    // signal is indeed gone, the lost signal has a known cause: a finished sensor → advise a NEW one
-    // (not "move the phone closer / re-scan", which can't revive it).
-    const sensorExpired = body.sensorExpired === true && signalLost;
-
-    // ----- CODE OWNS THE DOSE ----- (gp / iob computed above, before the insulin context)
-    const trend = lastTs ? trendFromReadings(sorted, nowMs) : "unknown";
-    const recentHypo = recentHypoFrom(sorted, nowMs);
-    // recentHypo was DEAD WEIGHT: computed here, handed to computeGuard, and never read by it (the
-    // post-hypo correction block was deliberately removed, but the parameter stayed wired to
-    // nothing). So a low forty minutes ago reached neither the dose nor a single word of the text.
-    // It cannot go back into the dose — correcting a genuine high after a low is the intended
-    // behaviour — but the narrative must know: coming up from a hypo is the whole context of the
-    // hour that follows, and it explains a rebound the model would otherwise read as a random spike.
-    const recentHypoNote = recentHypo
+    const hint = decisionHint(state, decision);
+    // recentHypo reaches the narrative only: correcting a genuine high after a low is intended
+    // behaviour, but coming up from a hypo is the whole context of the hour that follows.
+    const recentHypoNote = state.recentHypo
       ? (lang === "es"
         ? `HIPOGLUCEMIA RECIENTE (calculado por el sistema): hubo un valor por debajo de 70 en los últimos 75 minutos. Tenlo en cuenta al explicar lo que pasa ahora (un rebote después de un resucarado es esperable) y menciónalo.`
         : `HYPO RÉCENTE (calculé par le système) : il y a eu une valeur sous 70 dans les 75 dernières minutes. Prends-le en compte pour expliquer ce qui se passe maintenant (un rebond après un resucrage est attendu) et mentionne-le.`)
       : "";
-    const minSinceRescue = minutesSinceLastRescue(meals ?? [], nowMs);
-    // Sugar still on board, the counterweight to `iob` in every "where is this heading" question
-    // below. computeGuard itself is deliberately NOT given it: carbs on board answer where the
-    // glucose is going, they never make a correction bigger.
-    const cob = carbsOnBoard(meals ?? [], nowMs);
-    // THE TUG-OF-WAR IS THE WHOLE PICTURE, so the model gets it as a fact — where the glucose is,
-    // what the food still has to give, what the insulin still has to take, and where that lands.
-    // It had an authoritative line about the insulin and nothing at all about the sugar, so its
-    // narrative could only ever describe one side of a two-sided race.
-    // How fast each side is arriving, not just how much of it is left — a slow meal's grams cannot
-    // hold back insulin that is working now (see BALANCE_HORIZON_MIN).
-    const rates = balanceRates(meals ?? [], insulin ?? [], nowMs, rapidDur);
-    const balance = glucoseBalance(cur, iob, cob, gp, rates);
-    const guard = computeGuard({ glucoseMgdl: cur, trend, staleMin, iobUnits: iob, recentHypo, minSinceRescue, profile: gp });
-    const hint = situationHint(guard, lang);
-
-    // Proactive prediction + unlogged-meal heads-up (both SUGGESTION-grade, no dose number).
-    // Sport raises the line at which a fall is worth flagging: 95 and drifting down is unremarkable
-    // at rest and is the opening of a hypo an hour after football. Without this the "ça descend,
-    // garde du sucre" banner only fired under 90 — too late, in the one state it matters most.
-    const predict = predictiveAdvice(sorted, nowMs, 30,
-      activityLowWatchBump(activity ?? [], nowMs) + temperatureLowWatchBump(weather?.tempC ?? null));
-    const lastMealTs = (meals && meals.length && (meals[0] as any).ts) ? new Date((meals[0] as any).ts).getTime() : 0;
+    const lastMealTs = (meals.length && (meals[0] as any).ts) ? new Date((meals[0] as any).ts).getTime() : 0;
     const risingNow = trend === "rising" || trend === "rising_fast";
-    // An overnight rise is almost always the DAWN PHENOMENON (hormonal), not an unlogged meal — so
-    // don't nag "log your meal" at night (it read as wrong: a McDo logged 8 h earlier is long gone).
+    // An overnight rise is almost always the dawn phenomenon, not an unlogged meal: no nagging at night.
     const localHour = ((Math.floor((nowMs + tzOffsetMin * 60000) / 3600000) % 24) + 24) % 24;
     const isNight = localHour < 7 || localHour >= 23;
-    // > 3 h since the last logged meal (was 90 min): a meal keeps glucose rising for ~2–3 h, so a
-    // shorter window made the coach suggest "log your meal" long after breakfast WAS logged. Mirrors
-    // the client's live banner gate (MainActivity: mealLoggedRecently ≤ 180 min).
     const mealNudge = !isNight && risingNow && cur != null && cur > 140 && (nowMs - lastMealTs > 180 * 60 * 1000);
     const mealNudgeNote = mealNudge
       ? (lang === "es"
         ? "INDICIO: la glucosa sube sin comida registrada; sugiere amablemente registrar lo que ha comido (no inventes ninguna dosis)."
-        : "INDICE : la glycémie monte sans repas loggé ; suggère gentiment de logger ce qui a été mangé (n'invente aucune dose).")
+        : "INDICE : la glycémie monte sans repas noté ; suggère gentiment de noter ce qui a été mangé (n'invente aucune dose).")
       : "";
 
-    const swing = swingNote(sorted, lang); // merged series: swings hidden inside a follow-gap were invisible
-    const recent = signalLost ? "" : recentWindowNote(sorted, nowMs, lang); // a stale "now: X rising" reads as live — drop it
-    // CODE owns the stability verdict (variability + rapid swings) so the model can't call a
-    // 21-swing day "stable". Fed authoritatively to the prompt + reused in the fallback summary.
+    const swing = swingNote(sorted, lang);
+    const recent = signalLost ? "" : recentWindowNote(sorted, nowMs, lang); // a stale "now: X rising" reads as live
+    // CODE owns the stability verdict so the model can't call a 21-swing day "stable".
     const cv = variabilityCv(sorted);
     const stability = dayStability(stats, cv, lang);
-    // Red-flag a meal that spiked the glucose (esp. a fatty one → delayed rise, split-bolus advice).
-    const spikeNote = mealSpikeNote(meals ?? [], sorted, nowMs, lang);
-    // DECIDE THE ACTION BEFORE WRITING THE ANALYSIS. It used to be computed after the model had
-    // already written its bilan, so the model was describing the day with no idea what the app was
-    // about to tell the user to do — and the two collided: "bonne journée mais une chute rapide à
-    // corriger" printed directly above "Action : dans la cible, rien à corriger". Everything this
-    // needs is deterministic and available here, so the decision now leads and the prose follows it.
-    // What the NARRATIVE is allowed to name, in units. The guard's own ceiling covers the CORRECTION
-    // only, so it cannot be used raw: on a day with a meal to bolus, a perfectly correct "12 u for
-    // the meal" in the prose would read as an overshoot against a 2 u correction ceiling. Raised to
-    // the real total as soon as a meal plan is computed, just below.
-    //
-    // It must also clear every dose the prompt ITSELF put in front of the model. insulinContext feeds
-    // it "6,5 u Fiasp il y a 80 min", and iobSystemLine orders it to quote the active insulin in
-    // units — both routinely larger than a correction, since the correction is what's LEFT after
-    // subtracting them. Judged against the bare guard ceiling, a model doing exactly as told had its
-    // sentence gutted: "l'insuline encore active (≈ ) va en absorber une partie". Reporting a dose is
-    // not proposing one; only a figure above everything legitimately in play is an invention.
-    const contextUnits = Math.max(
-      iob || 0,
-      ...((insulin ?? []) as any[]).map((d) => Number(d?.units) || 0),
-      0,
-    );
-    let proseDoseCeiling = guard.maxInsulinUnits + contextUnits;
-    // The meal units the action line ACTUALLY named, after the sport reduction. Two things read it:
-    // the prose ceiling (a ceiling built on the uncut figure would let the narrative quote a number
-    // the action never gave), and the sport note (which may only claim a reduction if a dose exists).
-    let namedMealUnits = 0;
-    const actionLine = signalLost
-      ? (sensorExpired
-        ? (lang === "es"
-          ? "Sensor caducado: pon un sensor NUEVO lo antes posible (cuenta ~1 h de arranque); mientras tanto, decide solo con una punción capilar."
-          : "Capteur expiré : pose un NOUVEAU capteur dès que possible (compte ~1 h de démarrage) ; en attendant, décide uniquement avec un test au doigt.")
-        : (lang === "es"
-          ? "Señal perdida: reconecta el sensor (acerca el teléfono que lo escanea, vuelve a escanear); si no vuelve, hazte una punción capilar antes de cualquier decisión."
-          : "Signal perdu : reconnecte le capteur (rapproche le téléphone qui le scanne, re-scanne) ; s'il ne revient pas, fais un test au doigt avant toute décision."))
-      : (() => {
-        // WHICH meal to dose, and when — the ANALYSE button used to pass a hardcoded 0 here, so it
-        // could never name a dose for food: 120 g logged and unbolused at 175 mg/dL came back as
-        // "in range, nothing to correct".
-        const plan = mealBolusPlan(meals ?? [], insulin ?? [], nowMs, gp, 180, sorted);
-        namedMealUnits = applyActivityCut(Math.max(0, plan.units || 0), activityCut);
-        proseDoseCeiling = guard.maxInsulinUnits + namedMealUnits + contextUnits;
-        // A MEAL BOLUS IS NOT DUE WHEN THE INSULIN ALREADY IN IS ABOUT TO TAKE THE GLUCOSE LOW.
-        // planMealDose has always checked this; the eaten-meal branch below goes to
-        // combinedActionLine, which sums units and has never seen a glucose or an IOB. That is how
-        // "3 u de Fiasp" was answered at 85 mg/dL with 3.4 u still working.
-        // The food already eaten is weighed against that insulin (cob) — judged on the insulin
-        // alone, this held the bolus for a ~110 g menu because a dose from three hours before was
-        // still tailing off.
-        if (plan.units > 0 && mealBolusHeldByIob(cur, iob, gp, cob, rates)) {
-          return mealBolusHeldLine(cur as number, iob, gp, lang, cob);
-        }
-        if (plan.planned && plan.carbsG != null) {
-          return mealPlanLine(planMealDose({
-            glucoseMgdl: cur, trend, staleMin, iobUnits: iob,
-            carbsG: plan.carbsG, description: null, cobGrams: cob, rates,
-            minSinceRescue, recentHypo, activityCut: activityCut, profile: gp,
-          }), lang, gp, true); // concise: the ANALYSE card is a summary + ONE action line
-        }
-        if (guard.reason === "in_range" && plan.units <= 0) {
-          return inRangeActionLine(meals ?? [], insulin ?? [], sorted, nowMs, gp, lang, iob, rates);
-        }
-        return combinedActionLine(guard, plan.units, lang, gp, plan.planned,
-          { description: plan.description, carbsG: plan.carbsG, minutesAgo: plan.minutesAgo },
-          { glucoseMgdl: cur, trend, activityCut: activityCut, rescueG: plan.rescueG, remainingG: plan.remainingG, iobUnits: iob, cobGrams: cob });
-      })();
+    const spikeNote = mealSpikeNote(meals, sorted, nowMs, lang);
     const pr = await loadPrompts(lang);
     const prompt = buildPrompt(
       cur, stats, lang,
       ctx + (mealNudgeNote ? " " + mealNudgeNote : "") + (spikeNote ? " " + spikeNote : "")
-        + (recentHypoNote ? " " + recentHypoNote : "")
-        + (balanceSystemLine(balance, lang) ? " " + balanceSystemLine(balance, lang) : ""),
+        + (recentHypoNote ? " " + recentHypoNote : ""),
       swing, pr, hint, recent, stability, signalLost, staleMin, sensorExpired,
-      actionLine, noDoseDue(guard), sorted,
+      actionLine, decision.nothingDue, sorted,
+      signalLost ? "" : timedSeries(state),
+      signalLost ? "" : engineFacts(state, decision, ahead),
     );
     let raw = "";
     try {
@@ -1214,11 +1021,14 @@ Deno.serve(async (req: Request) => {
       // boxes stay populated. Coach used to drop both and show only a raw error string.
       const kind = llmErrorKind(e);
       const head = llmErrorMessage(kind, lang, false) /* text runs on the service key only */;
-      const showAction = !(guard.reason === "in_range" || guard.reason === "no_reading");
-      const out = showAction
-        ? `${head}\n\n${lang === "es" ? "Acción" : "Action"} : ${combinedActionLine(guard, 0, lang, gp)}`
-        : head;
-      return json({ text: out, isError: true, errorKind: kind, stats });
+      const show = guard.reason !== "no_reading";
+      const out = show ? `${head}\n\n${lang === "es" ? "Acción" : "Action"} : ${actionLine}` : head;
+      // The model being down changes nothing about the dose on the screen: it still has to be asked about.
+      if (show && dosePutForward(decision)) await rememberNamedDose(db, subject, state, decision);
+      return json({
+        text: out, isError: true, errorKind: kind, stats, decision: payload,
+        actionLine: show ? actionLine : "", predict,
+      });
     }
     let parsed: any = {};
     let parseOk = false;
@@ -1267,12 +1077,12 @@ Deno.serve(async (req: Request) => {
 
     // The model must not state a dose; if insulin is forbidden, strip any it sneaked in, then
     // append the code-computed authoritative action (only when a dose is actually relevant).
-    const insulinForbidden = guard.maxInsulinUnits === 0;
+    const insulinForbidden = decision.insulinForbidden;
     if (insulinForbidden) { display = stripInsulinNumbers(display) || display; voice = stripInsulinNumbers(voice) || voice; }
     // ...and when insulin IS allowed, the narrative may still not name a BIGGER dose than the system
     // decided. Until now nothing checked that: the strip above only covered the forbidden case.
     else {
-      const ceiling = { ...guard, maxInsulinUnits: proseDoseCeiling };
+      const ceiling = { ...guard, maxInsulinUnits: decision.proseCeiling };
       display = enforceInsulinCeiling(display, ceiling) || display;
       voice = enforceInsulinCeiling(voice, ceiling) || voice;
     }
@@ -1282,7 +1092,7 @@ Deno.serve(async (req: Request) => {
     // not say anything is "to correct" — the observation stays, as something to WATCH. Deliberately
     // here, BEFORE the action line is appended below, or it would rewrite the action's own
     // "rien à corriger" into nonsense.
-    if (noDoseDue(guard) && !signalLost) {
+    if (decision.nothingDue && !signalLost) {
       display = softenCorrectionTalk(display, lang);
       voice = softenCorrectionTalk(voice, lang);
     }
@@ -1297,108 +1107,32 @@ Deno.serve(async (req: Request) => {
     // Transparency: ALWAYS state what was accounted for (insulin on board + last meal) so the action
     // below is trustworthy — e.g. "no insulin now" reads as a decision (a dose is already working),
     // not an oversight — and the user knows to log a dose/meal when the system says none is recorded.
-    const acct = accountingLine(insulin ?? [], meals ?? [], iob, nowMs, lang);
+    const acct = accountingLine(recentInsulin, meals, iob, nowMs, lang);
     if (acct) display = `${display}\n\n${acct}`;
 
-    // The analysis ALWAYS ends with a concrete action now — a blank "Action" on the (frequent) in-range
-    // readings read as "the coach stopped giving advice". Only a TOTAL no-reading has nothing to say.
-    // In range we give a contextual, dose-free step (cover a just-logged meal / watch a drift / "in
-    // range, keep monitoring"); otherwise the code-owned dose action (sugar / correction / wait).
+    // The analysis ALWAYS ends with a concrete action. Only a TOTAL no-reading has nothing to say.
     const showAction = signalLost || guard.reason !== "no_reading";
     if (showAction) {
-      // The SAME string the model was shown above (signal loss included — never append a dose off a
-      // value we don't trust). Computed once, so what the analysis was told and what the user reads
-      // cannot drift apart.
       const label = lang === "es" ? "Acción" : "Action";
       display = `${display}\n\n${label} : ${actionLine}`;
-      // SPOKEN TOO. This line had drifted into the `else if (tip)` branch below, which inverted it
-      // completely: on every ordinary analysis the screen carried the action and the audio did not —
-      // a parent driving, listening to their child's analysis, never heard "15 g de sucre rapide tout
-      // de suite". And in the one case the branch did fire, the voice announced a dose the screen
-      // never showed. The action belongs to whoever is being told there IS an action.
-      voice = `${voice} ${actionLine}`.trim();
+      voice = `${voice} ${speakable(actionLine, lang)}`.trim();
     } else if (tip) {
-      // Nothing to act on: the improvement tip becomes the closing line instead of a blank ending.
       display = `${display}\n\n${tip}`;
     }
-
-    // SPORT, SAID OUT LOUD. Whenever a session is imminent, running, just finished or still leaving
-    // its tail, the parent gets the reason next to the number — including the % the dose was trimmed
-    // by. A reduction the user cannot see is a number they cannot check, and this app's whole
-    // contract is that the arithmetic is visible. The pre-sport carb line comes first when it fires:
-    // going into a match at 95 mg/dL, food is the answer and insulin is not.
-    if (!signalLost) {
-      const pre = preSportCarbsLine(activity ?? [], nowMs, cur, lang);
-      if (pre) { display = `${display}\n\n${pre}`; voice = `${voice} ${speakable(pre, lang)}`.trim(); }
-      // Only claim a reduction when a dose was actually named. "La dose est réduite de 30 %" under
-      // "aucune insuline pour l'instant" is the contradiction this codebase keeps hunting down.
-      const doseNamed = guard.kind === "correction" || namedMealUnits > 0;
-      const temp = temperatureNote(weather?.tempC ?? null, lang, outdoor, weather?.place ?? null);
-      if (temp) {
-        display = `${display}
-
-${temp}`;
-        voice = `${voice} ${speakable(temp.replace("🌡️", ""), lang)}`.trim();
-      }
-      const act = activityNote(activity ?? [], nowMs, activityCut, lang, doseNamed);
-      if (act) {
-        display = `${display}\n\n${act}`;
-        voice = `${voice} ${speakable(act.replace("🏃", ""), lang)}`.trim();
-      }
+    if (ahead) {
+      display = `${display}\n\n${lang === "es" ? "A prever" : "À prévoir"} : ${ahead.line}`;
+      voice = `${voice} ${speakable(ahead.line, lang)}`.trim();
     }
-
-    // A hypo while rapid insulin is STILL on board keeps falling — one rescue often won't hold (the
-    // real 6.5 u Fiasp case: an hour under 70 despite 3 sucres twice). Append a code-owned warning so
-    // the parent expects to re-treat + rechecks sooner. The rescue grams above are already bumped for
-    // IOB by the guard; this explains why and says to keep watching.
-    if (guard.kind === "sugar" && !signalLost) {
-      const warn = hypoIobWarning(iob, lang);
-      if (warn) { display = `${display}\n\n${warn}`; voice = `${voice} ${warn.replace("⚠️", "").trim()}`.trim(); }
-    }
-
-    // A high being CORRECTED while a recent meal was logged but never bolused: its carbs (esp. slow/
-    // fatty) are still digesting, so a correction alone dips then rebounds / plateaus ABOVE target —
-    // the potato-dinner case (why it sat at ~175 with a 120 target). Explain it + say to recheck later.
-    if (guard.kind === "correction" && !signalLost) {
-      const warn = uncoveredMealWarning(meals ?? [], insulin ?? [], nowMs, gp, lang);
-      if (warn) { display = `${display}\n\n${warn}`; voice = `${voice} ${warn.replace("⚠️", "").trim()}`.trim(); }
-    }
-
-    // An ANNOUNCED (planned, not-yet-eaten) meal logged in the last ~3 h: remind that it will need
-    // its bolus AT EATING TIME and whether a recent dose is on record — mirrors ask's
-    // plannedMealNote so "je vais manger un McDo" carries into the next ANALYSE too. Skipped during
-    // a hypo (sugar first) and on a lost signal (the lost-signal action must stand alone).
-    if (guard.kind !== "sugar" && !signalLost) {
-      // STILL AHEAD, not "announced at some point in the last three hours". The old window kept
-      // re-announcing a meal for three hours after its time had passed — and the note it prints ends
-      // with "logge le repas et ta dose", i.e. it asked the user to log the meal they had just
-      // logged, while the accounting line two paragraphs above already counted its carbs as
-      // digesting. Nothing ever clears `planned`, so the clock has to be the judge (same rule
-      // mealBolusPlan and isEatenBy apply).
-      const upcoming = (meals ?? []).find((m: any) => {
-        if (!m || m.planned !== true || !m.ts) return false;
-        const t = new Date(m.ts).getTime();
-        return Number.isFinite(t) && t > nowMs;
-      });
-      if (upcoming) {
-        const recentRapid = (insulin ?? []).some((d: any) => {
-          if (!d || d.kind === "basal") return false;
-          const t = new Date(d.ts).getTime();
-          return Number.isFinite(t) && t <= nowMs + 60000 && nowMs - t <= 45 * 60000;
-        });
-        const note = plannedMealNote(Number((upcoming as any).carbs_g) || null, recentRapid, lang);
-        display = `${display}\n\n${note}`;
-        voice = `${voice} ${note}`.trim();
-      }
+    const likely = signalLost ? "" : forecastLine(state.forecast, lang);
+    if (likely) display = `${display}\n\n${lang === "es" ? "Previsión" : "Prévision"} : ${likely}`;
+    for (const n of sideNotes(state, decision)) {
+      display = `${display}\n\n${n.display}`;
+      voice = `${voice} ${n.voice}`.trim();
     }
 
     // The spoken voice must never read the unit aloud ("128", not "128 milligrammes par décilitre").
     // Display keeps mg/dL; only the voice is stripped (also covers the voice=display fallback above).
     voice = voice.replace(/\s*mg\s*\/\s*d[lL]/gi, "");
-
-    // NO "Anticipation" line in the report: the dashboard's live ANTICIPATION banner already shows
-    // it, and appending it here duplicated it with slightly different numbers (the user saw "41 in
-    // 5 min" in one place and "46 in 8 min" in the other). One source only — the banner.
 
     let audioBase64: string | null = null;
     if (speak && premiumVoice && ELEVENLABS_API_KEY) {
@@ -1418,14 +1152,17 @@ ${temp}`;
     // heard. They read differently too (the model writes "display" and "voice" as two texts), which
     // is why an unlabelled history looked like it held two kinds of analysis. The history screen
     // badges these VOIX.
-    await db.from("mechabetics_coach_log").insert({ subject, message: display, glucose_at_time: cur, lang, spoken: speak });
+    await db.from("mechabetics_coach_log").insert({ subject, message: display, glucose_at_time: cur, lang, spoken: speak, decision: payload });
+    // A firm dose has been put in front of someone: remember it, so the next look asks what happened
+    // before naming another one.
+    if (dosePutForward(decision)) await rememberNamedDose(db, subject, state, decision);
 
     return json({
       text: display, voice, audioBase64, mime: "audio/mpeg", isError: false, stats, mealNudge, predict,
       // The compact card's two lines. actionLine is bare (no "Action :" label — the app draws its
       // own); empty when there is nothing actionable (total no-reading), and the app then falls
       // back to the full text.
-      summaryLine, actionLine: showAction ? actionLine : "",
+      summaryLine, actionLine: showAction ? actionLine : "", decision: payload,
     });
   } catch (e) {
     return json({ text: `Erreur serveur: ${(e as Error)?.message ?? e}`, isError: true });

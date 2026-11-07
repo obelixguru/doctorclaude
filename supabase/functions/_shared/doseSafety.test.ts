@@ -400,7 +400,7 @@ test("P14 — a fast climb through 140 with 55 g ten minutes in gets a capped co
   ];
   const readings = curve.map(([m, v]) => ({ ts: NOW + m * 60000, value: v }));
   const iob = activeIob(doses as any, NOW, 240);
-  assert.ok(Math.abs(iob - 2.19) < 0.2, `iob ${iob}`);
+  assert.ok(Math.abs(iob - 1.46) < 0.2, `iob ${iob}`); // the straight line said 2,19 here
   const cob = carbsOnBoard(meals as any, NOW);
   const trend = trendFromReadings(readings, NOW);
   assert.ok(trend === "rising_fast" || trend === "rising", `trend ${trend}`);

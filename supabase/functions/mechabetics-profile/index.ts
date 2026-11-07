@@ -1,6 +1,7 @@
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "jsr:@supabase/supabase-js@2";
 import { accessSubject } from "../_shared/access.ts";
+import { insulinByName } from "../_shared/insulins.ts";
 import { currentWeather } from "../_shared/weather.ts";
 
 // Doctor Claude - profil: sauvegarde / chargement (cle = subject, pseudonyme).
@@ -119,6 +120,14 @@ function estimateRatios(p: any): { carb_ratio: number; correction_factor: number
   return { carb_ratio, correction_factor, target_mgdl };
 }
 
+/** Different letters, same product: "Lantus" retyped as "lantus " is not a change of insulin. */
+function sameInsulin(a: unknown, b: unknown): boolean {
+  const ia = insulinByName(String(a ?? ""));
+  const ib = insulinByName(String(b ?? ""));
+  if (ia && ib) return ia.id === ib.id;
+  return String(a ?? "").trim().toLowerCase() === String(b ?? "").trim().toLowerCase();
+}
+
 Deno.serve(async (req: Request) => {
   if (req.method === "OPTIONS") return new Response("ok", { headers: CORS });
   if (req.method !== "POST") return json({ error: "Methode non autorisee" }, 405);
@@ -184,6 +193,10 @@ Deno.serve(async (req: Request) => {
       honeymoon,
       rapid_insulin: pick("rapid_insulin") ?? null,
       basal_insulin: pick("basal_insulin") ?? null,
+      // A new background insulin takes days to settle, and the analysis has to say so for those days.
+      basal_changed_at: sameInsulin(pick("basal_insulin"), base.basal_insulin)
+        ? (base.basal_changed_at ?? null)
+        : (base.basal_insulin ? new Date().toISOString() : null),
       rapid_units_per_day: rapidPerDay,
       basal_units_per_day: basalPerDay,
       carb_ratio: carbN ?? est?.carb_ratio ?? null,

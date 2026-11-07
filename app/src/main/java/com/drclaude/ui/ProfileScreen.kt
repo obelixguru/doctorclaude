@@ -509,9 +509,16 @@ fun ProfileScreen(
                 Box(Modifier.weight(2f)) { Field(s.fieldRapidName, rapidName) { rapidName = it } }
                 Box(Modifier.weight(1f)) { Field(s.fieldRapidUnits, rapidUnits, number = true) { rapidUnits = it } }
             }
+            // What the app understood from the name: the dose engine runs on it, so it is shown.
+            com.drclaude.data.insulinInfoLine(rapidName, lang == Lang.ES)?.let {
+                Text(it, color = InkDim, fontSize = 11.sp, lineHeight = 15.sp)
+            }
             Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                 Box(Modifier.weight(2f)) { Field(s.fieldBasalName, basalName) { basalName = it } }
                 Box(Modifier.weight(1f)) { Field(s.fieldBasalUnits, basalUnits, number = true) { basalUnits = it } }
+            }
+            com.drclaude.data.insulinInfoLine(basalName, lang == Lang.ES)?.let {
+                Text(it, color = InkDim, fontSize = 11.sp, lineHeight = 15.sp)
             }
             Text(s.ratiosOptional, color = InkMuted, fontSize = 11.sp, lineHeight = 15.sp)
             Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {

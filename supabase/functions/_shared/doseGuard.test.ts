@@ -86,12 +86,50 @@ test("stale data (>15 min) at 250 rising -> WAIT, no insulin", () => {
   assert.equal(g.maxInsulinUnits, 0);
 });
 
-test("60 mg/dL -> SUGAR by weight (0.3 g/kg), no insulin", () => {
+test("60 mg/dL -> SUGAR, one cube per 10 kg, no insulin", () => {
   const g = computeGuard({ ...base, glucoseMgdl: 60, trend: "falling" });
   assert.equal(g.kind, "sugar");
-  assert.equal(g.sugarGrams, 11); // round(0.3 * 38)
-  assert.equal(g.sugarCubes, 3);  // ceil(11/4)
+  assert.equal(g.sugarCubes, 4); // 38 kg
+  assert.equal(g.sugarGrams, 16);
   assert.equal(g.maxInsulinUnits, 0);
+});
+
+test("the family's rule, as they gave it: 75 kg = 8 sucres, 40 kg = 4 sucres", () => {
+  const cubes = (weightKg: number | null) =>
+    computeGuard({ ...base, glucoseMgdl: 60, trend: "falling", profile: { ...base.profile, weightKg } }).sugarCubes;
+  assert.equal(cubes(75), 8);
+  assert.equal(cubes(40), 4);
+  assert.equal(cubes(30), 3);
+  assert.equal(cubes(4), 1);
+  assert.equal(cubes(200), 12);
+  assert.equal(cubes(null), 4);
+});
+
+test("a low already climbing: nothing more to take, whatever the insulin says", () => {
+  for (const trend of ["rising", "rising_fast"] as const) {
+    const g = computeGuard({ ...base, glucoseMgdl: 64, trend, iobUnits: 2.9 });
+    assert.equal(g.kind, "wait");
+    assert.equal(g.reason, "sugar_recent", "held like a treatment just taken, everywhere that matters");
+    assert.equal(g.sugarGrams, 0);
+    assert.equal(g.maxInsulinUnits, 0);
+    assert.equal(g.climbing, "unexplained");
+  }
+  const fed = computeGuard({ ...base, glucoseMgdl: 64, trend: "rising", minSinceFood: 5 });
+  assert.equal(fed.climbing, "fed");
+  assert.match(actionLine(fed, "fr", base.profile), /^tu as mangé et ça remonte : pas de sucre en plus/);
+  assert.match(actionLine(fed, "fr", base.profile), /16 g de sucre rapide \(4 morceau/);
+  assert.match(actionLine(fed, "es", base.profile), /has comido y ya está subiendo/);
+  assert.equal(computeGuard({ ...base, glucoseMgdl: 64, trend: "rising", minSinceFood: 90 }).climbing, "unexplained");
+});
+
+test("only the curve holds a low: flat, falling, unreadable or under 54, it is sugar, food or no food", () => {
+  for (const trend of ["stable", "falling", "falling_fast", "unknown"] as const) {
+    const g = computeGuard({ ...base, glucoseMgdl: 64, trend, minSinceFood: 3 });
+    assert.equal(g.kind, "sugar", trend);
+    assert.equal(g.sugarCubes, 4, trend);
+  }
+  const severe = computeGuard({ ...base, glucoseMgdl: 50, trend: "rising_fast", minSinceFood: 3 });
+  assert.equal(severe.kind, "sugar");
 });
 
 test("66 mg/dL but sugar taken 8 min ago -> WAIT (sugar_recent), no MORE sugar", () => {
@@ -108,21 +146,19 @@ test("66 mg/dL with sugar taken 20 min ago -> SUGAR again (window passed)", () =
   assert.equal(g.reason, "hypo");
 });
 
-test("hypo with NO insulin on board -> plain 0.3 g/kg rescue, reason 'hypo'", () => {
+test("hypo with NO insulin on board -> the rule, reason 'hypo'", () => {
   const g = computeGuard({ ...base, glucoseMgdl: 60, trend: "falling", iobUnits: 0 });
   assert.equal(g.kind, "sugar");
   assert.equal(g.reason, "hypo");
-  assert.equal(g.sugarGrams, 11); // round(0.3 * 38)
+  assert.equal(g.sugarGrams, 16);
 });
 
-test("hypo with 3.8 u insulin still active -> BIGGER rescue + 'hypo_iob' (the 6.5u Fiasp case)", () => {
-  // 38 kg, ICR 12: base 11.4 + 3.8*12*0.3=13.7 = 25.1, capped at 0.6*38=22.8 -> 23 g (≈6 sucres)
+test("hypo with 3.8 u still active -> the same amount, and the warning that one rescue may not be enough", () => {
   const g = computeGuard({ ...base, glucoseMgdl: 60, trend: "falling", iobUnits: 3.8 });
   assert.equal(g.kind, "sugar");
   assert.equal(g.reason, "hypo_iob");
-  assert.ok(g.sugarGrams >= 20, `expected a bumped rescue, got ${g.sugarGrams}`);
-  assert.ok(g.sugarGrams <= 23, `capped near 0.6 g/kg, got ${g.sugarGrams}`);
-  assert.ok(g.sugarCubes >= 5);
+  assert.equal(g.sugarGrams, 16, "the parent refused 6 cubes for a 40 kg child in July");
+  assert.equal(g.sugarCubes, 4);
 });
 
 test("starchyCarbNote: explains starch≠sugar for potatoes/bread, empty for sweets/blank", () => {
@@ -309,43 +345,56 @@ test("mealBolusUnits = carbs / carb-ratio rounded to 0.5", () => {
   assert.equal(mealBolusUnits(36, { weightKg: 38 }), 0); // no carb ratio
 });
 
-test("activeIob: linear ~4h decay, basal ignored", () => {
+test("activeIob: follows the published Fiasp curve, basal ignored", () => {
   const now = 1_000_000_000_000;
   const doses = [
-    { ts: now - 120 * 60000, units: 4, kind: "rapid" }, // half-elapsed -> 2 u
-    { ts: now - 300 * 60000, units: 5, kind: "rapid" }, // expired -> 0
-    { ts: now - 10 * 60000, units: 10, kind: "basal" }, // basal -> ignored
+    { ts: now - 120 * 60000, units: 4, kind: "rapid", name: "Fiasp" }, // a third left, not half
+    { ts: now - 420 * 60000, units: 5, kind: "rapid", name: "Fiasp" }, // spent -> 0
+    { ts: now - 10 * 60000, units: 10, kind: "basal", name: "Lantus" }, // basal -> ignored
   ];
-  assert.equal(activeIob(doses, now), 2);
+  assert.ok(Math.abs(activeIob(doses, now) - 4 * 0.364) < 0.02, `${activeIob(doses, now)}`);
 });
 
-test("insulinActionMinutes: Fiasp/rapid analogs = 4h, regular = 6h, inhaled = 3h, unknown = null", () => {
-  assert.equal(insulinActionMinutes("Fiasp"), 240);
-  assert.equal(insulinActionMinutes("NovoRapid"), 240);
-  assert.equal(insulinActionMinutes("Humalog"), 240);
-  assert.equal(insulinActionMinutes("Lyumjev"), 240);
-  assert.equal(insulinActionMinutes("Actrapid"), 360);
-  assert.equal(insulinActionMinutes("Humulin R"), 360);
-  assert.equal(insulinActionMinutes("Afrezza"), 180);
-  assert.equal(insulinActionMinutes("Lantus"), null); // basal name unknown to rapid map
+test("Fiasp curve: the percentages it is meant to give", () => {
+  const now = 1_000_000_000_000;
+  const left = (min: number) => activeIob([{ ts: now - min * 60000, units: 100, kind: "rapid", name: "Fiasp" }], now);
+  for (const [m, want] of [[30, 94.4], [60, 75.3], [90, 54.2], [120, 36.4], [180, 13.8], [240, 4.0]] as const) {
+    assert.ok(Math.abs(left(m) - want) < 0.6, `${m} min: ${left(m)} instead of ${want}`);
+  }
+  assert.equal(left(0), 100);  // nothing has acted yet
+  assert.equal(left(371), 0);  // spent
+});
+
+test("a background insulin never counts as insulin still working, whatever its row says", () => {
+  const now = 1_000_000_000_000;
+  for (const name of ["Lantus", "Tresiba", "Toujeo", "Levemir", "insulina degludec"]) {
+    assert.equal(activeIob([{ ts: now - 30 * 60000, units: 15, kind: "rapid", name }], now), 0, name);
+  }
+});
+
+test("insulinActionMinutes: when a dose is practically spent, null for a background or unknown name", () => {
+  assert.ok(Math.abs((insulinActionMinutes("Fiasp") as number) - 235) <= 10);
+  assert.ok(Math.abs((insulinActionMinutes("Lyumjev") as number) - 235) <= 10);
+  assert.ok((insulinActionMinutes("NovoRapid") as number) > (insulinActionMinutes("Fiasp") as number));
+  assert.ok((insulinActionMinutes("Humalog") as number) > (insulinActionMinutes("Fiasp") as number));
+  assert.ok((insulinActionMinutes("Actrapid") as number) > 300);
+  assert.ok((insulinActionMinutes("Humulin R") as number) > 300);
+  assert.ok((insulinActionMinutes("Afrezza") as number) < 180);
+  assert.equal(insulinActionMinutes("Lantus"), null);
+  assert.equal(insulinActionMinutes("Tresiba"), null);
   assert.equal(insulinActionMinutes(""), null);
   assert.equal(insulinActionMinutes(null), null);
 });
 
-test("activeIob: per-dose insulin type drives the decay window", () => {
+test("activeIob: each dose runs on its own insulin's curve", () => {
   const now = 1_000_000_000_000;
-  // 300 min elapsed: under 4h (Fiasp) the dose is fully expired (0); under 6h (regular) it's still
-  // partly active (5 u * (1 - 300/360) = 5/6 ≈ 0.833).
-  assert.equal(activeIob([{ ts: now - 300 * 60000, units: 5, kind: "rapid", name: "Fiasp" }], now), 0);
-  assert.equal(
-    Math.round(activeIob([{ ts: now - 300 * 60000, units: 5, kind: "rapid", name: "Actrapid" }], now) * 1000),
-    833,
-  );
-  // No name → falls back to the passed default (here 6h), so the same dose stays partly active.
-  assert.equal(
-    Math.round(activeIob([{ ts: now - 300 * 60000, units: 5, kind: "rapid" }], now, 360) * 1000),
-    833,
-  );
+  const after = (name: string | undefined, fallback?: string) =>
+    activeIob([{ ts: now - 300 * 60000, units: 5, kind: "rapid", name }], now, fallback);
+  assert.ok(after("Fiasp") < 0.05, `${after("Fiasp")}`);
+  assert.ok(after("Actrapid") > 0.3, `${after("Actrapid")}`); // human regular has a long tail
+  // No name: the patient's usual insulin decides.
+  assert.equal(after(undefined, "Actrapid"), after("Actrapid"));
+  assert.equal(after(undefined, "Fiasp"), after("Fiasp"));
 });
 
 test("combinedActionLine: meal + correction sum, with breakdown", () => {
@@ -977,8 +1026,8 @@ test("a covered meal leaves nothing to inject", () => {
 
 test("no meal bolus while the insulin already in is about to take you low", () => {
   const iob = activeIob(preBolus as any, NOW_AFTER, 240);
-  assert.ok(iob > 3, `expected insulin still active, got ${iob}`); // 3.36 u on the night
-  // 85 - 3.4*58 is far under 70: three more units here is not a meal bolus, it is a hypo.
+  assert.ok(iob > 2, `expected insulin still active, got ${iob}`); // ~2,3 u on the night (3,4 on the old straight line)
+  // 85 - 2.3*58 is far under 70: three more units here is not a meal bolus, it is a hypo.
   assert.equal(mealBolusHeldByIob(85, iob, ryan), true);
   assert.match(mealBolusHeldLine(85, iob, ryan, "fr"), /aucune insuline pour le repas/i);
   // ...and it does not fire on an ordinary in-range value with nothing on board.
@@ -1114,11 +1163,11 @@ test("a whole menu eaten at 80 mg/dL is a MEAL, not a hypo rescue", () => {
 
 test("the carbs on board are weighed against the insulin on board", () => {
   const iob = activeIob(mcDoses as any, MC_NOW, 240);
-  assert.ok(iob > 3.8 && iob < 3.9, `expected the report's ~4 u still active, got ${iob}`);
-  assert.equal(Math.round((pendingDropMgdl(iob, mcdo) ?? 0)), 154); // the "154" of the screenshot
+  assert.ok(iob > 2.2 && iob < 2.3, `expected ~2,2 u still active, got ${iob}`); // 3,9 u on the old straight line
+  assert.equal(Math.round((pendingDropMgdl(iob, mcdo) ?? 0)), 89);
   const cob = carbsOnBoard(mcMeal as any, MC_NOW);
   assert.ok(cob > 100, `expected the menu still digesting, got ${cob}`);
-  // Insulin alone: 121 - 154 < 70 -> "a fall is coming". With the food: it is a climb.
+  // Insulin alone: 121 - 89 < 70 -> "a fall is coming". With the food: it is a climb.
   assert.equal(mealBolusHeldByIob(121, iob, mcdo, 0), true);
   assert.equal(mealBolusHeldByIob(121, iob, mcdo, cob), false);
   // ...and nothing changed when there is genuinely no food on board.
@@ -1139,12 +1188,12 @@ test("the analysis no longer announces a hypo 16 min into a 28-sugar-cube menu",
 });
 
 test("a REAL incoming hypo still says so — and says what the numbers mean", () => {
-  const iob = activeIob(mcDoses as any, MC_NOW, 240); // ~3.9 u -> ~154 mg/dL owed
+  const iob = activeIob(mcDoses as any, MC_NOW, 240); // ~2,2 u -> ~89 mg/dL owed
   const quiet = [[-20, 130], [-10, 125], [0, 121]].map(([m, v]) => ({ ts: MC_NOW + (m as number) * 60_000, value: v as number }));
   const line = inRangeActionLine([], mcDoses as any, quiet, MC_NOW, mcdo, "fr", iob); // nothing eaten
   assert.match(line, /vers une hypo|sous 70/i);
-  assert.match(line, /121 mg\/dL/);                 // "154" was read as a glucose value: name the real one
-  assert.match(line, /~154 mg\/dL de baisse/);      // and say what 154 actually is
+  assert.match(line, /121 mg\/dL/);                 // a bare drop was read as a glucose value: name the real one
+  assert.match(line, /~89 mg\/dL de baisse/);       // and say what 89 actually is
   assert.match(line, /sucre à portée MAINTENANT/);
 });
 
@@ -1152,7 +1201,7 @@ test("mealBolusHeldLine names the current glucose next to the pending drop", () 
   const iob = activeIob(mcDoses as any, MC_NOW, 240);
   const fr = mealBolusHeldLine(85, iob, mcdo, "fr");
   assert.match(fr, /tu es à 85 mg\/dL/);
-  assert.match(fr, /~154 mg\/dL de baisse/);
+  assert.match(fr, /~89 mg\/dL de baisse/);
   assert.match(fr, /sous 70/);
   assert.match(mealBolusHeldLine(85, iob, mcdo, "es"), /estás a 85 mg\/dL/);
 });
@@ -1160,7 +1209,7 @@ test("mealBolusHeldLine names the current glucose next to the pending drop", () 
 test("planMealDose: earlier carbs still landing lift the floor the meal bolus is judged against", () => {
   const iob = activeIob(mcDoses as any, MC_NOW, 240);
   const bare = planMealDose({ glucoseMgdl: 121, trend: "rising", staleMin: 2, iobUnits: iob, carbsG: 40, profile: mcdo });
-  assert.equal(bare.lowBeforeMeal, true);          // insulin alone: 121 - 154 = -33
+  assert.equal(bare.lowBeforeMeal, true);          // insulin alone: 121 - 89 = 32
   const withFood = planMealDose({
     glucoseMgdl: 121, trend: "rising", staleMin: 2, iobUnits: iob, carbsG: 40,
     cobGrams: carbsOnBoard(mcMeal as any, MC_NOW), profile: mcdo,
@@ -1449,8 +1498,8 @@ test("insulinActingWithin: what works in the next hour, not what is left in tota
   const dose = [{ ts: speedNow - 60 * 60_000, units: 6, kind: "rapid", insulin_name: "Fiasp" }];
   const total = activeIob(dose as any, speedNow, 240);
   const soon = insulinActingWithin(dose as any, speedNow, 240, 60);
-  assert.equal(Math.round(total * 10) / 10, 4.5);   // 6 × (1 − 60/240)
-  assert.equal(Math.round(soon * 10) / 10, 1.5);    // one hour of a four-hour decay
+  assert.equal(Math.round(total * 10) / 10, 4.5);   // 6 × 75 %
+  assert.equal(Math.round(soon * 10) / 10, 2.3);    // 75 % down to 36 %: the peak hours are ahead
   // A dose not yet injected is not insulin about to work.
   const planned = [{ ts: speedNow + 30 * 60_000, units: 6, kind: "rapid", insulin_name: "Fiasp" }];
   assert.equal(insulinActingWithin(planned as any, speedNow, 240, 60), 0);

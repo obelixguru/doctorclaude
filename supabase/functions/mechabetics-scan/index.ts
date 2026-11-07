@@ -2,22 +2,7 @@ import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "jsr:@supabase/supabase-js@2";
 import { accessSubject } from "../_shared/access.ts";
 import {
-  computeGuard,
-  STALE_MIN,
-  trendFromReadings,
-  recentHypoFrom,
-  activeIob,
-  insulinActionMinutes,
-  mealBolusUnits,
-  mealBolusHeldByIob,
-  carbsOnBoard,
-  balanceRates,
-  mealBolusHeldLine,
-  planMealDose,
-  mealPlanLine,
-  combinedActionLine,
-  situationHint,
-  minutesSinceLastRescue,
+  LOW_MGDL,
   stripInsulinNumbers,
   enforceInsulinCeiling,
   carbsCubesPhrase,
@@ -26,12 +11,19 @@ import {
   carbSpeedAdvice,
   starchyCarbNote,
   speakable,
-  activityBolusCut,
-  activityNote,
-  preSportCarbsLine,
-  toGuardProfile,
-  type GuardProfile,
 } from "../_shared/doseGuard.ts";
+import { anticipate, buildState, decideAction, decisionHint, decisionPayload, forecastLine, sideNotes } from "../_shared/decide.ts";
+import {
+  loadEngineData,
+  mealSaidAgain,
+  mergeReadings,
+  plateJustLogged,
+  dosePutForward,
+  rememberNamedDose,
+  storePhoneReadings,
+  tzOffsetOf,
+} from "../_shared/engineData.ts";
+import type { EngineData } from "../_shared/engineData.ts";
 import { classifyLlmError, llmErrorMessage, type LlmErrorKind } from "../_shared/llm.ts";
 
 // Doctor Claude product scanner (FR/ES). The phone sends a PHOTO of a food product + subject
@@ -301,64 +293,21 @@ Deno.serve(async (req: Request) => {
     }
 
     const nowMs = Date.now();
-    const rds = readings
-      .map((r: any) => ({ ts: Number(r.ts), value: Number(r.value) }))
-      .filter((r: any) => r.value > 0)
-      .sort((a: any, b: any) => (a.ts || 0) - (b.ts || 0));
-    const lastR = rds.length ? rds[rds.length - 1] : null;
-    const cur = lastR ? Math.round(lastR.value) : null;
-    const hasTs = !!(lastR && Number.isFinite(lastR.ts) && lastR.ts > 0);
-    // No usable timestamp → treat the reading as STALE (forces WAIT), never as fresh. A reading of
-    // unknown age must not yield a dose (mirrors the coach's safe default).
-    const staleMin = hasTs ? Math.round((nowMs - (lastR as any).ts) / 60000) : 999;
-    // Match the client's 5-min NO SIGNAL window: a reading older than that means the LIVE glucose is
-    // unknown, so we must not append a dose/sugar action off it (the guard's STALE_MIN=15 is laxer).
-    const signalLost = cur != null && (!hasTs || (nowMs - (lastR as any).ts) > STALE_MIN * 60000);
-    const trend = hasTs ? trendFromReadings(rds, nowMs) : "unknown";
-
-    let profile: any = null;
-    let insulinDoses: any[] = [];
-    let meals: any[] = [];
-    let activity: any[] = [];
-    if (subject) {
-      const { data: p } = await db.from("mechabetics_profiles").select("*").eq("subject", subject).maybeSingle();
-      profile = p;
-      const { data: ins } = await db.from("mechabetics_insulin")
-        .select("ts, units, insulin_name, kind").eq("subject", subject)
-        .gte("ts", new Date(nowMs - 6 * 3600 * 1000).toISOString())
-        .order("ts", { ascending: false }).limit(8);
-      insulinDoses = ins ?? [];
-      // Recent meals → so a low that was JUST treated isn't told to take MORE sugar (rule of 15).
-      // description + carbs_g are REQUIRED: minutesSinceLastRescue only counts an actual rescue
-      // (small fast sugar), which it reads off those two fields. Windowed for the same reason as ask.
-      const { data: ml } = await db.from("mechabetics_meals")
-        .select("ts, description, carbs_g, planned").eq("subject", subject)
-        .gte("ts", new Date(nowMs - 26 * 60 * 60 * 1000).toISOString())
-        // 24, not 6: every scan inserts a meal row, so a handful of scans pushed the real meal
-        // out of the window and carbs-on-board silently read 0 — the food vanished from the very
-        // balance that decides whether a fall is coming.
-        .order("ts", { ascending: false }).limit(24);
-      meals = ml ?? [];
-      // Sport, over the ~12 h its after-effect lasts: a scanned snack after football needs less
-      // insulin than the same snack at rest, and this path never knew about activity at all.
-      const { data: act } = await db.from("mechabetics_activity")
-        .select("ts, kind, description, intensity, duration_min, planned").eq("subject", subject)
-        .gte("ts", new Date(nowMs - 14 * 3600 * 1000).toISOString())
-        .order("ts", { ascending: false }).limit(6);
-      activity = act ?? [];
-    }
-
-    const gp = toGuardProfile(profile);
-    const activityCut = activityBolusCut(activity, nowMs);
-    const dia = insulinActionMinutes(gp?.rapidInsulin) ?? 240; // insulin-type-aware decay (Fiasp≈4h, regular≈6h)
-    const iob = activeIob(insulinDoses, nowMs, dia);
-    const recentHypo = hasTs ? recentHypoFrom(rds, nowMs) : rds.some((r) => r.value > 0 && r.value < 70);
-    const minSinceRescue = minutesSinceLastRescue(meals, nowMs);
-    // Sugar still on board — the counterweight to `iob` (see mealBolusHeldByIob).
-    const cob = carbsOnBoard(meals ?? [], nowMs);
-    const rates = balanceRates(meals ?? [], insulinDoses ?? [], nowMs, dia);
-    const guard = computeGuard({ glucoseMgdl: cur, trend, staleMin, iobUnits: iob, recentHypo, minSinceRescue, profile: gp });
-    const hint = situationHint(guard, lang);
+    const empty: EngineData = {
+      profile: null, stored: [], ...mergeReadings([], readings, nowMs), insulin: [], meals: [], activity: [],
+      model: null, modelFittedAt: null,
+    };
+    // Same data, same state, same decision as the analysis and the voice.
+    const data = subject ? await loadEngineData(db, subject, nowMs, readings, 6) : empty;
+    if (subject) await storePhoneReadings(db, subject, data.accepted);
+    const profile = data.profile;
+    const tzOffsetMin = tzOffsetOf(body, profile);
+    const state = buildState({
+      nowMs, lang, tzOffsetMin, profile, readings: data.series, insulin: data.insulin, meals: data.meals,
+      activity: data.activity, sensorExpired: body.sensorExpired === true, model: data.model,
+    });
+    const { cur, guard, signalLost } = state;
+    const hint = decisionHint(state, decideAction(state));
 
     const pr = await loadPrompts(lang);
     const sys = buildSystem(lang, profile, cur, pr, hint);
@@ -370,11 +319,11 @@ Deno.serve(async (req: Request) => {
       // return the code-owned safe action (the guard doesn't need the model).
       const kind = vr.kind ?? "ai_down";
       const head = llmErrorMessage(kind, lang, !!byokGeminiKey);
-      const show = !(guard.reason === "in_range" || guard.reason === "no_reading");
-      const out = show
-        ? `${head}\n\n${lang === "es" ? "Acción" : "Action"} : ${combinedActionLine(guard, 0, lang, gp)}`
-        : head;
-      return json({ text: out, isError: true, errorKind: kind });
+      const safe = decideAction(state);
+      const show = guard.reason !== "no_reading";
+      const out = show ? `${head}\n\n${lang === "es" ? "Acción" : "Action"} : ${safe.line}` : head;
+      if (show && subject && dosePutForward(safe)) await rememberNamedDose(db, subject, state, safe);
+      return json({ text: out, isError: true, errorKind: kind, actionLine: show ? safe.line : "" });
     }
     const raw = (vr.raw ?? "").trim();
     let parsed: any = {};
@@ -388,76 +337,45 @@ Deno.serve(async (req: Request) => {
     // ----- CODE OWNS THE DOSE -----
     const mealCarbs = (parsed.meal && typeof parsed.meal === "object" && Number.isFinite(Number(parsed.meal.carbsG)))
       ? Math.min(300, Math.max(0, Math.round(Number(parsed.meal.carbsG)))) : null; // clamp a hallucinated carb count
-    // NO MEAL BOLUS INTO A FALL ALREADY OWED. The dashboard got this guard; the voice and the photo
-    // did not, and they name doses too — so "3 u pour ce repas" at 85 mg/dL with 3.4 u still working
-    // was reachable from here exactly as it was from the home screen. The insulin already in keeps
-    // going whatever the number on screen says.
-    const mealUnitsRaw = mealBolusUnits(mealCarbs, gp);
-    const mealHeld = mealUnitsRaw > 0 && mealBolusHeldByIob(cur, iob, gp, cob, rates);
-    const mealUnits = mealHeld ? 0 : mealUnitsRaw;
-    // THE PHOTO ANSWERS THE SAME QUESTION AS THE VOICE. Photographing a plate used to return a bare
-    // unit count off mealBolusUnits — no timing, no idea where the food would take you uncovered —
-    // while asking the very same question out loud got the full prospective plan. Same engine on
-    // both, computed BEFORE the safety filters below so a legitimately larger meal total is not
-    // stripped as an invention (planMealDose delegates the correction to computeGuard, so nothing
-    // here can hand out insulin the guard forbids).
-    const plan = (!signalLost && mealCarbs && mealCarbs > 0)
-      ? planMealDose({
-        glucoseMgdl: cur, trend, staleMin, iobUnits: iob, carbsG: mealCarbs,
-        description: parsed.meal?.description, cobGrams: cob, rates,
-        minSinceRescue, recentHypo, activityCut, profile: gp,
-      })
-      : null;
-    // Signal lost (stale reading) → forbid any dose off it and override the action with a fingerstick
-    // prompt, exactly like coach. Otherwise a 5–15 min-old high could yield a correction the app's own
-    // NO SIGNAL state contradicts.
-    const planUnits = plan ? Math.max(0, plan.totalUnits) : 0;
-    // planUnits is deliberately NOT in this test. It decides whether the MODEL's prose gets its
-    // invented dose numbers stripped, and the code-owned action line is appended afterwards — so
-    // the plan's own figure is never at risk. Letting a plan open this gate would un-strip the
-    // model exactly where the code has just decided nothing goes in now (a meal bolus held by the
-    // insulin already working), which is the one moment a hallucinated "fais 4 u" must not survive.
-    const insulinForbidden = signalLost || (guard.maxInsulinUnits === 0 && mealUnits === 0);
-    if (insulinForbidden) { reply = stripInsulinNumbers(reply) || reply; voice = stripInsulinNumbers(voice) || voice; }
-    // Insulin allowed: the answer still may not name MORE units than the system decided (correction
-    // plus the meal bolus for the scanned food). Previously unchecked.
-    // Plus whatever insulin the context legitimately names (active insulin, a dose logged earlier):
-    // echoing one is not proposing one, and judging against the bolus alone gutted correct answers.
+    // THE PHOTO ANSWERS THE SAME QUESTION AS THE VOICE AND THE MEALS SCREEN: the plate joins the same
+    // decision as a meal under discussion, with its dose, its timing and its safety holds.
+    // A second photo of the same plate is the same plate. Its figures never match the first ones exactly, and
+    // counted as new it doubled the dose, here and in the analysis that followed. Grams have to agree: a
+    // chicken leg and then the whole plate share a word and nothing else. A real second helping goes through
+    // the meals screen. Never at a low: a second can there is a second treatment, and "already noted" would
+    // send him for sugar on top of it.
+    const plateAgain = !!parsed.meal?.description && !!mealCarbs && !(state.cur != null && state.cur < LOW_MGDL)
+      && (mealSaidAgain(data.meals, String(parsed.meal.description), mealCarbs, nowMs, true) || plateJustLogged(data.meals, mealCarbs, nowMs));
+    const decision = decideAction(state, {
+      candidate: mealCarbs && mealCarbs > 0 && !plateAgain ? { carbsG: mealCarbs, description: parsed.meal?.description } : null,
+      estimatedCarbs: mealCarbs, // what a model read off a picture, until someone looks at the figure
+    });
+    const ahead = anticipate(state, decision);
+    const plan = decision.plan;
+    if (decision.insulinForbidden) { reply = stripInsulinNumbers(reply) || reply; voice = stripInsulinNumbers(voice) || voice; }
     else {
-      const ctxUnits = Math.max(iob || 0, 0);
-      // The MAX of two complete ceilings, not the guard added on top of the larger total: plan.
-      // totalUnits ALREADY contains the correction, so `guard.max + planUnits` counted it twice and
-      // quietly loosened the last backstop on "the model never invents a dose" by that whole amount.
-      const named = Math.max(guard.maxInsulinUnits + Math.max(0, mealUnits || 0), planUnits);
-      const ceiling = { ...guard, maxInsulinUnits: named + ctxUnits };
+      const ceiling = { ...guard, maxInsulinUnits: decision.proseCeiling };
       reply = enforceInsulinCeiling(reply, ceiling) || reply;
       voice = enforceInsulinCeiling(voice, ceiling) || voice;
     }
-    const showAction = signalLost || mealUnits > 0 || planUnits > 0 ||
-      !(guard.reason === "in_range" || guard.reason === "no_reading");
     let text = reply;
     let voiceText = voice;
+    const showAction = guard.reason !== "no_reading" || signalLost || decision.units > 0;
+    const actionLine = showAction ? decision.line : "";
     if (showAction) {
-      const line = signalLost
-        ? (lang === "es"
-          ? "Señal perdida: reconecta el sensor (acerca el teléfono que lo escanea, vuelve a escanear); si no vuelve, hazte una punción capilar antes de cualquier decisión."
-          : "Signal perdu : reconnecte le capteur (rapproche le téléphone qui le scanne, re-scanne) ; s'il ne revient pas, fais un test au doigt avant toute décision.")
-        : plan
-          ? mealPlanLine(plan, lang, gp)
-          : mealHeld
-            ? mealBolusHeldLine(cur as number, iob, gp, lang, cob)
-            : combinedActionLine(guard, mealUnits, lang, gp, false,
-              parsed.meal?.description ? { description: String(parsed.meal.description), carbsG: mealCarbs, minutesAgo: 0 } : null,
-              { glucoseMgdl: cur, trend, activityCut, iobUnits: iob, cobGrams: cob });
       const label = lang === "es" ? "Acción" : "Action";
-      text = `${reply}\n\n${label} : ${line}`;
-      voiceText = `${voice} ${speakable(line, lang)}`.trim();
-      const pre = preSportCarbsLine(activity, nowMs, cur, lang);
-      if (pre) { text = `${text}\n\n${pre}`; voiceText = `${voiceText} ${speakable(pre, lang)}`.trim(); }
-      // The reduction is only CLAIMED when a dose was actually named (see activityNote).
-      const act = activityNote(activity, nowMs, activityCut, lang,
-        guard.kind === "correction" || mealUnits > 0 || (plan?.totalUnits ?? 0) > 0);
-      if (act) { text = `${text}\n\n${act}`; voiceText = `${voiceText} ${speakable(act.replace("🏃", ""), lang)}`.trim(); }
+      text = `${reply}\n\n${label} : ${decision.line}`;
+      voiceText = `${voice} ${speakable(decision.line, lang)}`.trim();
+      if (ahead) {
+        text = `${text}\n\n${lang === "es" ? "A prever" : "À prévoir"} : ${ahead.line}`;
+        voiceText = `${voiceText} ${speakable(ahead.line, lang)}`.trim();
+      }
+      const likely = signalLost ? "" : forecastLine(state.forecast, lang);
+      if (likely) text = `${text}\n\n${lang === "es" ? "Previsión" : "Prévision"} : ${likely}`;
+      for (const n of sideNotes(state, decision)) {
+        text = `${text}\n\n${n.display}`;
+        voiceText = `${voiceText} ${n.voice}`.trim();
+      }
     }
 
     // Make grams tangible: pair the estimated carbs with their ~4 g sugar-cube equivalent.
@@ -483,7 +401,8 @@ Deno.serve(async (req: Request) => {
     // ...unless the plan already said it. mealPlanLine ends with mealTimingLine, so appending
     // carbSpeedAdvice here repeated the same instruction in different words — and its default
     // wording is "next time", addressed to a plate that has not been eaten yet.
-    if (!plan && parsed.meal && typeof parsed.meal === "object" && guard.kind !== "sugar") {
+    const doseStands = (decision.units > 0 || decision.laterUnits > 0) && !decision.capped;
+    if (!plan && parsed.meal && typeof parsed.meal === "object" && decision.kind !== "sugar" && !decision.rescueFood && doseStands) {
       const speed = mealCarbSpeed(parsed.meal.description);
       const adv = carbSpeedAdvice(speed, lang);
       if (adv) {
@@ -495,7 +414,14 @@ Deno.serve(async (req: Request) => {
 
     let logFailed = false;
     let loggedMeal: any = null;
-    if (subject && parsed.meal && typeof parsed.meal === "object" && parsed.meal.description) {
+    if (plateAgain) {
+      const known = lang === "es"
+        ? "Ya está anotado: no lo cuento dos veces. Si es otra cosa, añádelo en la pestaña Comidas."
+        : "C'est déjà noté : je ne le compte pas deux fois. Si c'est autre chose, ajoute-le dans l'onglet Repas.";
+      text = `${text}\n\n${known}`;
+      voiceText = `${voiceText} ${known}`.trim();
+    }
+    if (!plateAgain && subject && parsed.meal && typeof parsed.meal === "object" && parsed.meal.description) {
       loggedMeal = {
         subject,
         description: String(parsed.meal.description).slice(0, 240),
@@ -503,15 +429,18 @@ Deno.serve(async (req: Request) => {
         // A scanned product is being eaten NOW → log it as EATEN, not "prévu". (It used to default
         // to planned=true, so scans showed "prévu" and the daily analysis skipped them as not-eaten.)
         planned: false,
+        carbs_estimated: !!mealCarbs,
       };
       // A failed write was silent (the reply still showed the food) → user thinks it's logged. Warn.
       const { error: mErr } = await db.from("mechabetics_meals").insert(loggedMeal);
       if (mErr) {
         loggedMeal = null;
         logFailed = true;
-        text += `\n\n${lang === "es"
+        const warning = lang === "es"
           ? "⚠️ No pude registrar esta comida — vuelve a anotarla en la pestaña Comidas."
-          : "⚠️ Je n'ai pas pu enregistrer ce repas — re-note-le dans l'onglet Repas."}`;
+          : "⚠️ Je n'ai pas pu enregistrer ce repas — re-note-le dans l'onglet Repas.";
+        text += `\n\n${warning}`;
+        voiceText = `${voiceText} ${warning.replace("⚠️ ", "")}`.trim();
       }
     }
 
@@ -527,7 +456,11 @@ Deno.serve(async (req: Request) => {
       } catch (_) { /* voice optional */ }
     }
 
-    return json({ text, voice: voiceText, audioBase64, mime: "audio/mpeg", isError: false, meal: loggedMeal, logFailed });
+    if (subject && dosePutForward(decision)) await rememberNamedDose(db, subject, state, decision);
+    return json({
+      text, voice: voiceText, audioBase64, mime: "audio/mpeg", isError: false, meal: loggedMeal, logFailed,
+      actionLine, decision: decisionPayload(state, decision, ahead),
+    });
   } catch (e) {
     return json({ text: `Erreur serveur: ${(e as Error)?.message ?? e}`, isError: true });
   }

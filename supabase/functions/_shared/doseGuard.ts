@@ -5,7 +5,7 @@
 //
 // Invariants (locked HERE, not just in the prompt text):
 //   - Data stale (> STALE_MIN) or glucose unknown -> WAIT, no insulin (recheck first).
-//   - Glucose < 70                                -> SUGAR by body weight (0.3 g/kg), no insulin.
+//   - Glucose < 70                                -> SUGAR, one cube per 10 kg, no insulin.
 //   - Glucose 70..180 (in range)                  -> NONE, no correction insulin.
 //   - Glucose > 180                               -> correction ONLY if (stable or rising), minus
 //                                                    IOB, rounded to 0.5 u, floored at 0. Falling or
@@ -16,6 +16,8 @@
 //
 // Pure TS (no Deno/Node APIs) so it imports cleanly in edge functions AND runs under the
 // Node test runner. Erasable-only syntax (type-strip safe).
+
+import { curveOf, fractionRemaining, insulinByName, isBasalInsulin, practicallyDoneMin } from "./insulins.ts";
 
 export type Trend = "rising_fast" | "rising" | "stable" | "falling" | "falling_fast" | "unknown";
 export type ActionKind = "sugar" | "correction" | "none" | "wait" | "no_ratios";
@@ -37,11 +39,15 @@ export interface GuardInput {
   // Minutes since the last EATEN fast carbs / sugar (a hypo rescue), or null if none recent. When
   // a low is already being treated, we hold instead of stacking more sugar (see RESCUE_WINDOW_MIN).
   minSinceRescue?: number | null;
+  // Minutes since the last food eaten, of any kind. Only ever changes the words: rice treats nothing in 15 min.
+  minSinceFood?: number | null;
   profile: GuardProfile | null;
 }
 
 export interface GuardResult {
   kind: ActionKind;
+  /** A low already going up, and why as far as anyone can tell: its reason is "sugar_recent", it is held the same way. */
+  climbing?: "fed" | "unexplained";
   insulinUnits: number;     // correction units recommended (0 unless kind === "correction")
   maxInsulinUnits: number;  // absolute ceiling for ANY insulin suggestion (0 => no insulin at all)
   sugarGrams: number;       // fast sugar grams (0 unless kind === "sugar")
@@ -62,12 +68,15 @@ export const RESCUE_MAX_CARBS = 25;
 // Below this (severe hypo) the rescue-window "hold" NEVER applies: a deep low must be re-treated
 // with sugar immediately, even if some was just taken — waiting on a 45 mg/dL is dangerous.
 export const SEVERE_LOW_MGDL = 54;
-// A hypo while rapid insulin is still on board keeps falling (pendingDrop = iob × ISF). A plain
-// 0.3 g/kg rescue then doesn't hold (the real case: 6.5 u Fiasp → an hour under 70 despite 3 sucres,
-// twice). We add carbs to blunt PART of the remaining insulin (this fraction of iob × ICR grams) on
-// top of the base rescue — the rest is covered by re-treating. Kept a FRACTION + capped at 0.6 g/kg
-// so we never push a rebound-high carb load; the guidance still says recheck + re-treat.
-export const IOB_RESCUE_FRACTION = 0.3;
+// THE FAMILY'S RULE, in the parent's words: "1 sucre chaque 10 kg, 75 kg = 8 sucres, 40 kg = 4 sucres, règle
+// universelle". The insulin on board does not change the amount: it told a 40 kg child to take 6 cubes,
+// which the parent refused in July, and the rule was lost when the August version replaced that code. 7 November
+// it was back, at 53 with 8 u on record, then at 64 climbing, with two slices of toast just eaten. What
+// active insulin changes is the warning that one rescue may not be enough: recheck, and treat again.
+const RESCUE_KG_PER_CUBE = 10;
+const RESCUE_MAX_CUBES = 12;
+const RESCUE_CUBES_NO_WEIGHT = 4; // the rule of 15
+const GRAMS_PER_CUBE = 4;
 // At/above this much active insulin during a hypo, warn that one rescue may not be enough.
 export const IOB_HYPO_WARN_UNITS = 1.0;
 
@@ -102,6 +111,12 @@ export function roundToHalf(x: number): number {
   return Math.round(x * 2) / 2;
 }
 
+/** See the family's rule above. */
+export function rescueCubes(profile: GuardProfile | null): number {
+  const w = profile?.weightKg && profile.weightKg > 0 ? profile.weightKg : null;
+  return w ? Math.min(RESCUE_MAX_CUBES, Math.max(1, Math.round(w / RESCUE_KG_PER_CUBE))) : RESCUE_CUBES_NO_WEIGHT;
+}
+
 /** The one function that decides the allowed action. Safety-biased: when in doubt, no insulin. */
 export function computeGuard(input: GuardInput): GuardResult {
   const { glucoseMgdl: g, trend, staleMin, iobUnits, profile } = input;
@@ -122,17 +137,23 @@ export function computeGuard(input: GuardInput): GuardResult {
     if (ms != null && ms >= 0 && ms <= RESCUE_WINDOW_MIN && g >= SEVERE_LOW_MGDL) {
       return { kind: "wait", insulinUnits: 0, maxInsulinUnits: 0, sugarGrams: 0, sugarCubes: 0, reason: "sugar_recent" };
     }
-    const w = profile?.weightKg && profile.weightKg > 0 ? profile.weightKg : null;
-    let grams = w ? 0.3 * w : 15; // base rescue (≈0.3 g/kg) to fix the CURRENT low
-    // INSULIN-ON-BOARD AWARE: rapid insulin still active will keep lowering glucose, so add carbs to
-    // blunt part of it now (capped) — otherwise a single rescue fails and the low drags on.
-    const cr = profile?.carbRatio && profile.carbRatio > 0 ? profile.carbRatio : null;
-    const iob = iobUnits || 0;
-    if (cr && iob > 0) grams += iob * cr * IOB_RESCUE_FRACTION;
-    const capG = w ? w * 0.6 : 30; // never recommend a rebound-sized load in one go
-    grams = Math.round(Math.min(grams, capG));
-    const cubes = Math.max(1, Math.ceil(grams / 4));
-    return { kind: "sugar", insulinUnits: 0, maxInsulinUnits: 0, sugarGrams: grams, sugarCubes: cubes, reason: iob >= IOB_HYPO_WARN_UNITS ? "hypo_iob" : "hypo" };
+    // ALREADY CLIMBING: SOMETHING ANSWERED THIS LOW. Only a tenth of what is treated is ever noted, so the
+    // curve is the record: on 155 days a low between 54 and 70 going up was back over 70 within half an hour
+    // nine times in ten, at 98 at the median, against 77 for a flat one, and sugar on top of that is the
+    // rebound. It lasts while it climbs: the moment it stops, this is a low like any other. Food alone holds
+    // nothing, however much of it: 80 g of rice lifts nothing in 15 minutes (see RESCUE_MAX_CARBS).
+    if (g >= SEVERE_LOW_MGDL && (trend === "rising" || trend === "rising_fast")) {
+      const f = input.minSinceFood;
+      return {
+        kind: "wait", insulinUnits: 0, maxInsulinUnits: 0, sugarGrams: 0, sugarCubes: 0, reason: "sugar_recent",
+        climbing: f != null && f >= 0 && f <= FOOD_EXPLAINS_RISE_MIN ? "fed" : "unexplained",
+      };
+    }
+    const cubes = rescueCubes(profile);
+    return {
+      kind: "sugar", insulinUnits: 0, maxInsulinUnits: 0, sugarGrams: cubes * GRAMS_PER_CUBE, sugarCubes: cubes,
+      reason: (iobUnits || 0) >= IOB_HYPO_WARN_UNITS ? "hypo_iob" : "hypo",
+    };
   }
 
   if (g <= HIGH_MGDL) return block("none", "in_range");
@@ -276,9 +297,12 @@ export function trendFromReadings(readings: { ts: number; value: number }[], _no
 // Words that mean "sugar taken to fix a low", not "food". Narrow on purpose (mirrors the same list in
 // mechabetics-diet): a rescue is glucose/sugar cubes/juice, not a plate of something.
 const RESCUE_WORDS = [
-  "sucre", "azúcar", "azucar", "sugar", "morceau", "terrón", "terron",
+  "sucre", "azúcar", "azucar", "sugar", "terrón", "terron",
   "glucose", "glucosa", "dextro", "resucr", "rescate",
 ];
+/** Holds the treatment of a low if read as sugar: "coca sans sucre" logged at 65 answered "tu as déjà pris
+ *  du sucre, laisse-lui 15 min". */
+const NOT_SUGAR = /sans sucre|sin az[uú]car|sugar.?free|z[eé]ro|light/;
 
 /** Is this logged item a HYPO RESCUE (small fast sugar taken to treat a low) rather than a meal?
  *  Only a rescue may hold a re-treatment (computeGuard's "sugar_recent" gate), so this stays NARROW:
@@ -291,11 +315,21 @@ const RESCUE_WORDS = [
 export function isHypoRescue(desc?: string | null, carbsG?: number | null): boolean {
   const c = Number(carbsG);
   const known = Number.isFinite(c) && c > 0;
+  if (namedAsRescue(desc, carbsG)) return true;
   if (known && c > RESCUE_MAX_CARBS) return false;
   const d = (desc || "").toLowerCase();
-  if (!d) return false;
-  if (RESCUE_WORDS.some((w) => d.includes(w))) return true;
-  return known && mealCarbSpeed(d) === "fast";
+  return !!d && known && !NOT_SUGAR.test(d) && mealCarbSpeed(d) === "fast";
+}
+
+/** Called what a treatment is called, at the size of one: "3 sucres", "glucose". "3 morceaux" is how the
+ *  app itself says it, "un morceau de poulet" is not. A row with 0 g treats nothing. */
+export function namedAsRescue(desc?: string | null, carbsG?: number | null): boolean {
+  if (carbsG === 0) return false;
+  const c = Number(carbsG);
+  if (Number.isFinite(c) && c > RESCUE_MAX_CARBS) return false;
+  const d = (desc || "").toLowerCase();
+  if (!d || NOT_SUGAR.test(d)) return false;
+  return RESCUE_WORDS.some((w) => d.includes(w)) || /^\s*\d*\s*morceaux?\s*$/.test(d);
 }
 
 /**
@@ -330,6 +364,23 @@ export function minutesSinceLastRescue(meals: any[], nowMs: number): number | nu
   return latest ? Math.max(0, Math.round((nowMs - latest) / 60000)) : null;
 }
 
+/** Food this recent is why a low is climbing, as far as anyone can say. */
+const FOOD_EXPLAINS_RISE_MIN = 45;
+/** Under this it is a bite, and says nothing about the curve. */
+const FOOD_MIN_CARBS = 10;
+
+/** Minutes since the last food really eaten, a rescue or a meal, or null. */
+export function minutesSinceFood(meals: any[], nowMs: number): number | null {
+  let latest = 0;
+  for (const m of meals || []) {
+    if (!m || !isEatenBy(m, nowMs)) continue;
+    if (!(Number(m.carbs_g ?? m.carbsG) >= FOOD_MIN_CARBS)) continue;
+    const t = typeof m.ts === "number" ? m.ts : new Date(m.ts).getTime();
+    if (Number.isFinite(t) && t <= nowMs + 60000 && t > latest) latest = t;
+  }
+  return latest ? Math.max(0, Math.round((nowMs - latest) / 60000)) : null;
+}
+
 /** Did the person come up from a hypo recently (rebound)? Then don't stack a correction. */
 export function recentHypoFrom(readings: { ts: number; value: number }[], nowMs: number, windowMin = 75): boolean {
   const cut = nowMs - windowMin * 60 * 1000;
@@ -345,6 +396,17 @@ function fmtUnits(u: number): string {
 /** The authoritative, localized action sentence. Code owns the numbers; the LLM only adds tone. */
 export function actionLine(g: GuardResult, lang: string, profile: GuardProfile | null): string {
   const rapid = profile?.rapidInsulin || (lang === "es" ? "insulina rápida" : "insuline rapide");
+  // A low already on its way up: nothing to add, and the amount is there if it turns.
+  if (g.climbing) {
+    const cubes = rescueCubes(profile);
+    const grams = cubes * GRAMS_PER_CUBE;
+    if (lang === "es") {
+      const why = g.climbing === "fed" ? "has comido y ya está subiendo" : "ya está subiendo";
+      return `${why}: nada de azúcar de más por ahora, tenlo a mano. Vuelve a medir en 10 min; si baja o deja de subir por debajo de 70, toma ${grams} g de azúcar rápido (${cubes} terrón/es).`;
+    }
+    const why = g.climbing === "fed" ? "tu as mangé et ça remonte" : "ça remonte déjà";
+    return `${why} : pas de sucre en plus pour l'instant, garde-le à portée. Recontrôle dans 10 min ; si ça redescend ou que ça s'arrête sous 70, prends ${grams} g de sucre rapide (${cubes} morceau(x)).`;
+  }
   // A low that was JUST treated: hold, don't take more sugar yet.
   if (g.reason === "sugar_recent") {
     return lang === "es"
@@ -427,6 +489,10 @@ export function stripInsulinNumbers(text: string): string {
   // for readability survive this strip (it runs on every in-range/blocked analysis).
   return (text || "")
     .replace(/\d+(?:[.,]\d+)?\s*(?:ui\b|u\b|unit[ée]s?\b|unidad(?:es)?\b)/gi, "")
+    // What surrounded the number goes with it: "(environ )", "(≈ )", "de ," read as a broken app.
+    .replace(/[(（]\s*(?:environ|à peu près|presque|≈|~|unos|unas|aproximadamente|cerca de)?\s*[)）]/gi, "")
+    .replace(/\b(?:environ|unos|unas)\s+(?=[.,;:!?)]|$)/gim, "")
+    .replace(/[≈~]\s*(?=[.,;:!?)]|$)/gm, "")
     .replace(/[ \t]{2,}/g, " ")
     .replace(/[ \t]+([.,;:!?])/g, "$1")
     .trim();
@@ -507,6 +573,11 @@ export function clampInsulin(modelUnits: number, g: GuardResult): { units: numbe
 /** A short, NUMBER-FREE situation phrase so the LLM's tone matches the code-computed action. */
 export function situationHint(guard: GuardResult, lang: string): string {
   const es = lang === "es";
+  if (guard.climbing) {
+    return es
+      ? "glucosa baja pero ya subiendo: lo comido o tomado está actuando, sin azúcar de más por ahora, volver a medir pronto"
+      : "glycémie basse mais qui remonte déjà : ce qui a été mangé ou pris agit, pas de sucre en plus pour l'instant, recontrôle bientôt";
+  }
   switch (guard.reason) {
     case "hypo": return es ? "hipoglucemia en curso, hace falta azúcar rápido" : "hypo en cours, resucrage nécessaire";
     case "hypo_iob": return es ? "hipoglucemia con insulina aún activa: seguirá bajando, hace falta azúcar y vigilancia estrecha" : "hypo avec insuline encore active : ça va continuer à baisser, sucre + surveillance rapprochée";
@@ -678,9 +749,9 @@ export function carbsLandingWithin(meals: MealRow[], nowMs: number, horizonMin =
  *  still be left THEN. Doses not yet injected are excluded from both ends, so a planned dose cannot
  *  appear as insulin about to work. */
 export function insulinActingWithin(
-  doses: { ts: string | number; units: number; kind?: string; name?: string | null; insulin_name?: string | null }[],
+  doses: { ts: string | number; units: number; kind?: string | null; name?: string | null; insulin_name?: string | null }[],
   nowMs: number,
-  durationMin = 240,
+  defaultName?: string | number | null,
   horizonMin = BALANCE_HORIZON_MIN,
 ): number {
   const taken = (doses || []).filter((d) => {
@@ -688,22 +759,22 @@ export function insulinActingWithin(
     const t = typeof d.ts === "number" ? d.ts : new Date(d.ts).getTime();
     return Number.isFinite(t) && t <= nowMs;
   });
-  const now = activeIob(taken, nowMs, durationMin);
-  const later = activeIob(taken, nowMs + horizonMin * 60000, durationMin);
+  const now = activeIob(taken, nowMs, defaultName);
+  const later = activeIob(taken, nowMs + horizonMin * 60000, defaultName);
   return Math.max(0, now - later);
 }
 
 /** Both rates in one call, for the callers that hold the rows. */
 export function balanceRates(
   meals: MealRow[],
-  doses: { ts: string | number; units: number; kind?: string; name?: string | null; insulin_name?: string | null }[],
+  doses: { ts: string | number; units: number; kind?: string | null; name?: string | null; insulin_name?: string | null }[],
   nowMs: number,
-  durationMin = 240,
+  defaultName?: string | number | null,
   horizonMin = BALANCE_HORIZON_MIN,
 ): BalanceRates {
   return {
     gramsSoon: carbsLandingWithin(meals, nowMs, horizonMin),
-    unitsSoon: insulinActingWithin(doses, nowMs, durationMin, horizonMin),
+    unitsSoon: insulinActingWithin(doses, nowMs, defaultName, horizonMin),
     horizonMin,
   };
 }
@@ -802,9 +873,8 @@ export function mealBolusHeldByIob(
 ): boolean {
   const b = glucoseBalance(glucoseMgdl, iobUnits, cobGrams, profile, rates);
   // EITHER HORIZON HOLDS IT. The near-term view exists to catch food that arrives too late — it may
-  // only ADD holds. Judged on the hour ALONE it did the opposite: insulin decays linearly, so any
-  // dose with more than an hour left contributes exactly a quarter of itself to the hour whatever
-  // its size, and eight units injected five minutes ago looked survivable. The hold was released in
+  // only ADD holds. Judged on the hour ALONE it did the opposite: most of a dose acts after the first
+  // hour, so eight units injected five minutes ago looked survivable. The hold was released in
   // 1783 states against 85 gained, and the app would have advised six more units on top.
   return !!b && (b.headroomMgdl < 0 || b.headroomSoonMgdl < 0);
 }
@@ -931,47 +1001,113 @@ export function sugarTimingFact(lang: string): string {
     : `DÉLAI DU SUCRE (donnée fixe — NE l'invente pas) : le sucre rapide (morceaux, jus, soda) COMMENCE à agir en ~15 min et son plein effet arrive vers ~30-45 min — c'est la « règle des 15 » : prendre du sucre, attendre 15 min puis recontrôler. Après un resucrage, laisse passer ~15 min avant d'en reprendre ou de recontrôler. Ne donne JAMAIS une autre durée (pas de « 20 min », « 26 min »…).`;
 }
 
-/** Effective duration of insulin action (minutes) for a named insulin, used for the linear IOB
- *  decay. Returns null for an unknown name so the caller can fall back to its default (4 h).
- *  Rapid/ultra-rapid analogs ≈ 4 h working time; Fiasp/Lyumjev act FASTER with a SHORTER tail than
- *  older analogs, but 4 h linear already tails high — keeping them at 4 h overestimates late IOB,
- *  which BLOCKS dose-stacking (the safe direction) rather than causing it. Regular human insulin
- *  lasts ~6 h, inhaled (Afrezza) ~3 h — those genuinely need a different duration. */
+/** When a dose of this insulin is spent for practical purposes, in minutes: under 5 % left. Null for
+ *  a name nothing recognises, so callers can fall back to their own default. Used for the words
+ *  ("terminée"), never for the arithmetic: that is [activeIob], on the insulin's own curve. */
 export function insulinActionMinutes(name?: string | null): number | null {
+  const info = insulinByName(name);
+  if (info?.curve) return practicallyDoneMin(info.curve);
   const n = (name || "").toLowerCase();
-  if (!n) return null;
-  if (n.includes("afrezza") || n.includes("inhal")) return 180; // inhaled — very short
-  if (
-    n.includes("actrapid") || n.includes("humulin r") || n.includes("humulin s") ||
-    n.includes("insuman") || n.includes("novolin r") || n.includes("insulatard") ||
-    /\bregular\b/.test(n) || n.includes("humaine") || n.includes("humana")
-  ) return 360; // regular/human short-acting — long tail (~6 h)
-  if (
-    n.includes("fiasp") || n.includes("lyumjev") || n.includes("novorapid") || n.includes("novolog") ||
-    n.includes("humalog") || n.includes("apidra") || n.includes("admelog") || n.includes("trurapi") ||
-    n.includes("kirsty") || n.includes("aspart") || n.includes("lispro") || n.includes("glulisine") ||
-    n.includes("rapid") || n.includes("rápid") || n.includes("rapide")
-  ) return 240; // rapid & ultra-rapid analogs — ~4 h
-  return null; // unknown → caller's default
+  if (n.includes("rapid") || n.includes("rápid")) return practicallyDoneMin(curveOf(name));
+  return null;
 }
 
-/** Active insulin-on-board from recent rapid doses (linear decay over each dose's action duration —
- *  insulin-type-aware via insulinActionMinutes, fallback `durationMin`). ts may be ISO or ms. */
+/** Share of a dose of this insulin still to act after `minutes`. */
+export function doseFractionLeft(name: string | null | undefined, minutes: number): number {
+  return fractionRemaining(minutes, curveOf(name));
+}
+
+/**
+ * Insulin still working, in units, from every rapid dose on record. Each dose runs on the curve of
+ * ITS OWN insulin, so a family that changes product mid-week is still counted right.
+ *
+ * `defaultName` is the patient's usual rapid insulin, used for a dose logged without a name. Doses
+ * logged under a background insulin never count, whatever their `kind` says: 15 u of Lantus read as
+ * rapid would block every correction for six hours. `ts` may be ISO or ms.
+ */
 export function activeIob(
-  doses: { ts: string | number; units: number; kind?: string; name?: string | null; insulin_name?: string | null }[],
+  doses: { ts: string | number; units: number; kind?: string | null; name?: string | null; insulin_name?: string | null }[],
   nowMs: number,
-  durationMin = 240,
+  defaultName?: string | number | null,
 ): number {
+  const fallback = typeof defaultName === "string" ? defaultName : null;
   let iob = 0;
   for (const d of (doses || [])) {
     if (!d || d.kind === "basal") continue;
+    const name = d.name ?? d.insulin_name ?? fallback;
+    if (isBasalInsulin(name)) continue;
     const t = typeof d.ts === "number" ? d.ts : new Date(d.ts).getTime();
-    const dur = insulinActionMinutes(d.name ?? d.insulin_name) ?? durationMin;
     const mins = (nowMs - t) / 60000;
-    if (!Number.isFinite(mins) || mins < 0 || mins > dur) continue;
-    iob += Number(d.units) * (1 - mins / dur);
+    if (!Number.isFinite(mins) || mins < 0) continue;
+    iob += Number(d.units) * doseFractionLeft(name, mins);
   }
   return Math.max(0, iob);
+}
+
+/** A dose said for the coming hour ("je ferai 3 u dans une demi-heure"). Not in the body yet, so it is
+ *  not on the screen as active insulin, but nothing may be named on top of it. */
+export const ANNOUNCED_DOSE_MIN = 60;
+
+/** The straight line the doses were judged on until v4.0, in minutes. */
+const DOSE_LINE_MIN = 240;
+
+/**
+ * The insulin a NEW dose is judged against: the larger of the curve and the old straight line, dose by
+ * dose, plus what was announced for the coming hour.
+ *
+ * The curve is the better estimate of what is left, and it stays the number on screen. But past the
+ * first hour it says less is left than the line did, up to 15 % of the dose at 140 minutes, and a dose
+ * computed on it comes out larger: 6 u at 140 min, 181 mg/dL and 60 g just logged asked for 4 u where
+ * the line asked for 2. Half of this child's doses already end under 70. A better estimate of the
+ * insulin must not turn into more insulin, so no dose named here can exceed what the line would name.
+ */
+export function dosingIob(
+  doses: { ts: string | number; units: number; kind?: string | null; name?: string | null; insulin_name?: string | null }[],
+  nowMs: number,
+  defaultName?: string | number | null,
+): number {
+  const fallback = typeof defaultName === "string" ? defaultName : null;
+  let iob = 0;
+  for (const d of (doses || [])) {
+    if (!d || d.kind === "basal") continue;
+    const name = d.name ?? d.insulin_name ?? fallback;
+    if (isBasalInsulin(name)) continue;
+    const t = typeof d.ts === "number" ? d.ts : new Date(d.ts).getTime();
+    const mins = (nowMs - t) / 60000;
+    if (!Number.isFinite(mins)) continue;
+    if (mins < 0) {
+      if (mins >= -ANNOUNCED_DOSE_MIN) iob += Number(d.units);
+      continue;
+    }
+    iob += Number(d.units) * Math.max(doseFractionLeft(name, mins), lineLeft(name, mins));
+  }
+  return Math.max(0, iob);
+}
+
+/** Share of a dose left on the old straight line. */
+function lineLeft(name: string | null | undefined, minutes: number): number {
+  return Math.max(0, 1 - minutes / Math.max(DOSE_LINE_MIN, insulinActionMinutes(name) ?? DOSE_LINE_MIN));
+}
+
+/** The hour ahead, judged the same way: the larger of what the curve and the line expect to act. */
+export function dosingActingWithin(
+  doses: { ts: string | number; units: number; kind?: string | null; name?: string | null; insulin_name?: string | null }[],
+  nowMs: number,
+  defaultName?: string | number | null,
+  horizonMin = BALANCE_HORIZON_MIN,
+): number {
+  const fallback = typeof defaultName === "string" ? defaultName : null;
+  let onLine = 0;
+  for (const d of (doses || [])) {
+    if (!d || d.kind === "basal") continue;
+    const name = d.name ?? d.insulin_name ?? fallback;
+    if (isBasalInsulin(name)) continue;
+    const t = typeof d.ts === "number" ? d.ts : new Date(d.ts).getTime();
+    const mins = (nowMs - t) / 60000;
+    if (!Number.isFinite(mins) || mins < 0) continue;
+    onLine += Number(d.units) * (lineLeft(name, mins) - lineLeft(name, mins + horizonMin));
+  }
+  return Math.max(onLine, insulinActingWithin(doses, nowMs, defaultName, horizonMin));
 }
 
 /** Code-owned phrase for how much insulin is still working — three HONEST tiers. "presque épuisée"
@@ -1019,9 +1155,11 @@ function mealLabel(
   if (meal?.carbsG != null && meal.carbsG > 0) bits.push(`${Math.round(meal.carbsG)} g`);
   const m = meal?.minutesAgo;
   if (m != null && m >= 0) {
+    const h = Math.floor(m / 60);
+    const mm = String(m % 60).padStart(2, "0");
     bits.push(m < 60
       ? (es ? `hace ${m} min` : `il y a ${m} min`)
-      : (es ? `hace ${Math.round(m / 60)} h` : `il y a ${Math.round(m / 60)} h`));
+      : (es ? `hace ${h} h ${mm}` : `il y a ${h} h ${mm}`));
   }
   const paren = bits.length ? ` (${bits.join(", ")})` : "";
   return `«${d.slice(0, 48)}»${paren}`;
@@ -1203,6 +1341,9 @@ export function plannedMealNote(
 
 // ---- Proactive prediction (SUGGESTION only — the dose guard still owns every number) ---------
 
+/** How fast a trend dies out, in minutes. The forecast's fallback uses the same figure. */
+export const MOMENTUM_FADE_MIN = 15;
+
 export interface Projection {
   slopePerMin: number;
   projectedMgdl: number | null;
@@ -1223,7 +1364,11 @@ export function projectGlucose(
   const { slope: raw, current } = robustSlope(readings);
   if (current === null) return { slopePerMin: 0, projectedMgdl: null, minutesAhead, current: null };
   const slope = raw ?? 0; // no readable direction -> project flat, never invent a ramp
-  const projected = Math.max(20, Math.min(600, Math.round(current + slope * minutesAhead)));
+  // A trend fades. Carried on in a straight line it missed by 88 mg/dL at one hour on Ryan's data, worse
+  // than saying nothing changes (63). The slope is capped too: past 4 mg/dL a minute it is mostly noise.
+  const capped = Math.max(-4, Math.min(4, slope));
+  const move = capped * MOMENTUM_FADE_MIN * (1 - Math.exp(-minutesAhead / MOMENTUM_FADE_MIN));
+  const projected = Math.max(20, Math.min(600, Math.round(current + move)));
   return { slopePerMin: slope, projectedMgdl: projected, minutesAhead, current };
 }
 
@@ -1422,7 +1567,7 @@ export const MEAL_COVER_WINDOW_MIN = 45;
 // …if it carries at least this fraction of the meal's expected bolus.
 export const MEAL_COVER_FRACTION = 0.5;
 
-function cobWindowMin(speed: CarbSpeed): number {
+export function cobWindowMin(speed: CarbSpeed): number {
   if (speed === "fast") return COB_WINDOW_FAST_MIN;
   if (speed === "slow" || speed === "fatty") return COB_WINDOW_SLOW_MIN;
   return COB_WINDOW_NORMAL_MIN;
@@ -1451,7 +1596,7 @@ export interface UncoveredMeal {
 }
 
 type MealRow = { ts: string | number; carbs_g?: number | null; carbsG?: number | null; description?: string | null; planned?: boolean };
-type DoseRow = { ts: string | number; units: number; kind?: string | null };
+type DoseRow = { ts: string | number; units: number; kind?: string | null; name?: string | null; insulin_name?: string | null };
 
 // A hypo rescue eaten while the glucose was LOW is a rescue whatever it is called. The word list
 // below it (RESCUE_WORDS / mealCarbSpeed) knows "soda", "coca", "limonade" — and did not know "7up",
@@ -1462,6 +1607,15 @@ type DoseRow = { ts: string | number; units: number; kind?: string | null };
 export const RESCUE_GLUCOSE_MGDL = 80;
 /** A low this recently makes whatever followed it a rescue. */
 export const RESCUE_LOOKBACK_MIN = 45;
+/** Drinks that the word lists do not know as fast sugar, and should not: at a normal glucose a can of 7up
+ *  is food with its dose. Just after a low it is what brought the glucose up, whatever the reading says. */
+const SWEET_DRINKS = ["7up", "7 up", "seven up", "orangina", "canette", "gaseosa"];
+/** A small sweet thing is only worth covering while it is still arriving. Past this it has mostly acted,
+ *  and insulin would come after the sugar: 1 u at 90, forty minutes after a juice, lands on nothing. */
+export const SNACK_COVER_MIN = 15;
+/** On the way up from a low, what is eaten at or under this is still the treatment. Above it the low is
+ *  over and it is food: a sandwich at 160, forty minutes after a 65, came out with no insulin at all. */
+export const RESCUE_AFTER_LOW_MGDL = 110;
 /** How close to the meal a sub-70 reading must be to mean "they were low WHILE eating". A low that
  *  has been treated and resolved is history by the time the next meal comes; forty minutes was long
  *  enough to swallow the lunch that followed a morning hypo. */
@@ -1495,6 +1649,8 @@ export function eatenToTreatALow(
   if (!rs.length) return false;
 
   const c = Number(carbsG);
+  const speed = mealCarbSpeed(description);
+  const slowFood = speed === "slow" || speed === "fatty";
   // A LOW MEASURED WHILE THEY WERE EATING outranks the vocabulary and the carb speed. People do not
   // measure out a textbook 15 g when they feel a hypo coming: at 57 mg/dL a can of classic cola is
   // 35 g — over the ordinary rescue ceiling — and answering it with three units of rapid is the 7up
@@ -1508,7 +1664,20 @@ export function eatenToTreatALow(
   const from = mealTs - RESCUE_NEARBY_MIN * 60000;
   const to = mealTs + 10 * 60000;
   const lowWhileEating = rs.some((r) => Number(r.ts) >= from && Number(r.ts) <= to && Number(r.value) < LOW_MGDL);
-  if (lowWhileEating) return !(Number.isFinite(c) && c > RESCUE_AT_LOW_MAX_CARBS);
+  if (lowWhileEating) {
+    // A plate is still a plate. Pasta or a burger lift nothing in time, and the dose promised "ensuite"
+    // for them has to still be there once the low is over. A square of chocolate at 60 is the treatment.
+    if (slowFood && Number.isFinite(c) && c > RESCUE_MAX_CARBS) return false;
+    return !(Number.isFinite(c) && c > RESCUE_AT_LOW_MAX_CARBS);
+  }
+
+  // Sugar on the way up from a low is the treatment, at 92 as much as at 75: a can of 7up twenty minutes
+  // after a 65 is the incident this whole rule exists for. It keeps that name whatever the reading says by
+  // then, written down late, and at the size people really take: 35 g of cola at 115 is not a snack.
+  const after = rs.some((r) => Number(r.ts) >= mealTs - RESCUE_LOOKBACK_MIN * 60000 && Number(r.ts) <= mealTs && Number(r.value) < LOW_MGDL);
+  const d = (description || "").toLowerCase();
+  const sugary = speed === "fast" || SWEET_DRINKS.some((w) => d.includes(w)) || namedAsRescue(description, null);
+  if (after && sugary && !(Number.isFinite(c) && c > RESCUE_AT_LOW_MAX_CARBS)) return true;
 
   // Below here there is NO low at the moment of eating — only a low-ISH value (≤ 80) near the meal,
   // or a low that had already passed, from which we INFER treatment. An inference is where the food
@@ -1516,14 +1685,38 @@ export function eatenToTreatALow(
   // and filing lunch as a rescue means never being told to cover it. So: nothing above rescue size,
   // and nothing slow or fatty (neither lifts a low inside the quarter of an hour this window judges).
   if (Number.isFinite(c) && c > RESCUE_MAX_CARBS) return false;
-  const speed = mealCarbSpeed(description);
-  if (speed === "slow" || speed === "fatty") return false;
+  if (slowFood) return false;
   let nearest: { dt: number; v: number } | null = null;
   for (const r of rs) {
     const dt = Math.abs(Number(r.ts) - mealTs);
     if (dt <= 15 * 60000 && (!nearest || dt < nearest.dt)) nearest = { dt, v: Number(r.value) };
   }
-  return !!nearest && nearest.v <= RESCUE_GLUCOSE_MGDL;
+  if (!nearest) return after;
+  return nearest.v <= (after ? RESCUE_AFTER_LOW_MGDL : RESCUE_GLUCOSE_MGDL);
+}
+
+/**
+ * Is this food a treatment rather than something to cover? ONE RULE for a row in the log and for a food
+ * under discussion: the photo and the meals screen used to say 1,5 u for a juice at 150 while the voice
+ * and the analysis said nothing. No insulin for it when it is called sugar, when a low is near, or
+ * when it is small and quick on the way down: 12 g at 100 falling 4 a minute is someone stopping a fall.
+ * Otherwise it is food: a juice at 150 with no low around gets covered, like anything else, with every
+ * hold a dose goes through. With no readings to look at, the words are all there is.
+ */
+export function eatenAsTreatment(
+  mealTs: number,
+  readings: { ts: number; value: number }[] | null | undefined,
+  carbsG?: number | null,
+  description?: string | null,
+): boolean {
+  const rs = (readings || []).filter((r) => r && Number(r.value) > 0 && Number.isFinite(Number(r.ts)));
+  if (!rs.length) return isHypoRescue(description, carbsG);
+  if (namedAsRescue(description, carbsG)) return true;
+  if (eatenToTreatALow(mealTs, rs, carbsG, description)) return true;
+  if (!isHypoRescue(description, carbsG)) return false;
+  const until = rs.filter((r) => Number(r.ts) <= mealTs + 60000 && Number(r.ts) >= mealTs - 30 * 60000);
+  const trend = trendFromReadings(until, mealTs);
+  return trend === "falling" || trend === "falling_fast";
 }
 
 /** The most recent EATEN meal that (a) was substantial (≥ UNCOVERED_MEAL_MIN_CARBS g), (b) is still
@@ -1538,40 +1731,76 @@ export function findUncoveredMeal(
   readings?: { ts: number; value: number }[] | null,
 ): UncoveredMeal | null {
   const cr = profile?.carbRatio && profile.carbRatio > 0 ? profile.carbRatio : null;
-  let best: UncoveredMeal | null = null;
+  const candidates: {
+    m: MealRow; mt: number; carbs: number; rescueG: number; minsAgo: number; speed: CarbSpeed;
+  }[] = [];
   for (const m of meals || []) {
     // Not yet eaten → nothing to cover yet; already eaten (even if still flagged "planned") → it is
     // exactly the meal this looks for.
     if (!m || !isEatenBy(m, nowMs)) continue;
-    // A hypo rescue is NOT a meal to bolus. Without this, 15 g of sugar taken to stop a fall came
-    // back as "1,5 u for the meal" — insulin advised to cover the treatment for a low.
-    if (isHypoRescue(m.description, m.carbs_g ?? m.carbsG)) continue;
     const logged = Number(m.carbs_g ?? m.carbsG ?? 0);
     if (!Number.isFinite(logged) || logged <= 0) continue;
     const mt = typeof m.ts === "number" ? m.ts : new Date(m.ts).getTime();
     if (!Number.isFinite(mt)) continue;
-    // THE CURVE OVERRULES THE WORDS. Eaten while low = treatment for that low, never a meal to cover
-    // — but only at rescue SIZE: a full menu eaten at 80 mg/dL is still a meal that needs its bolus.
-    if (eatenToTreatALow(mt, readings, logged, m.description)) continue;
+    // A hypo rescue is NOT a meal to bolus. Without this, 15 g of sugar taken to stop a fall came
+    // back as "1,5 u for the meal" — insulin advised to cover the treatment for a low. THE CURVE
+    // OVERRULES THE WORDS: eaten while low = treatment for that low, never a meal to cover — but only at
+    // rescue SIZE: a full menu eaten at 80 mg/dL is still a meal that needs its bolus.
+    if (eatenAsTreatment(mt, readings, logged, m.description)) continue;
+    if (isHypoRescue(m.description, logged) && (nowMs - mt) / 60000 > SNACK_COVER_MIN) continue;
     // ONE ENTRY, TWO THINGS. Above RESCUE_AT_LOW_MAX_CARBS the all-or-nothing test just gave up, so
     // "4 sucres et 2 petits croque-monsieur" logged at 53 mg/dL was bolused whole — the rescue sugar
     // included. Take the counted rescue out and cover only what is left; the caller says the figure.
-    const rescueG = wasLowAtMeal(mt, readings) ? rescueCarbsInMeal(m.description, logged) : 0;
+    const lowAtMeal = wasLowAtMeal(mt, readings);
+    const rescueG = lowAtMeal ? rescueCarbsInMeal(m.description, logged) : 0;
     const carbs = Math.max(0, logged - rescueG);
+    // A slow plate eaten at a low: its dose waits for the rise. "Une fois la remontée amorcée" means that,
+    // not 90 and climbing half an hour after a hypo: until then it is the same line as for the treatment.
+    const speedOf = mealCarbSpeed(m.description);
+    const slowPlate = speedOf === "slow" || speedOf === "fatty";
+    if (lowAtMeal && slowPlate && logged <= RESCUE_AT_LOW_MAX_CARBS && newestReading(readings) < RESCUE_AFTER_LOW_MGDL) continue;
     if (carbs < UNCOVERED_MEAL_MIN_CARBS) continue;
     const minsAgo = (nowMs - mt) / 60000;
     if (minsAgo < 0) continue; // not eaten yet
     const speed = mealCarbSpeed(m.description);
     if (minsAgo > cobWindowMin(speed)) continue; // carbs already absorbed → no longer the cause
-    const need = cr ? carbs / cr : 0; // expected meal bolus (0 when no ratio → any nearby dose covers)
-    const covered = (doses || []).some((d) => {
-      if (!d || d.kind === "basal") return false;
-      const dt = typeof d.ts === "number" ? d.ts : new Date(d.ts).getTime();
-      if (!Number.isFinite(dt)) return false;
-      if (Math.abs(dt - mt) > MEAL_COVER_WINDOW_MIN * 60000) return false;
-      return need <= 0 || Number(d.units) >= need * MEAL_COVER_FRACTION;
-    });
-    if (covered) continue;
+    candidates.push({ m, mt, carbs, rescueG, minsAgo, speed });
+  }
+
+  // A DOSE ONLY COVERS WHAT IT HAS THE UNITS FOR. Each meal used to be tested against every dose on its
+  // own, so one 2 u dose cleared two 60 g meals. Each dose now has its units to give, spent on the
+  // meals in the order they were eaten: a 4 u dose still covers a plate and the dessert logged after
+  // it, as a family that injects once for both expects, and the second 60 g stays uncovered. Each meal
+  // takes the oldest dose that can reach it, which leaves the later ones for the later food: nearest
+  // first, a plate took the 2 u given after it, the 5 u before it could not reach the dessert, and 7 u
+  // for 5 u of food came out as "fais 1 u".
+  const left = (doses || []).flatMap((d) => {
+    if (!d || d.kind === "basal" || isBasalInsulin(d.name ?? d.insulin_name)) return [];
+    const dt = typeof d.ts === "number" ? d.ts : new Date(d.ts).getTime();
+    // Up to an hour ahead: a dose said for the next hour covers the plate as much as one just given.
+    if (!Number.isFinite(dt) || dt > nowMs + ANNOUNCED_DOSE_MIN * 60000) return [];
+    return [{ dt, units: Number(d.units) || 0 }];
+  });
+
+  let best: UncoveredMeal | null = null;
+  for (const c of candidates.sort((a, b) => a.mt - b.mt)) {
+    const { m, mt, carbs, rescueG, minsAgo, speed } = c;
+    // What this dose would have to give, at its own time: the whole plate when it went in around the
+    // meal, what was left of the food when it went in later. 6 November: 60 g at 20:59, 3 u at 22:21,
+    // and eighteen minutes later the meal still read as uncovered and asked for more. 0 without a
+    // carb ratio: any nearby dose covers.
+    const needOf = (dt: number) => {
+      if (!cr) return 0;
+      if (dt <= mt + MEAL_COVER_WINDOW_MIN * 60000) return carbs / cr;
+      return (carbs * Math.max(0, 1 - (dt - mt) / 60000 / cobWindowMin(speed))) / cr;
+    };
+    const dose = left
+      .filter((d) => d.dt >= mt - MEAL_COVER_WINDOW_MIN * 60000 && d.units >= needOf(d.dt) * MEAL_COVER_FRACTION)
+      .sort((a, b) => a.dt - b.dt)[0];
+    if (dose) {
+      dose.units = Math.max(0, dose.units - needOf(dose.dt));
+      continue;
+    }
     if (!best || minsAgo < best.minutesAgo) {
       // Same linear decay carbsOnBoard uses, so "still to come" means one thing across the engine.
       const remaining = Math.max(0, carbs * (1 - minsAgo / cobWindowMin(speed)));
@@ -1696,6 +1925,14 @@ export function inRangeActionLine(
     // Not enough food, or food that arrives too late — two different situations, and the second one
     // is the pizza: the grams are there, they simply land after the insulin has done its work.
     const late = !!bal?.slowFoodMismatch || (bal && grams > 0 && bal.riseSoonMgdl * 2 < bal.riseMgdl);
+    // AND A CURVE THAT IS CLIMBING HAS ALREADY ANSWERED. 7 November, 77 and up 3 a minute, ten minutes after
+    // two slices of toast: "sans sucre tu passes sous 70, les ~38 g arrivent TROP TARD". Those two figures are
+    // estimates and the curve is a measurement. The insulin is still there, so no more of it.
+    if (grams > 0 && (robustSlope(readings || []).slope ?? 0) >= 0.5) {
+      return es
+        ? `estás a ${g} mg/dL y está subiendo, con ~${grams} g aún en digestión: no hace falta azúcar por ahora. Sigue habiendo insulina activa: ten azúcar a mano, vuelve a medir en 30 min y nada de insulina de más (comida incluida) hasta que haya subido.`
+        : `tu es à ${g} mg/dL et ça remonte, avec ~${grams} g encore en digestion : pas besoin de sucre pour l'instant. Il reste de l'insuline active : garde du sucre à portée, recontrôle dans 30 min, et aucune insuline en plus (repas compris) tant que ce n'est pas remonté.`;
+    }
     const food = grams === 0
       ? ""
       : late
@@ -1847,6 +2084,8 @@ export function mealBolusPlan(
   let bestDesc: string | null = null;
   for (const m of meals || []) {
     if (!m || m.planned !== true) continue;
+    // "Il va prendre 3 sucres avant le foot" is not a meal to dose for, now or later.
+    if (namedAsRescue(m.description, m.carbs_g ?? m.carbsG)) continue;
     const t = typeof m.ts === "number" ? m.ts : new Date(m.ts).getTime();
     // Still ahead, and not so far ahead that it is tomorrow's dinner.
     if (!Number.isFinite(t) || t <= nowMs || t > nowMs + announcedWindowMin * 60000) continue;
@@ -1893,6 +2132,7 @@ export interface MealPlanInput {
   /** Arrival rates for the two sides (`balanceRates`). Without them the plan compares totals. */
   rates?: BalanceRates | null;
   minSinceRescue?: number | null;
+  minSinceFood?: number | null;
   recentHypo?: boolean;
   /** 0..ACTIVITY_MAX_CUT — sport around this meal trims BOTH halves of the dose (activityBolusCut).
    *  Absent/0 leaves the arithmetic exactly as it was. */
@@ -1949,7 +2189,7 @@ export function planMealDose(input: MealPlanInput): MealPlanResult {
   const minutesUntilMeal = Number.isFinite(untilRaw) && untilRaw > 0 ? Math.round(untilRaw) : 0;
   const guard = computeGuard({
     glucoseMgdl: g, trend, staleMin, iobUnits, recentHypo: !!input.recentHypo,
-    minSinceRescue: input.minSinceRescue ?? null, profile,
+    minSinceRescue: input.minSinceRescue ?? null, minSinceFood: input.minSinceFood ?? null, profile,
   });
 
   const icr = profile?.carbRatio && profile.carbRatio > 0 ? profile.carbRatio : null;
@@ -2007,9 +2247,15 @@ export function planMealDose(input: MealPlanInput): MealPlanResult {
   const landsLowAfterDose = !hypoFirst && carbsG > 0 && g != null && !!icr && !!isf &&
     (g + ((carbsG + Math.max(0, Number(input.cobGrams) || 0)) / icr) * isf
       - (Math.max(0, iobUnits || 0) + plannedTotal) * isf) < LOW_MGDL;
+  // Under 90 there is no room for a full meal dose in ANY direction: the line the analysis has always
+  // drawn (mealBolusHeldByFall). Without it here, 85 stable with 60 g logged three minutes earlier
+  // came out as "4 u", and 72 rising with a pizza as 5 u. It is about this moment: a meal two hours away
+  // will be eaten at another glucose, and "mange d'abord" says nothing about it. Three quarters of an
+  // hour, not half: a dose done ahead of the food is due sooner than the food.
   const lowBeforeMeal = !hypoFirst && carbsG > 0 && (
     (floorMgdl != null && floorMgdl < LOW_MGDL) ||
     landsLowAfterDose ||
+    (g != null && g < FALL_WATCH_BELOW && minutesUntilMeal <= 45) ||
     (falling && g != null && g < FALL_WATCH_BELOW + 10)
   );
 
@@ -2096,6 +2342,10 @@ export function mealPlanLine(
    *  supposed to conclude. The voice/ask path, where the user literally asked "if I eat this, how
    *  much?", keeps the full reasoning. Safety clauses are never dropped by this flag. */
   concise = false,
+  /** Say what the meal will need once the low or the fall is over. The engine turns this off: that figure
+   *  was worked out now, for a later that has its own glucose and its own insulin on board. At 120 with
+   *  3 u just given it read "the meal will need 4 u", where the safe figure was none. */
+  figureLater = true,
 ): string {
   const es = lang === "es";
   const rapid = profile?.rapidInsulin || (es ? "insulina rápida" : "insuline rapide");
@@ -2111,8 +2361,13 @@ export function mealPlanLine(
     // hypo has a rescue in grams. Returning "je ne peux pas donner de dose" threw BOTH away: at
     // 45 mg/dL the guard had already computed the sugar to take and the only sentence the endpoint
     // emitted was a complaint about the profile.
+    // The correction as it will really be given: the sentence and the figure a Done button records must
+    // be the same number, and sport has already trimmed this one.
+    const said = plan.guard.kind === "correction"
+      ? { ...plan.guard, insulinUnits: plan.correctionUnits, maxInsulinUnits: plan.correctionUnits }
+      : plan.guard;
     const guardFirst = (plan.correctionUnits > 0 || plan.guard.kind === "sugar" || plan.guard.reason === "sugar_recent")
-      ? actionLine(plan.guard, lang, profile) + " "
+      ? actionLine(said, lang, profile) + " "
       : "";
     return guardFirst + (es
       ? `Para ~${plan.carbsG} g de carbohidratos${cubesP} no puedo dar la dosis de la COMIDA: falta tu ratio de carbohidratos en el perfil. Complétalo y te doy el número exacto.`
@@ -2140,9 +2395,18 @@ export function mealPlanLine(
     // Lead with the GRAMS. "Sucre d'abord" without a quantity is the one number that actually
     // matters at that moment, and it was being dropped in favour of the meal's unit count.
     parts.push(actionLine(plan.guard, lang, profile));
-    parts.push(es
-      ? `Después, para ~${plan.carbsG} g${cubesP}, la comida necesitará ${fmtUnits(plan.mealUnits)} u de ${rapid} — solo DESPUÉS de haber remontado.`
-      : `Ensuite, pour ~${plan.carbsG} g${cubesP}, le repas demandera ${fmtUnits(plan.mealUnits)} u de ${rapid} — seulement APRÈS être remonté.`);
+    parts.push(figureLater
+      ? (es
+        ? `Después, para ~${plan.carbsG} g${cubesP}, la comida necesitará ${fmtUnits(plan.mealUnits)} u de ${rapid} — solo DESPUÉS de haber remontado.`
+        : `Ensuite, pour ~${plan.carbsG} g${cubesP}, le repas demandera ${fmtUnits(plan.mealUnits)} u de ${rapid} — seulement APRÈS être remonté.`)
+      : (es
+        ? `Después, para ~${plan.carbsG} g${cubesP}, vuelve a preguntarme cuando hayas remontado: calcularé la dosis en ese momento.`
+        : `Ensuite, pour ~${plan.carbsG} g${cubesP}, redemande-moi une fois remonté : je calculerai la dose à ce moment-là.`));
+  } else if (plan.lowBeforeMeal) {
+    // NOTHING IS TO BE INJECTED NOW, so that is what the sentence opens with. On a card that shows one
+    // line, "Pour ~60 g : 4 u de Fiasp pour le repas" reads as the instruction, and the warning that
+    // followed it was the part nobody saw. The figure comes last, for later.
+    parts.push(es ? "Ninguna insulina ahora." : "Aucune insuline maintenant.");
   } else {
     let head = es
       ? `Para ~${plan.carbsG} g de carbohidratos${cubesP}: ${fmtUnits(plan.totalUnits)} u de ${rapid}`
@@ -2169,7 +2433,7 @@ export function mealPlanLine(
   // — reacting to the glucose after the fact can never catch a rise this size. Skipped during a hypo:
   // there the one thing that must land is "sugar first", and a "+292 mg/dL" beside it only competes
   // with it (the food IS the treatment at that moment).
-  if (!concise && plan.reason !== "hypo_first" && plan.expectedRiseMgdl != null && plan.expectedRiseMgdl > 0) {
+  if (!concise && !plan.lowBeforeMeal && plan.reason !== "hypo_first" && plan.expectedRiseMgdl != null && plan.expectedRiseMgdl > 0) {
     const capped = plan.projectedUncoveredMgdl != null && plan.projectedUncoveredMgdl >= PROJECTION_MAX_MGDL;
     const land = plan.projectedUncoveredMgdl != null
       ? (es
@@ -2206,8 +2470,17 @@ export function mealPlanLine(
       // "en train de descendre" is a small lie, and a parent who catches one stops believing the
       // sentence around it. This wording is true either way.
       parts.push(es
-        ? "⚠️ Estás demasiado bajo para ponerte insulina ahora: come primero y ponla cuando la subida haya empezado, no antes."
-        : "⚠️ Tu es trop bas pour encaisser de l'insuline maintenant : mange d'abord et fais-la une fois la remontée amorcée, pas avant.");
+        ? "⚠️ No hay margen para insulina ahora: come primero y ponla cuando la subida haya empezado, no antes."
+        : "⚠️ Pas assez de marge pour de l'insuline maintenant : mange d'abord et fais-la une fois la remontée amorcée, pas avant.");
+    }
+    if (plan.mealUnits > 0) {
+      parts.push(figureLater
+        ? (es
+          ? `Después, para ~${plan.carbsG} g${cubesP}, la comida necesitará ${fmtUnits(plan.mealUnits)} u de ${rapid}.`
+          : `Ensuite, pour ~${plan.carbsG} g${cubesP}, le repas demandera ${fmtUnits(plan.mealUnits)} u de ${rapid}.`)
+        : (es
+          ? `Después, para ~${plan.carbsG} g${cubesP}, vuelve a preguntarme cuando la subida haya empezado: calcularé la dosis en ese momento.`
+          : `Ensuite, pour ~${plan.carbsG} g${cubesP}, redemande-moi une fois la remontée amorcée : je calculerai la dose à ce moment-là.`));
     }
   }
 
@@ -2631,7 +2904,10 @@ export function mealBolusHeldFallingLine(
   // disappears. Only a meal that has NOT been eaten gets "eat first".
   const eaten = Number.isFinite(Number(mealInfo?.minutesAgo)) && Number(mealInfo?.minutesAgo) > 0;
   if (eaten) {
-    const food = carbs ? (es ? ` los ~${carbs} g` : ` les ~${carbs} g`) : (es ? " la comida" : " le repas");
+    // What is LEFT of it, when that is known: "les ~60 g restant à digérer" of a 60 g plate eaten an
+    // hour and a half ago is a figure the parent can see is wrong.
+    const left = held?.cobGrams != null && held.cobGrams > 0 ? Math.round(held.cobGrams) : carbs;
+    const food = left ? (es ? ` los ~${left} g` : ` les ~${left} g`) : (es ? " la comida" : " le repas");
     if (falling) {
       const why = es ? `y bajando${fast ? " rápido" : ""}` : `et ça descend${fast ? " vite" : ""}`;
       return es
@@ -2723,6 +2999,15 @@ export function rescueCarbsInMeal(description?: string | null, carbsG?: number |
   const total = Number(carbsG);
   if (!Number.isFinite(total) || total <= 0) return grams;
   return Math.min(grams, Math.floor(total * RESCUE_DEDUCTION_MAX_FRACTION));
+}
+
+function newestReading(readings: { ts: number; value: number }[] | null | undefined): number {
+  let at = -Infinity;
+  let value = Infinity;
+  for (const r of readings || []) {
+    if (r && Number(r.value) > 0 && Number(r.ts) > at) { at = Number(r.ts); value = Number(r.value); }
+  }
+  return value;
 }
 
 /** Was the glucose UNDER 70 while this was being eaten? The curve fact `eatenToTreatALow` leans on,

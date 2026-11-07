@@ -36,8 +36,7 @@ import com.drclaude.data.Predictor
 import com.drclaude.data.Trend
 import com.drclaude.data.cleanGlucoseSeries
 import com.drclaude.data.glucoseRisingNow
-import com.drclaude.data.insulinActionMinutes
-import com.drclaude.data.DEFAULT_INSULIN_ACTION_MIN
+import com.drclaude.data.doseUnitsLeft
 import com.drclaude.data.local.LocalHistoryDb
 import com.drclaude.ui.AppHeader
 import com.drclaude.ui.ConsentScreen
@@ -66,6 +65,7 @@ import com.drclaude.ui.langFromCode
 import com.drclaude.ui.stringsFor
 import com.drclaude.ui.theme.DoctorClaudeTheme
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -181,6 +181,21 @@ class MainActivity : ComponentActivity() {
         // Only reports get pre-translated to the other language for instant language switching.
         var aiIsReport by remember { mutableStateOf(store.lastReportPatient == store.patientId && !store.lastReportText.isNullOrEmpty()) }
         var aiLoading by remember { mutableStateOf(false) }
+        // What the server decided, as numbers: what the buttons on the card act on. Only ever beside a
+        // report written in the same language, never parsed out of the prose.
+        var aiDecision by remember { mutableStateOf<AnalysisService.Decision?>(null) }
+        val decisions = remember { mutableMapOf<String, AnalysisService.Decision?>() }
+        // Bumped when something went on record after the analysis on screen was written. "Fais 2 u" left
+        // up once the 2 u are logged is how the same dose gets done twice. See the effect by analyzeNow.
+        var analysisStale by remember { mutableStateOf(0) }
+        // Every analysis in flight was asked about one moment. Once a dose, a meal or another person has
+        // changed that moment it must not land: its FAIT button would name what is already counted.
+        var analysisGen by remember { mutableStateOf(0) }
+        // The silent greeting at launch runs with no spinner: it is on its way all the same.
+        var greeting by remember { mutableStateOf(false) }
+        // The patient's usual rapid insulin, for a dose logged with no name: the server counts those on
+        // this curve, and the screen has to say the same.
+        var rapidFallback by remember { mutableStateOf<String?>(null) }
         var isRecording by remember { mutableStateOf(false) }
         var lang by remember { mutableStateOf(langFromCode(store.language)) }
         var tab by remember { mutableStateOf(Tab.GLUCOSE) }
@@ -250,7 +265,7 @@ class MainActivity : ComponentActivity() {
         // plays its start tone, and pressing stop landed in the middle of a restart — two beeps that
         // sound exactly like "cancelled". Worse, an answer still travelling when stop was pressed had
         // its meal thrown away. A single utterance, written as soon as it comes back, is the
-        // behaviour that worked. (The server keeps its `defer`/`commitPending` support, unused here.)
+        // behaviour that worked.
         fun startVoiceCapture() {
             ai.stopSpeaking()
             val code = lang.code.lowercase()
@@ -270,10 +285,15 @@ class MainActivity : ComponentActivity() {
                                 // A write that did NOT happen must be said: a dictated dose missing
                                 // from the table silently corrupts every later IOB calculation.
                                 aiText = r.text; aiAt = System.currentTimeMillis(); aiLang = code; aiIsReport = false
+                                aiDecision = null // no buttons under an answer that is not the analysis
+                                analysisGen++; aiLoading = false // nothing running may land over it
                             }
                             // Anything dictated may have changed the meals/doses → re-analyse and let
-                            // the REPAS / INSULINE / SPORT tabs pick it up.
+                            // the REPAS / INSULINE / SPORT tabs pick it up. Not after a write that
+                            // failed: the warning has to stay, and the analysis would name again the
+                            // dose that was given but could not be recorded.
                             dataVersion++
+                            if (r.logged && !r.logFailed) { aiDecision = null; decisions.clear(); analysisGen++; analysisStale++ }
                         } catch (e: Exception) {
                             android.util.Log.e("Dashboard", "voice ask failed", e)
                         }
@@ -304,6 +324,17 @@ class MainActivity : ComponentActivity() {
         // reading their own 85% next to their child's photo. Clearing on the change of patient makes
         // an empty screen the honest answer while the data loads.
         var statsPatient by remember { mutableStateOf<String?>(null) }
+        // On its own: inside the effect below, a new reading cancelled this load and nothing tried again,
+        // which left nameless doses on the slower curve for the whole session. Tried until it succeeds.
+        var rapidLoadedFor by remember { mutableStateOf<String?>(null) }
+        LaunchedEffect(state.isLoggedIn, state.patientId, state.current?.timestampMs) {
+            val pid = state.patientId
+            if (!state.isLoggedIn || pid == null || rapidLoadedFor == pid) return@LaunchedEffect
+            rapidFallback = null
+            val p = profile.load(pid) ?: return@LaunchedEffect
+            rapidFallback = if (p.isNull("rapid_insulin")) null else p.optString("rapid_insulin").ifBlank { null }
+            rapidLoadedFor = pid
+        }
         LaunchedEffect(state.isLoggedIn, state.patientId, state.current?.timestampMs, dataVersion) {
             if (state.isLoggedIn && state.patientId != null) {
                 if (statsPatient != state.patientId) {
@@ -317,6 +348,9 @@ class MainActivity : ComponentActivity() {
                     if (statsPatient != null) {
                         aiText = ""; aiAt = 0L; aiIsReport = false
                         reportsPatient = null
+                        // ...and its buttons: FAIT would log the other person's dose on this record.
+                        aiDecision = null; decisions.clear()
+                        analysisGen++; aiLoading = false // ...and what was on its way for that person
                     }
                     statsPatient = state.patientId
                 }
@@ -329,23 +363,21 @@ class MainActivity : ComponentActivity() {
                 h.tir24h?.let { stat24Tir = it }
                 h.pctHigh24h?.let { stat24High = it }
                 h.pctLow24h?.let { stat24Low = it }
-                // Insulin-on-board (recent RAPID doses, ~4 h linear decay). BASAL (slow/background,
+                // Insulin-on-board (recent RAPID doses, each on its own curve). BASAL (slow/background,
                 // e.g. Lantus) is NOT correction IOB and must be EXCLUDED — mirrors the server's
                 // activeIob (which skips kind=="basal"). Otherwise a 10 u Lantus both inflated the IOB
                 // and SILENCED the HIGH alarm for hours (recentInsulinIob gates the HIGH alarm/banner).
                 val iNow = System.currentTimeMillis()
                 val rapidDoses = h.insulin.filter { it.kind != "basal" }
                 recentInsulinIob = rapidDoses.sumOf { d ->
-                    val dur = (insulinActionMinutes(d.name) ?: DEFAULT_INSULIN_ACTION_MIN).toDouble()
-                    val mins = (iNow - d.ts) / 60000.0
-                    if (mins in 0.0..dur) d.units * (1 - mins / dur) else 0.0
+                    doseUnitsLeft(d.units, d.name, d.ts, iNow, rapidFallback)
                 }.coerceAtLeast(0.0)
                 iobReady = true // IOB now known → the HIGH alarm may evaluate (see the alert effect)
                 // Share the RAPID doses (name kept for type-aware decay) with the repo so the
                 // background MonitorService computes the same IOB for its HIGH-alarm suppression while
                 // the app is closed. Basal is filtered out HERE (the Triple carries no kind, so the
                 // monitor could not exclude it itself) — it must never silence the HIGH alarm.
-                repo.setInsulinDoses(rapidDoses.map { Triple(it.ts, it.units, it.name) })
+                repo.setInsulinDoses(rapidDoses.map { Triple(it.ts, it.units, it.name ?: rapidFallback) })
                 // Last EATEN (non-planned) meal, in minutes, mirroring the server's
                 // minutesSinceLastRescue (drop planned, ignore >1 min future, round to minutes) so the
                 // LOW banner agrees with the spoken analysis.
@@ -446,9 +478,12 @@ class MainActivity : ComponentActivity() {
                         // reading arriving mid-call cancels this effect, and a slow/failed call must never
                         // leave the UI wedged — here we simply keep the old report.
                         try {
+                            greeting = true
+                            val gen = analysisGen
                             val r = ai.coach(state.history, state.patientId, lang.code.lowercase(), playVoice = false)
-                            if (!r.isError && r.text.isNotEmpty()) {
+                            if (gen == analysisGen && !r.isError && r.text.isNotEmpty()) {
                                 aiText = r.text; aiAt = System.currentTimeMillis(); aiLang = lang.code.lowercase(); aiIsReport = true
+                                aiDecision = r.decision; decisions[lang.code.lowercase()] = r.decision
                                 store.lastReportText = r.text; store.lastReportAt = aiAt; store.lastReportPatient = state.patientId
                                 store.lastReportLang = lang.code.lowercase()
                                 r.avg24h?.let { stat24Avg = it }
@@ -458,6 +493,8 @@ class MainActivity : ComponentActivity() {
                             }
                         } catch (e: Exception) {
                             android.util.Log.e("Dashboard", "auto-greet analyze failed", e)
+                        } finally {
+                            greeting = false
                         }
                     }
                 }
@@ -480,6 +517,7 @@ class MainActivity : ComponentActivity() {
             if (aiIsReport && !cached.isNullOrEmpty() && fresh) {
                 ai.stopSpeaking()
                 aiText = cached; aiAt = reportsAt; aiLang = code
+                aiDecision = decisions[code]
                 store.lastReportText = cached; store.lastReportAt = reportsAt
                 store.lastReportPatient = state.patientId; store.lastReportLang = code
                 return@LaunchedEffect
@@ -493,9 +531,12 @@ class MainActivity : ComponentActivity() {
                     aiText = ""; aiAt = 0L
                     if (state.isLoggedIn && state.patientId != null && state.history.size >= 3) {
                         aiLoading = true
+                        val gen = ++analysisGen
                         try {
                             val r = ai.coach(state.history, state.patientId, code, playVoice = false)
+                            if (gen != analysisGen) return@LaunchedEffect
                             aiText = r.text; aiAt = System.currentTimeMillis(); aiLang = code; aiIsReport = true
+                            aiDecision = r.decision; decisions[code] = r.decision
                             if (!r.isError && r.text.isNotEmpty()) {
                                 store.lastReportText = r.text; store.lastReportAt = aiAt
                                 store.lastReportPatient = state.patientId; store.lastReportLang = code
@@ -508,7 +549,7 @@ class MainActivity : ComponentActivity() {
                             android.util.Log.e("Dashboard", "lang-change analyze failed", e)
                             if (aiText.isBlank()) { aiText = stringsFor(lang).aiError; aiLang = code }
                         } finally {
-                            aiLoading = false
+                            if (gen == analysisGen) aiLoading = false
                         }
                     } else {
                         aiLang = "" // nothing to regenerate yet — cleared so the stale language never shows
@@ -533,11 +574,79 @@ class MainActivity : ComponentActivity() {
             if (isNew) reports.remove(other) // the report changed → the other-language copy is now stale
             if (!reports[other].isNullOrEmpty()) return@LaunchedEffect // already pre-generated
             try {
+                val gen = analysisGen
                 val r = ai.coach(state.history, state.patientId, other, playVoice = false)
-                if (!r.isError && r.text.isNotEmpty()) reports[other] = r.text
+                if (gen == analysisGen && !r.isError && r.text.isNotEmpty()) { reports[other] = r.text; decisions[other] = r.decision }
             } catch (e: Exception) {
                 android.util.Log.e("Dashboard", "prefetch other-language report failed", e)
             }
+        }
+
+        /** A fresh analysis, on the button or after an answer on the card. The server's own 10-min cache
+         *  is bypassed: the user expects a new one each time. */
+        fun analyzeNow(speak: Boolean) {
+            if (!store.aiReady) {
+                aiText = stringsFor(lang).aiNeedsKey; aiLang = lang.code.lowercase(); aiIsReport = false
+                return
+            }
+            aiLoading = true
+            aiText = ""
+            aiDecision = null
+            val gen = ++analysisGen
+            lifecycleScope.launch {
+                // try/finally guarantees the spinner ALWAYS clears, even if a call throws or is cut by
+                // the 80 s callTimeout, so "Analyse…" can never hang forever. Only this run's spinner:
+                // a newer run has its own, and clears it when it lands.
+                try {
+                    val r = ai.coach(state.history, state.patientId, lang.code.lowercase(), playVoice = speak, force = true, stillWanted = { gen == analysisGen })
+                    if (gen != analysisGen) return@launch
+                    aiText = r.text; aiAt = System.currentTimeMillis(); aiLang = lang.code.lowercase(); aiIsReport = true
+                    aiDecision = r.decision; decisions[lang.code.lowercase()] = r.decision
+                    if (!r.isError && r.text.isNotEmpty()) {
+                        store.lastReportText = r.text; store.lastReportAt = aiAt; store.lastReportPatient = state.patientId
+                        store.lastReportLang = lang.code.lowercase()
+                    }
+                    r.avg24h?.let { stat24Avg = it }
+                    r.tir24h?.let { stat24Tir = it }
+                    r.pctHigh24h?.let { stat24High = it }
+                    r.pctLow24h?.let { stat24Low = it }
+                    val h = ai.history(state.patientId, 1)
+                    if (h.readings.isNotEmpty()) history24 = h.readings
+                    h.avg24h?.let { stat24Avg = it }
+                    h.tir24h?.let { stat24Tir = it }
+                    h.pctHigh24h?.let { stat24High = it }
+                    h.pctLow24h?.let { stat24Low = it }
+                } catch (e: Exception) {
+                    android.util.Log.e("Dashboard", "analyze failed", e)
+                    // Fresh timestamp so the error is shown as current, not instantly aged out into the
+                    // "refaire une analyse" prompt by the 20-min freshness rule.
+                    if (gen == analysisGen && aiText.isBlank()) { aiText = stringsFor(lang).aiError; aiAt = System.currentTimeMillis(); aiLang = lang.code.lowercase() }
+                } finally {
+                    if (gen == analysisGen) aiLoading = false
+                }
+            }
+        }
+
+        // A dose, a meal or a session went on record after this analysis was written: its action no
+        // longer describes the moment, so it goes, and one still on its way is asked again. The wait
+        // gathers several quick edits into one call. An answer is not a report: the sugar to take, or
+        // the warning that a dose was not recorded, stays where it is while the card still shows it.
+        // Its buttons went with the data.
+        fun answerOnScreen() = aiText.isNotEmpty() && !aiIsReport && System.currentTimeMillis() - aiAt < 20 * 60_000L
+        LaunchedEffect(analysisStale) {
+            if (analysisStale == 0) return@LaunchedEffect
+            if (aiText.isEmpty() && !aiLoading && !greeting) return@LaunchedEffect
+            if (answerOnScreen()) return@LaunchedEffect
+            delay(1500)
+            if (answerOnScreen()) return@LaunchedEffect
+            analyzeNow(false)
+        }
+        fun dataChanged() {
+            dataVersion++
+            aiDecision = null
+            decisions.clear()
+            analysisGen++
+            analysisStale++
         }
 
         // Hypo/hyper + fast-curve watchdog. We remember (persisted) which alert we've already
@@ -604,17 +713,20 @@ class MainActivity : ComponentActivity() {
                 aiText = ""
                 val code = lang.code.lowercase()
                 val q = urgentQuestion(alert, lang, rescueRecent)
+                val gen = ++analysisGen // whatever was on its way must not land over this
                 lifecycleScope.launch {
                     try {
-                        val r = ai.ask(q, state.history, state.patientId, code)
+                        val r = ai.ask(q, state.history, state.patientId, code, auto = true)
+                        if (gen != analysisGen) return@launch
                         aiText = r.text; aiAt = System.currentTimeMillis(); aiLang = code; aiIsReport = false
+                        aiDecision = r.decision
                     } catch (e: Exception) {
                         android.util.Log.e("Dashboard", "hypo auto-analyze failed", e)
                         // Fresh timestamp so the error is shown as current, not instantly aged out
                         // into the "refaire une analyse" prompt by the 20-min freshness rule.
-                        if (aiText.isBlank()) { aiText = stringsFor(lang).aiError; aiAt = System.currentTimeMillis(); aiLang = code }
+                        if (gen == analysisGen && aiText.isBlank()) { aiText = stringsFor(lang).aiError; aiAt = System.currentTimeMillis(); aiLang = code }
                     } finally {
-                        aiLoading = false
+                        if (gen == analysisGen) aiLoading = false
                     }
                 }
             }
@@ -814,46 +926,39 @@ class MainActivity : ComponentActivity() {
                     addingAccount = false
                     repo.logout()
                 },
-                onAnalyze = {
-                    // ANALYSE always generates a FRESH analysis — the user expects a new one each tap.
-                    // The server's own 10-min cache still avoids AI cost when nothing changed; re-
-                    // listening to the existing report is the speaker ▷ icon's job, not this button.
-                    if (!store.aiReady) {
-                        aiText = stringsFor(lang).aiNeedsKey; aiLang = lang.code.lowercase(); aiIsReport = false
-                    } else {
-                        aiLoading = true
-                        aiText = ""
-                        lifecycleScope.launch {
-                            // try/finally guarantees the spinner ALWAYS clears — even if a call throws
-                            // or is cut by the 80s callTimeout — so "Analyse…" can never hang forever.
-                            try {
-                                val r = ai.coach(state.history, state.patientId, lang.code.lowercase(), force = true)
-                                aiText = r.text; aiAt = System.currentTimeMillis(); aiLang = lang.code.lowercase(); aiIsReport = true
-                                if (!r.isError && r.text.isNotEmpty()) {
-                                    store.lastReportText = r.text; store.lastReportAt = aiAt; store.lastReportPatient = state.patientId
-                                    store.lastReportLang = lang.code.lowercase()
-                                }
-                                r.avg24h?.let { stat24Avg = it }
-                                r.tir24h?.let { stat24Tir = it }
-                                r.pctHigh24h?.let { stat24High = it }
-                                r.pctLow24h?.let { stat24Low = it }
-                                val h = ai.history(state.patientId, 1)
-                                if (h.readings.isNotEmpty()) history24 = h.readings
-                                h.avg24h?.let { stat24Avg = it }
-                                h.tir24h?.let { stat24Tir = it }
-                                h.pctHigh24h?.let { stat24High = it }
-                                h.pctLow24h?.let { stat24Low = it }
-                            } catch (e: Exception) {
-                                android.util.Log.e("Dashboard", "analyze failed", e)
-                                // Fresh timestamp so the error is shown as current, not instantly aged
-                                // out into the "refaire une analyse" prompt by the 20-min freshness rule.
-                                if (aiText.isBlank()) { aiText = stringsFor(lang).aiError; aiAt = System.currentTimeMillis(); aiLang = lang.code.lowercase() }
-                            } finally {
-                                aiLoading = false
-                            }
+                decision = aiDecision,
+                onDoseDone = { units, tsMs ->
+                    val pid = state.patientId
+                    if (pid != null) lifecycleScope.launch {
+                        val ok = meals.addInsulin(pid, units, aiDecision?.insulinName, "rapid", tsMs, answersQuestion = true)
+                        if (ok) {
+                            dataVersion++
+                            analyzeNow(false)
+                        } else {
+                            // A dose that did not reach the table is the one thing that must be said.
+                            android.widget.Toast.makeText(
+                                this@MainActivity,
+                                if (lang == Lang.ES) "Dosis NO registrada. Anótala en la pestaña Insulina." else "Dose NON enregistrée. Note-la dans l'onglet Insuline.",
+                                android.widget.Toast.LENGTH_LONG,
+                            ).show()
                         }
                     }
                 },
+                onDoseNotDone = {
+                    val pid = state.patientId
+                    if (pid != null) lifecycleScope.launch {
+                        meals.doseNotDone(pid)
+                        analyzeNow(false)
+                    }
+                },
+                onNoRecentInsulin = {
+                    val pid = state.patientId
+                    if (pid != null) lifecycleScope.launch {
+                        meals.confirmNoInsulin(pid)
+                        analyzeNow(false)
+                    }
+                },
+                onAnalyze = { analyzeNow(true) },
                 onMicClick = {
                     // Tapping PARLER cuts off whatever Doctor Claude is reading aloud right now, so the
                     // mic doesn't record over the AI's own voice (and it's what the user expects).
@@ -898,7 +1003,7 @@ class MainActivity : ComponentActivity() {
                             state.patientId, meals, ai, lang, state.history,
                             header = { tabHeader(stringsFor(lang).tabMeals, false, true) },
                             refreshKey = tabRefresh,
-                            onDataChanged = { dataVersion++ },
+                            onDataChanged = { dataChanged() },
                             openEditId = openMealId, onOpenEditConsumed = { openMealId = null },
                         )
                         Tab.INSULIN -> InsulinScreen(
@@ -906,7 +1011,7 @@ class MainActivity : ComponentActivity() {
                             currentMgdl = state.current?.valueMgDl,
                             header = { tabHeader(stringsFor(lang).tabInsulin, false, true) },
                             refreshKey = tabRefresh,
-                            onDataChanged = { dataVersion++ },
+                            onDataChanged = { dataChanged() },
                             openEditId = openDoseId, onOpenEditConsumed = { openDoseId = null },
                         )
                         // Sport changes the NEXT dose, so a new session bumps dataVersion like a meal
@@ -917,7 +1022,7 @@ class MainActivity : ComponentActivity() {
                             meals = meals,
                             header = { tabHeader(activityStringsFor(lang).tabActivity, false, true) },
                             refreshKey = tabRefresh,
-                            onDataChanged = { dataVersion++ },
+                            onDataChanged = { dataChanged() },
                         )
                         Tab.PROFILE -> ProfileScreen(
                             patientId = state.patientId,

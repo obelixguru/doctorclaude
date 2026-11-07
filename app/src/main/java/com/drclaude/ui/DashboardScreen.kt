@@ -64,6 +64,7 @@ import com.drclaude.data.GlucoseReading
 import com.drclaude.data.Trend
 import com.drclaude.data.PredictKind
 import com.drclaude.data.Prediction
+import com.drclaude.ai.AnalysisService
 import com.drclaude.ai.ServiceHealth
 import com.drclaude.NetworkMonitor
 import com.drclaude.ui.theme.*
@@ -84,6 +85,12 @@ fun DashboardScreen(
     aiText: String,
     aiAt: Long = 0L,
     aiLoading: Boolean,
+    /** The numbers behind the analysis on screen; null for an older server or a spoken answer. */
+    decision: AnalysisService.Decision? = null,
+    /** A dose was done: units, and when (null = now). */
+    onDoseDone: (Double, Long?) -> Unit = { _, _ -> },
+    onDoseNotDone: () -> Unit = {},
+    onNoRecentInsulin: () -> Unit = {},
     isRecording: Boolean,
     lang: Lang,
     onToggleLang: () -> Unit,
@@ -212,6 +219,10 @@ fun DashboardScreen(
                 now = now,
                 lang = lang,
                 aiLoading = aiLoading,
+                decision = decision,
+                onDoseDone = onDoseDone,
+                onDoseNotDone = onDoseNotDone,
+                onNoRecentInsulin = onNoRecentInsulin,
                 enabled = history.size >= 3,
                 accent = c1,
                 isRecording = isRecording,
@@ -922,6 +933,222 @@ private fun TirLegend(label: String, pct: Int, color: Color) {
     }
 }
 
+/**
+ * What the analysis expects next, and the one-tap answers that keep the insulin record true. 86 % of
+ * the doses the app named were computed with nothing logged: the record only stays right if answering
+ * costs a single tap, at the moment the dose is on screen.
+ */
+@Composable
+private fun DecisionBlock(
+    d: AnalysisService.Decision,
+    lang: Lang,
+    accent: Color,
+    onDoseDone: (Double, Long?) -> Unit,
+    onDoseNotDone: () -> Unit,
+    onNoRecentInsulin: () -> Unit,
+) {
+    val es = lang == Lang.ES
+    var otherDose by remember(d) { mutableStateOf(false) }
+    // One tap, one record: a second tap while the network answers would log the dose twice. It frees
+    // itself so a failed write can be tried again.
+    var tapped by remember(d) { mutableStateOf(false) }
+    LaunchedEffect(tapped) {
+        if (tapped) { delay(8000); tapped = false }
+    }
+    fun once(action: () -> Unit): () -> Unit = { if (!tapped) { tapped = true; action() } }
+    d.anticipation?.let {
+        Spacer(Modifier.height(8.dp))
+        Text(
+            (if (es) "A prever : " else "À prévoir : ") + it,
+            color = InkPrimary, fontSize = 13.sp, lineHeight = 18.sp,
+        )
+    }
+    if (d.forecast.isNotEmpty()) {
+        Spacer(Modifier.height(8.dp))
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
+            d.forecast.forEach { p ->
+                Surface(
+                    color = accent.copy(alpha = 0.08f),
+                    shape = RoundedCornerShape(10.dp),
+                    modifier = Modifier.weight(1f),
+                ) {
+                    Column(Modifier.padding(horizontal = 10.dp, vertical = 6.dp)) {
+                        Text(
+                            when {
+                                p.minutes >= 60 && es -> "EN 1 H"
+                                p.minutes >= 60 -> "DANS 1 H"
+                                es -> "EN ${p.minutes} MIN"
+                                else -> "DANS ${p.minutes} MIN"
+                            },
+                            color = InkDim, fontSize = 9.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.sp,
+                        )
+                        Text("~${p.mgdl}", color = InkPrimary, fontSize = 16.sp, fontWeight = FontWeight.Black)
+                        Text("${p.low} – ${p.high}", color = InkMuted, fontSize = 11.sp)
+                    }
+                }
+            }
+        }
+        d.forecastNote?.let {
+            Spacer(Modifier.height(6.dp))
+            Text(it, color = InkMuted, fontSize = 11.sp, lineHeight = 15.sp)
+        }
+    }
+    val pendingUnits = d.pendingUnits
+    val pendingAt = d.pendingAtMs
+    // The earlier dose comes first: until it is answered, the insulin on board is a guess. Not during a
+    // low or a lost signal, and not while the dose on screen is still that same dose.
+    val asking = pendingUnits != null && pendingAt != null && d.kind in listOf("ask_done", "hold", "fine", "dose_later")
+    if (asking && d.kind != "ask_done") {
+        Spacer(Modifier.height(8.dp))
+        val at = SimpleDateFormat("HH:mm", Locale.getDefault()).format(Date(pendingAt!!))
+        val u = pendingUnits.toString().removeSuffix(".0").replace(".", ",")
+        Text(
+            if (es) "Las $u u propuestas a las $at: ¿se pusieron?" else "Les $u u proposées à $at : faites ?",
+            color = InkPrimary, fontSize = 13.sp, fontWeight = FontWeight.Bold,
+        )
+    }
+    when {
+        // In two parts, what was done is a part: it asks how much instead of recording the whole.
+        asking && d.pendingSplit -> AnswerRow(
+            first = (if (es) "HECHA UNA PARTE" else "FAIT EN PARTIE") to { otherDose = true },
+            second = (if (es) "NO" else "PAS FAIT") to once(onDoseNotDone),
+            third = null,
+            accent = accent,
+        )
+        asking -> AnswerRow(
+            first = (if (es) "HECHO" else "FAIT") to once { onDoseDone(pendingUnits!!, pendingAt) },
+            second = (if (es) "NO" else "PAS FAIT") to once(onDoseNotDone),
+            third = (if (es) "OTRA DOSIS" else "AUTRE DOSE") to { otherDose = true },
+            accent = accent,
+        )
+        // In two parts: what was done is a part, so it asks how much instead of recording the whole.
+        d.kind == "dose" && d.split -> AnswerRow(
+            first = (if (es) "HECHA UNA PARTE" else "FAIT EN PARTIE") to { otherDose = true },
+            second = (if (es) "NO" else "PAS FAIT") to once(onDoseNotDone),
+            third = null,
+            accent = accent,
+        )
+        d.kind == "dose" -> AnswerRow(
+            first = (if (es) "HECHO" else "FAIT") to once { onDoseDone(d.units, null) },
+            second = (if (es) "NO" else "PAS FAIT") to once(onDoseNotDone),
+            third = (if (es) "OTRA DOSIS" else "AUTRE DOSE") to { otherDose = true },
+            accent = accent,
+        )
+        d.kind == "dose_if" -> AnswerRow(
+            first = (if (es) "NADA EN 3 H" else "RIEN DEPUIS 3 H") to once(onNoRecentInsulin),
+            second = (if (es) "YA PUESTA" else "DÉJÀ FAITE") to { otherDose = true },
+            third = null,
+            accent = accent,
+        )
+    }
+    if (otherDose) {
+        OtherDoseDialog(
+            lang = lang,
+            // In two parts, what was done is a part: nothing prefilled to confirm by mistake.
+            start = if (d.split || d.pendingSplit) 0.0 else pendingUnits ?: d.units,
+            accent = accent,
+            onDismiss = { otherDose = false },
+            onSave = { units, ts -> otherDose = false; once { onDoseDone(units, ts) }() },
+        )
+    }
+}
+
+@Composable
+private fun AnswerRow(
+    first: Pair<String, () -> Unit>,
+    second: Pair<String, () -> Unit>,
+    third: Pair<String, () -> Unit>?,
+    accent: Color,
+) {
+    Spacer(Modifier.height(10.dp))
+    Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
+        Button(
+            onClick = first.second,
+            colors = ButtonDefaults.buttonColors(containerColor = accent, contentColor = OnColor),
+            shape = RoundedCornerShape(10.dp),
+            contentPadding = PaddingValues(horizontal = 6.dp),
+            modifier = Modifier.weight(1f).height(40.dp),
+        ) { Text(first.first, fontSize = 11.sp, fontWeight = FontWeight.Black, maxLines = 1) }
+        listOfNotNull(second, third).forEach { (label, action) ->
+            OutlinedButton(
+                onClick = action,
+                border = BorderStroke(1.dp, accent),
+                shape = RoundedCornerShape(10.dp),
+                contentPadding = PaddingValues(horizontal = 6.dp),
+                modifier = Modifier.weight(1f).height(40.dp),
+            ) { Text(label, color = accent, fontSize = 11.sp, fontWeight = FontWeight.Black, maxLines = 1) }
+        }
+    }
+}
+
+/** The dose really done, and when. Prefilled with the figure on screen, because that is usually it. */
+@Composable
+private fun OtherDoseDialog(
+    lang: Lang,
+    start: Double,
+    accent: Color,
+    onDismiss: () -> Unit,
+    onSave: (Double, Long?) -> Unit,
+) {
+    val es = lang == Lang.ES
+    var text by remember { mutableStateOf(if (start > 0) start.toString().removeSuffix(".0") else "") }
+    var minutesAgo by remember { mutableStateOf(0) }
+    val units = text.replace(",", ".").toDoubleOrNull()
+    Dialog(onDismissRequest = onDismiss) {
+        Surface(shape = RoundedCornerShape(18.dp), color = CardWhite) {
+            Column(Modifier.padding(18.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                Text(
+                    if (es) "DOSIS PUESTA" else "DOSE FAITE",
+                    color = accent, fontSize = 11.sp, fontWeight = FontWeight.Black, letterSpacing = 1.5.sp,
+                )
+                OutlinedTextField(
+                    value = text,
+                    onValueChange = { text = it.take(5) },
+                    label = { Text(if (es) "Unidades" else "Unités") },
+                    keyboardOptions = androidx.compose.foundation.text.KeyboardOptions(
+                        keyboardType = androidx.compose.ui.text.input.KeyboardType.Decimal,
+                    ),
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                Row(horizontalArrangement = Arrangement.spacedBy(6.dp), modifier = Modifier.fillMaxWidth()) {
+                    listOf(0, 30, 60, 120, 180).forEach { m ->
+                        val on = minutesAgo == m
+                        Surface(
+                            color = if (on) accent else Color.Transparent,
+                            border = BorderStroke(1.dp, accent),
+                            shape = RoundedCornerShape(8.dp),
+                            modifier = Modifier.weight(1f).clickable { minutesAgo = m },
+                        ) {
+                            Text(
+                                when {
+                                    m == 0 -> if (es) "Ahora" else "Là"
+                                    m < 60 -> "-$m'"
+                                    else -> "-${m / 60} h"
+                                },
+                                color = if (on) OnColor else accent, fontSize = 11.sp, fontWeight = FontWeight.Bold,
+                                textAlign = androidx.compose.ui.text.style.TextAlign.Center,
+                                modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp),
+                            )
+                        }
+                    }
+                }
+                Row(horizontalArrangement = Arrangement.End, modifier = Modifier.fillMaxWidth()) {
+                    TextButton(onClick = onDismiss) { Text(if (es) "ANULAR" else "ANNULER", color = InkMuted) }
+                    Button(
+                        enabled = units != null && units > 0 && units <= 50,
+                        onClick = {
+                            val u = units ?: return@Button
+                            onSave(u, if (minutesAgo == 0) null else System.currentTimeMillis() - minutesAgo * 60_000L)
+                        },
+                        colors = ButtonDefaults.buttonColors(containerColor = accent, contentColor = OnColor),
+                    ) { Text(if (es) "GUARDAR" else "ENREGISTRER", fontWeight = FontWeight.Black) }
+                }
+            }
+        }
+    }
+}
+
 // Une analyse n'est lue à voix haute et affichée que tant qu'elle reflète la glycémie récente.
 // Passé ce délai, la glycémie a bougé : on retire le bilan périmé et on invite à en refaire un.
 private const val ANALYSIS_TTL_MS = 20 * 60_000L
@@ -934,6 +1161,10 @@ private fun AnalysisCard(
     now: Long = 0L,
     lang: Lang = Lang.FR,
     aiLoading: Boolean,
+    decision: AnalysisService.Decision? = null,
+    onDoseDone: (Double, Long?) -> Unit = { _, _ -> },
+    onDoseNotDone: () -> Unit = {},
+    onNoRecentInsulin: () -> Unit = {},
     enabled: Boolean,
     accent: Color,
     isRecording: Boolean,
@@ -961,6 +1192,8 @@ private fun AnalysisCard(
     val summaryText = (if (statsLead) paras.getOrNull(1) else paras.firstOrNull())
         ?.takeIf { it != actionPara }.orEmpty()
     val compact = actionText.isNotBlank()
+    // A warning never hides behind "Voir plus": a dose that could not be recorded has to be read.
+    val warnings = remember(aiText) { paras.filter { it.startsWith("⚠️") } }
     var showFull by remember(aiText) { mutableStateOf(false) }
     Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
         // PARLER (voix/micro) + ANALYSE côte à côte sur une seule ligne.
@@ -1044,6 +1277,11 @@ private fun AnalysisCard(
                     if (compact) {
                         // L'action d'abord, en gras — c'est LA chose à lire.
                         Text(actionText, color = InkPrimary, fontSize = 15.sp, lineHeight = 21.sp, fontWeight = FontWeight.Bold)
+                        if (decision != null) DecisionBlock(decision, lang, accent, onDoseDone, onDoseNotDone, onNoRecentInsulin)
+                        warnings.forEach { w ->
+                            Spacer(Modifier.height(6.dp))
+                            Text(w, color = GlucoseStatus.DANGER.strong, fontSize = 13.sp, lineHeight = 18.sp, fontWeight = FontWeight.Bold)
+                        }
                         if (summaryText.isNotBlank()) {
                             Spacer(Modifier.height(6.dp))
                             Text(summaryText, color = InkMuted, fontSize = 13.sp, lineHeight = 18.sp)

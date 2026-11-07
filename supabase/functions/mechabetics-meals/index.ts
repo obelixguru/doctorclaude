@@ -1,27 +1,23 @@
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "jsr:@supabase/supabase-js@2";
 import { accessSubject } from "../_shared/access.ts";
-import { chatJson } from "../_shared/llm.ts";
+import { chatJsonWithin } from "../_shared/llm.ts";
 import {
   carbEstimationRules,
-  toGuardProfile,
-  trendFromReadings,
-  recentHypoFrom,
-  activeIob,
-  insulinActionMinutes,
-  carbsOnBoard,
-  balanceRates,
-  minutesSinceLastRescue,
   MEAL_COVER_WINDOW_MIN,
   MEAL_COVER_FRACTION,
-  planMealDose,
-  mealPlanLine,
-  activityBolusCut,
-  activityNote,
-  preSportCarbsLine,
-  type GuardProfile,
   type MealPlanResult,
 } from "../_shared/doseGuard.ts";
+import { anticipate, buildState, decideAction, decisionPayload, sideNotes } from "../_shared/decide.ts";
+import {
+  clearNamedDose,
+  confirmNoRecentInsulin,
+  loadEngineData,
+  dosePutForward,
+  rememberNamedDose,
+  tzOffsetOf,
+} from "../_shared/engineData.ts";
+import { isBasalInsulin } from "../_shared/insulins.ts";
 import { lookupBarcode, lookupProduct, foodFactLine, type FoodFact } from "../_shared/foodFacts.ts";
 
 // How long ONE call to the model may take. Not a guarantee on its own: chatJson retries once when
@@ -44,7 +40,7 @@ const ASK_ESTIMATE_MS = 28_000;
  *  called back, but the parent waiting on the meal screen gets an answer on time — which is the
  *  whole point: the carb figure is a convenience, the meal being SAVED is not. */
 async function withDeadline<T>(p: Promise<T>, ms: number, fallback: T): Promise<T> {
-  let timer: number | undefined;
+  let timer: ReturnType<typeof setTimeout> | undefined;
   const clock = new Promise<T>((resolve) => {
     timer = setTimeout(() => resolve(fallback), ms);
   });
@@ -65,7 +61,7 @@ function finishInBackground(p: Promise<CarbEstimate>, id: number, quantity: numb
     const n = r?.carbsG;
     if (n == null || !(n > 0)) return;
     await db.from("mechabetics_meals")
-      .update({ carbs_g: Math.min(2000, Math.round(n) * quantity) })
+      .update({ carbs_g: Math.min(2000, Math.round(n) * quantity), carbs_estimated: !r?.fact })
       .eq("id", id).is("carbs_g", null);
   }).catch(() => { /* the meal is saved; a missing estimate is not an error */ });
   const rt = (globalThis as { EdgeRuntime?: { waitUntil?: (p: Promise<unknown>) => void } }).EdgeRuntime;
@@ -121,7 +117,7 @@ async function estimateCarbs(
       : ` La personne est en : ${country}. Les valeurs nutritionnelles d'un même produit varient selon le pays — raisonne pour CE marché.`)
     : "";
   try {
-    const raw = await chatJson(
+    const raw = await chatJsonWithin(
       {
         system: es
           ? `Estimas los carbohidratos de un alimento para una persona diabética.${where} ${carbEstimationRules("es")}${fact ? " " + foodFactLine(fact, "es") : ""} Responde ÚNICAMENTE en JSON {"carbsG":<gramos enteros de carbohidratos para TODO lo descrito>}. Sin texto.`
@@ -147,6 +143,7 @@ async function estimateCarbs(
         timeoutMs: ESTIMATE_BUDGET_MS,
       },
       { byokGeminiKey: byok, deepseekKey: DEEPSEEK_API_KEY, deepseekModel: DEEPSEEK_MODEL, geminiModel: GEMINI_TEXT_MODEL },
+      ESTIMATE_BUDGET_MS,
     );
     const parsed = JSON.parse(raw.match(/\{[\s\S]*\}/)?.[0] ?? "{}");
     const n = Math.round(Number(parsed.carbsG));
@@ -202,7 +199,7 @@ function clampQty(raw: unknown): number {
  *  read as "prévu" on a scanned/now-dated meal and made the analysis skip it. null ts = now = eaten. */
 function plannedFromTs(mealTs: string | null): boolean {
   if (!mealTs) return false;
-  return new Date(mealTs).getTime() > Date.now() + 5 * 60 * 1000;
+  return new Date(mealTs).getTime() > Date.now();
 }
 
 // ---- "If I eat this, how much insulin?" ---------------------------------------------------------
@@ -219,89 +216,37 @@ function plannedFromTs(mealTs: string | null): boolean {
 /** Current glucose, trend, insulin and carbs on board — read fresh, straight from the tables the
  *  monitor and the other functions have been filling all along. `excludeMealId` keeps a meal being
  *  EDITED out of its own carbs-on-board, which would otherwise count against its own bolus. */
-async function planContext(subject: string, nowMs: number, excludeMealId?: unknown): Promise<{
-  gp: GuardProfile | null;
-  cur: number | null;
-  trend: ReturnType<typeof trendFromReadings>;
-  staleMin: number;
-  iob: number;
-  cob: number;
-  minSinceRescue: number | null;
-  recentHypo: boolean;
-  doses: any[];
-  activity: any[];
-  activityCut: number;
-  rates: ReturnType<typeof balanceRates>;
-}> {
-  const [profRes, readRes, insRes, mealRes, actRes] = await Promise.all([
-    db.from("mechabetics_profiles")
-      .select("carb_ratio, correction_factor, target_mgdl, weight_kg, rapid_insulin")
-      .eq("subject", subject).maybeSingle(),
-    db.from("mechabetics_readings")
-      .select("ts, value_mgdl").eq("subject", subject)
-      .gte("ts", new Date(nowMs - 3 * 3600 * 1000).toISOString())
-      .order("ts", { ascending: false }).limit(60),
-    db.from("mechabetics_insulin")
-      .select("ts, units, insulin_name, kind").eq("subject", subject)
-      .gte("ts", new Date(nowMs - 8 * 3600 * 1000).toISOString())
-      .order("ts", { ascending: false }).limit(24),
-    db.from("mechabetics_meals")
-      .select("id, ts, description, carbs_g, planned").eq("subject", subject)
-      .gte("ts", new Date(nowMs - 26 * 3600 * 1000).toISOString())
-      .order("ts", { ascending: false }).limit(24),
-    // Sport over the window its after-effect covers (~12 h): the same plate needs less insulin
-    // before, during and after a session than it does at rest.
-    db.from("mechabetics_activity")
-      .select("ts, kind, description, intensity, duration_min, planned").eq("subject", subject)
-      .gte("ts", new Date(nowMs - 14 * 3600 * 1000).toISOString())
-      .order("ts", { ascending: false }).limit(6),
-  ]);
-
-  const rds = ((readRes.data ?? []) as any[])
-    .map((r) => ({ ts: new Date(r.ts).getTime(), value: Number(r.value_mgdl) }))
-    .filter((r) => Number.isFinite(r.ts) && r.value > 0)
-    .sort((a, b) => a.ts - b.ts);
-  const last = rds.length ? rds[rds.length - 1] : null;
-  const cur = last ? Math.round(last.value) : null;
-  // No reading at all reads as STALE, never as fresh: computeGuard then refuses a correction, which
-  // is the honest answer when nobody knows the glucose. The MEAL half is unaffected — carb counting
-  // does not need a glucose — so the user still gets the number they came for.
-  const staleMin = last ? Math.round((nowMs - last.ts) / 60000) : 999;
-  const trend = last ? trendFromReadings(rds, nowMs) : "unknown";
-
-  const gp = toGuardProfile(profRes.data);
-  const dia = insulinActionMinutes(gp?.rapidInsulin) ?? 240;
-  const doses = ((insRes.data ?? []) as any[]).map((d) => ({ ...d, ts: new Date(d.ts).getTime() }));
-  const allMeals = (mealRes.data ?? []) as any[];
-  // The exclusion is ONLY about carbs-on-board — a meal must not count as sugar already landing
-  // against its own bolus. The RESCUE CLOCK must still see every row: editing the three sugars you
-  // took two minutes ago would otherwise erase them from minutesSinceLastRescue, drop computeGuard's
-  // "you just took sugar, let it work" hold, and answer with a second full rescue.
-  const forCob = allMeals.filter((m) => excludeMealId == null || String(m.id) !== String(excludeMealId));
-
-  return {
-    gp, cur, trend, staleMin,
-    iob: activeIob(doses as any, nowMs, dia),
-    cob: carbsOnBoard(forCob as any, nowMs),
-    minSinceRescue: minutesSinceLastRescue(allMeals, nowMs),
-    recentHypo: recentHypoFrom(rds, nowMs),
-    doses,
-    activity: (actRes.data ?? []) as any[],
-    activityCut: activityBolusCut((actRes.data ?? []) as any[], nowMs),
-    // Arrival rates, so a slow meal's carbs are not counted as protection they cannot give in time.
-    rates: balanceRates(forCob as any, doses as any, nowMs, dia),
-  };
+async function planContext(subject: string, nowMs: number, lang: string, tzBody: unknown, excludeMealId?: unknown) {
+  const data = await loadEngineData(db, subject, nowMs, [], 6);
+  // The exclusion is ONLY about carbs-on-board: a meal must not count as sugar already landing against
+  // its own bolus. The RESCUE CLOCK still sees every row: editing the three sugars taken two minutes
+  // ago would otherwise erase them, drop computeGuard's "you just took sugar, let it work" hold and
+  // answer with a second full rescue.
+  const forCob = data.meals.filter((m: any) => excludeMealId == null || String(m.id) !== String(excludeMealId));
+  const state = buildState({
+    nowMs, lang, tzOffsetMin: tzOffsetOf({ tzOffsetMin: tzBody }, data.profile), profile: data.profile,
+    readings: data.series, insulin: data.insulin, meals: forCob, rescueMeals: data.meals, activity: data.activity,
+    model: data.model,
+  });
+  return { state, profile: data.profile };
 }
+
+/** How long the same dose written twice is one dose written twice. */
+const INSULIN_RETRY_MIN = 2;
 
 /** A meal whose time is further in the past than this is EATEN, not planned. */
 export const PAST_MEAL_GRACE_MIN = 15;
+
+const insulinNameOf = (ins: any): string | null => (ins?.name ? String(ins.name).slice(0, 80) : null);
 
 /** The plan for a meal of `carbsG` grams eaten at `mealTs` (null = now), plus its prose line.
  *  Returns nulls when there are no carbs to dose — the caller keeps its own wording. */
 async function mealDoseAnswer(
   subject: string, nowMs: number, carbsG: number | null, description: string,
-  mealTs: string | null, lang: string, excludeMealId?: unknown,
-): Promise<{ plan: MealPlanResult | null; planLine: string | null; alreadyEaten?: boolean }> {
+  mealTs: string | null, lang: string, excludeMealId?: unknown, tzBody?: unknown, willEat = false,
+  /** The figure is a model's guess, not one typed or read off a label. */
+  guessed = false,
+): Promise<{ plan: MealPlanResult | null; planLine: string | null; alreadyEaten?: boolean; decision?: unknown; actionLine?: string }> {
   if (carbsG == null || !(carbsG > 0)) return { plan: null, planLine: null };
   // Eating LATER moves the injection, not the arithmetic: mealTimingLine says "dans N min" off this.
   const untilMin = mealTs ? Math.round((new Date(mealTs).getTime() - nowMs) / 60000) : 0;
@@ -313,7 +258,7 @@ async function mealDoseAnswer(
   // commencer à manger" for a lunch three hours gone. Backdating a forgotten meal does the same.
   // No plan at all is the honest answer; the meal is still logged, and the analysis still covers it.
   if (untilMin < -PAST_MEAL_GRACE_MIN) return { plan: null, planLine: null, alreadyEaten: true };
-  const ctx = await planContext(subject, nowMs, excludeMealId);
+  const { state, profile } = await planContext(subject, nowMs, lang, tzBody, excludeMealId);
   // ...and inside the grace window, a meal that was ALREADY BOLUSED is finished business too. The
   // fifteen minutes exist so "Maintenant" still works, but they are also exactly when someone
   // reopens the row they just created — and computeGuard subtracts insulin on board from the
@@ -321,27 +266,29 @@ async function mealDoseAnswer(
   // first one is still working. Same coverage test the uncovered-meal detector uses.
   if (untilMin <= 0 && mealTs) {
     const mt = new Date(mealTs).getTime();
-    const need = ctx.gp?.carbRatio && ctx.gp.carbRatio > 0 ? carbsG / ctx.gp.carbRatio : 0;
-    const covered = (ctx.doses || []).some((d: any) => {
-      if (!d || d.kind === "basal") return false;
-      const dt = Number(d.ts);
+    const need = state.gp?.carbRatio && state.gp.carbRatio > 0 ? carbsG / state.gp.carbRatio : 0;
+    const covered = (state.insulin || []).some((d: any) => {
+      if (!d || d.kind === "basal" || isBasalInsulin(d.insulin_name)) return false;
+      const dt = new Date(d.ts).getTime();
       if (!Number.isFinite(dt) || Math.abs(dt - mt) > MEAL_COVER_WINDOW_MIN * 60000) return false;
       return need <= 0 || Number(d.units) >= need * MEAL_COVER_FRACTION;
     });
     if (covered) return { plan: null, planLine: null, alreadyEaten: true };
   }
-  const plan = planMealDose({
-    glucoseMgdl: ctx.cur, trend: ctx.trend, staleMin: ctx.staleMin, iobUnits: ctx.iob,
-    carbsG, description, cobGrams: ctx.cob, rates: ctx.rates,
-    minutesUntilMeal: untilMin > 0 ? untilMin : 0,
-    minSinceRescue: ctx.minSinceRescue, recentHypo: ctx.recentHypo,
-    activityCut: ctx.activityCut, profile: ctx.gp,
+  // Same decision as everywhere else, with this meal as the one under discussion.
+  const decision = decideAction(state, {
+    candidate: {
+      carbsG, description, minutesUntil: untilMin > 0 ? untilMin : 0,
+      eatenAtMs: untilMin < 0 && mealTs ? new Date(mealTs).getTime() : null,
+    },
+    estimatedCarbs: guessed ? carbsG : null,
   });
-  // The sport reduction is stated with the number it changed, never applied silently.
-  const act = activityNote(ctx.activity, nowMs, ctx.activityCut, lang, plan.totalUnits > 0);
-  const pre = preSportCarbsLine(ctx.activity, nowMs, ctx.cur, lang);
-  const line = [mealPlanLine(plan, lang, ctx.gp), pre, act].filter(Boolean).join(" ");
-  return { plan, planLine: line };
+  const ahead = anticipate(state, decision);
+  const notes = sideNotes(state, decision).map((n) => n.display);
+  const line = [decision.line, ...notes].filter(Boolean).join(" ");
+  // Only a meal being saved puts a dose in front of someone; "how much would it be?" does not.
+  if (willEat && dosePutForward(decision)) await rememberNamedDose(db, subject, state, decision);
+  return { plan: decision.plan, planLine: line, actionLine: decision.line, decision: decisionPayload(state, decision, ahead) };
 }
 
 /** The structured half, for a client that wants to style the number rather than print the sentence. */
@@ -398,8 +345,11 @@ Deno.serve(async (req: Request) => {
         }
       }
       const carbsG = perUnit != null ? Math.min(2000, perUnit * quantity) : null;
-      const a = await mealDoseAnswer(subject, nowMs, carbsG, description, clampTs(m.ts), lang);
-      return json({ carbsG, carbsPerUnit: perUnit, carbSource, carbFact, plan: planPayload(a.plan), planLine: a.planLine, alreadyEaten: !!a.alreadyEaten });
+      const a = await mealDoseAnswer(subject, nowMs, carbsG, description, clampTs(m.ts), lang, undefined, body.tzOffsetMin, false, carbSource === "estimate");
+      return json({
+        carbsG, carbsPerUnit: perUnit, carbSource, carbFact, plan: planPayload(a.plan), planLine: a.planLine,
+        actionLine: a.actionLine, decision: a.decision, alreadyEaten: !!a.alreadyEaten,
+      });
     }
 
     if (body.action === "add") {
@@ -414,7 +364,8 @@ Deno.serve(async (req: Request) => {
       // WHERE THE NUMBER CAME FROM travels with it. A figure the user typed, a figure read off a
       // barcode and a figure a model guessed are three different things, and the app used to print
       // all three the same way. The parent has to be able to tell an estimate from a label.
-      let carbSource: string = perUnit != null ? "user" : "estimate";
+      // The preview can have filled the field: the figure comes back looking typed, and the phone says so.
+      let carbSource: string = perUnit != null && m.carbSource !== "estimate" ? "user" : "estimate";
       let carbFact: unknown = null;
       // Still running when our deadline passed: kept so it can finish the job after the answer.
       let stillEstimating: Promise<CarbEstimate> | null = null;
@@ -458,7 +409,7 @@ Deno.serve(async (req: Request) => {
       // The plan is computed BEFORE the insert, on purpose: carbs-on-board must not include the very
       // meal this dose is meant to cover, or the food would be counted as already-landing sugar and
       // shrink its own dose.
-      const answer = await mealDoseAnswer(subject, nowMs, carbsG, description, mealTs, lang);
+      const answer = await mealDoseAnswer(subject, nowMs, carbsG, description, mealTs, lang, undefined, body.tzOffsetMin, true, carbSource === "estimate");
       if (alreadyLogged) {
         // Answer as a SUCCESS with the row that already exists: the parent's meal is on record, and
         // pressing save again cannot multiply it.
@@ -474,6 +425,7 @@ Deno.serve(async (req: Request) => {
         carbs_g: carbsG,
         quantity,
         planned: plannedFromTs(mealTs), // past/now = eaten, only a future time is "prévu"
+        carbs_estimated: carbSource === "estimate",
         ...(mealTs ? { ts: mealTs } : {}),
       };
       const { data, error } = await db.from("mechabetics_meals").insert(row).select().single();
@@ -481,11 +433,23 @@ Deno.serve(async (req: Request) => {
       if (stillEstimating) finishInBackground(stillEstimating, Number((data as any)?.id), quantity);
       return json({
         meal: data, carbSource, carbFact, plan: planPayload(answer.plan), planLine: answer.planLine,
+        actionLine: answer.actionLine, decision: answer.decision,
         alreadyEaten: !!answer.alreadyEaten,
         // The meal is saved; its carb figure is still being worked out and will appear on the next
         // refresh of the list. Said out loud so a blank « — g » reads as "coming", not "failed".
         carbsPending: !!stillEstimating,
       });
+    }
+
+    // "Nothing injected in the last 3 h": what lets a conditional dose become a firm one.
+    if (body.action === "confirmNoInsulin") {
+      await confirmNoRecentInsulin(db, subject, Date.now());
+      return json({ ok: true });
+    }
+    // "The dose you named was not done": the question is closed, the next analysis decides afresh.
+    if (body.action === "doseNotDone") {
+      await clearNamedDose(db, subject);
+      return json({ ok: true });
     }
 
     // Manual rapid-insulin log (the Insulin page) -> feeds IOB used by coach/ask/scan.
@@ -499,11 +463,27 @@ Deno.serve(async (req: Request) => {
         units: Math.round(units * 100) / 100,
         insulin_name: ins.name ? String(ins.name).slice(0, 80) : null,
         // basal (slow) doses must NOT count toward rapid insulin-on-board; default to rapid.
-        kind: ins.kind === "basal" ? "basal" : "rapid",
+        kind: ins.kind === "basal" || isBasalInsulin(insulinNameOf(ins)) ? "basal" : "rapid",
         ...(insTs ? { ts: insTs } : {}),
       };
+      // A RETRY MUST NOT BECOME A SECOND DOSE, same as for a meal. The answer can reach the phone after
+      // it has given up, and FAIT pressed again would write the same injection twice. Same dose, same
+      // time, same minute of writing: nobody really injects the same units twice in two minutes.
+      const at = insTs ? new Date(insTs).getTime() : nowMs;
+      const { data: justWritten } = await db.from("mechabetics_insulin")
+        .select("ts, units, kind").eq("subject", subject)
+        .gte("created_at", new Date(nowMs - INSULIN_RETRY_MIN * 60000).toISOString())
+        .order("created_at", { ascending: false }).limit(5);
+      const retried = (justWritten ?? []).some((r: any) =>
+        r.kind === row.kind && Math.abs(Number(r.units) - row.units) < 0.01 &&
+        Math.abs(new Date(r.ts).getTime() - at) <= INSULIN_RETRY_MIN * 60000);
+      if (retried) return json({ ok: true, duplicate: true });
       const { error } = await db.from("mechabetics_insulin").insert(row);
       if (error) return json({ error: error.message }, 500);
+      // Whether this answers "was it done?" is decided where the question is read (openPendingDose): a
+      // dose from before the one named is not the answer to it. Except from the card that asks: there the
+      // family is answering, at whatever time they give, and the question would otherwise stay open.
+      if (ins.answersQuestion === true) await clearNamedDose(db, subject);
       return json({ ok: true });
     }
 
@@ -533,8 +513,14 @@ Deno.serve(async (req: Request) => {
       // with no carbs is invisible to every carb computation there is: no bolus named for it, no
       // sugar-on-board counted against the insulin, no uncovered-meal warning. Moving a meal by ten
       // minutes silently deleted it from the safety maths.
-      let carbSource: string | null = carbsSent ? "user" : null;
+      let carbSource: string | null = carbsSent ? (m.carbSource === "estimate" ? "estimate" : "user") : null;
       let carbsG: number | null = perUnit != null ? Math.min(2000, perUnit * quantity) : null;
+      // The form sends back the figure it opened with: moving a meal in time says nothing about it.
+      if (carbsSent && carbSource === "user") {
+        const { data: was } = await db.from("mechabetics_meals")
+          .select("carbs_g").eq("subject", subject).eq("id", body.id).maybeSingle();
+        if (Number((was as any)?.carbs_g) === carbsG) carbSource = "kept";
+      }
       if (perUnit == null) {
         const { data: prev } = await db.from("mechabetics_meals")
           .select("carbs_g, quantity, description").eq("subject", subject).eq("id", body.id).maybeSingle();
@@ -571,12 +557,14 @@ Deno.serve(async (req: Request) => {
           }
         }
       }
-      const answer = await mealDoseAnswer(subject, nowMs, carbsG, description, mealTs, lang, body.id);
+      const answer = await mealDoseAnswer(subject, nowMs, carbsG, description, mealTs, lang, body.id, body.tzOffsetMin, true, carbSource === "estimate");
       const patch: Record<string, unknown> = {
         description: description.slice(0, 240),
         carbs_g: carbsG,
         quantity,
         planned: plannedFromTs(mealTs), // re-derive: editing a meal to a past time makes it "eaten"
+        // A figure typed or read off a label stops being a guess; one kept stays what it was.
+        ...(carbSource && carbSource !== "kept" ? { carbs_estimated: carbSource === "estimate" } : {}),
         ...(mealTs ? { ts: mealTs } : {}),
       };
       const { error } = await db.from("mechabetics_meals").update(patch).eq("subject", subject).eq("id", body.id);
@@ -593,7 +581,7 @@ Deno.serve(async (req: Request) => {
       const patch: Record<string, unknown> = {
         units: Math.round(units * 100) / 100,
         insulin_name: ins.name ? String(ins.name).slice(0, 80) : null,
-        kind: ins.kind === "basal" ? "basal" : "rapid",
+        kind: ins.kind === "basal" || isBasalInsulin(insulinNameOf(ins)) ? "basal" : "rapid",
         ...(insTs ? { ts: insTs } : {}),
       };
       const { error } = await db.from("mechabetics_insulin").update(patch).eq("subject", subject).eq("id", body.id);

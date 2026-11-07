@@ -68,7 +68,7 @@ Deno.serve(async (req: Request) => {
     for (let page = 0; page < MAX_PAGES; page++) {
       const from = page * PAGE;
       const { data, error } = await db.from("mechabetics_readings")
-        .select("ts, value_mgdl").eq("subject", subject).gte("ts", since)
+        .select("ts, value_mgdl").eq("subject", subject).eq("suspect", false).gte("ts", since)
         .order("ts", { ascending: false }).range(from, from + PAGE - 1);
       if (error || !data || data.length === 0) break;
       for (const r of data) raw.push({ ts: new Date(r.ts).getTime(), value: Number(r.value_mgdl) });
@@ -114,7 +114,16 @@ Deno.serve(async (req: Request) => {
     // bar work WITHOUT the (gated) AI coach — these are plain DB aggregates, not AI.
     const { data: stats } = await db.rpc("mechabetics_stats", { p_subject: subject });
 
-    return json({ readings, analyses, insulin, meals, stats });
+    // What the voice said: the spoken answers were stored nowhere from 27 July on, so a parent who
+    // heard three different answers had nothing to go back to.
+    const { data: voiceRows } = await db.from("mechabetics_voice_log")
+      .select("ts, question, reply, action, scope").eq("subject", subject).gte("ts", since)
+      .order("ts", { ascending: false }).limit(40);
+    const voice = (voiceRows ?? []).map((v: any) => ({
+      ts: new Date(v.ts).getTime(), question: v.question, reply: v.reply, action: v.action ?? null,
+    }));
+
+    return json({ readings, analyses, insulin, meals, stats, voice });
   } catch (e) {
     return json({ readings: [], analyses: [], error: `${(e as Error)?.message ?? e}` });
   }

@@ -206,15 +206,11 @@ fun carbsLandingWithin(
 /** Units that will act within [horizonMin]: what is on board now minus what will still be then. */
 fun insulinActingWithin(
     doses: List<AnalysisService.InsulinDose>, nowMs: Long, horizonMin: Int = BALANCE_HORIZON_MIN,
-    /** The profile's rapid insulin, used for a dose logged without a name — the server does the
-     *  same. Left out, a nameless dose of Actrapid (6 h) was treated as a 4 h analog, and since this
-     *  figure is a one-hour SLICE the 3% error on the total became 50% on the slice. */
+    /** The profile's rapid insulin, used for a dose logged without a name: the server does the same. */
     profileInsulin: String? = null,
 ): Double {
     fun iobAt(t: Long) = doses.filter { it.kind != "basal" && it.ts <= nowMs }.sumOf { d ->
-        val dur = (insulinActionMinutes(d.name) ?: insulinActionMinutes(profileInsulin) ?: DEFAULT_INSULIN_ACTION_MIN).toDouble()
-        val mins = (t - d.ts) / 60000.0
-        if (mins in 0.0..dur) d.units * (1 - mins / dur) else 0.0
+        doseUnitsLeft(d.units, d.name, d.ts, t, profileInsulin)
     }
     return (iobAt(nowMs) - iobAt(nowMs + horizonMin * 60_000L)).coerceAtLeast(0.0)
 }

@@ -15,7 +15,20 @@
 // cutoff, retry once with a doubled cap. For Gemini we also disable thinking (thinkingBudget:0) —
 // a short coaching JSON needs no chain-of-thought.
 //
-// Pure fetch + Web APIs (no Deno/Node-only calls) so it imports cleanly in edge functions.
+// THE DOMINO (v4.0). The family's own models answer first, in the order Nueve uses: ChatGPT, then Claude
+// (its accounts take over from one another on the server), then DeepSeek. They write better and cost
+// nothing per call, but they run on one machine at home and share their plans with Nueve. A week of their
+// logs: a short ask takes 8 s on ChatGPT and 7 s on Claude at the median, 22 s and 16 s for one in ten, and
+// the ChatGPT plan ran out for five days in October. So each one gets a head start, never a monopoly: past
+// it, or as soon as it fails, the next one starts too, and the first valid answer wins. DeepSeek starts at
+// 40 % of the budget at the latest, so nothing here can make an analysis later than DeepSeek alone would
+// have been by more than that, and with the door shut this file behaves exactly as it did before.
+//
+// The servers' keys never come here. They are secrets of the Nueve project, and a door over there uses them
+// for us: see supabase/functions-nueve/mechabetics-domino.
+//
+// Pure fetch + Web APIs (no Deno/Node-only calls) so it imports cleanly in edge functions. The environment
+// is read when there is one, through globalThis.
 
 export interface LlmRequest {
   /** Ground the answer in Google Search (Gemini only). For facts that live in the world and change
@@ -40,6 +53,18 @@ export interface LlmConfig {
   deepseekKey?: string | null;
   deepseekModel?: string;
   geminiModel?: string;
+  /** The family's own servers, in order. Worked out from the environment when not given here. */
+  domino?: DominoLink[] | null;
+}
+
+export interface DominoLink {
+  /** Who it is, for the logs and for the rest it takes. */
+  name: string;
+  url: string;
+  /** What opens the door for one ask. Throws when it can't, and the next link starts. */
+  access: () => Promise<Record<string, string>>;
+  /** The model and the effort, in the words that server reads. */
+  ask: Record<string, unknown>;
 }
 
 interface LlmResult {
@@ -196,6 +221,154 @@ export async function chatJson(req: LlmRequest, cfg: LlmConfig): Promise<string>
   return res.content;
 }
 
+/** In the Nueve project, because that is where the servers' keys are. */
+const DOMINO_DOOR = "https://nppzlbiznfsijlbdxubx.supabase.co/functions/v1/mechabetics-domino";
+/** Writing a pass is one row in this project's own database. Past this, the link is skipped. */
+const DOMINO_PASS_MS = 3000;
+
+/** One ask, one pass: written here, where only this project's server can write, and checked there. */
+async function dominoPass(base: string, service: string, anon: string): Promise<Record<string, string>> {
+  const pass = crypto.randomUUID();
+  const r = await fetch(`${base}/rest/v1/mechabetics_domino_passes`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "apikey": service,
+      "authorization": `Bearer ${service}`,
+      "prefer": "return=minimal",
+    },
+    body: JSON.stringify({ pass }),
+    signal: AbortSignal.timeout(DOMINO_PASS_MS),
+  });
+  if (!r.ok) throw new LlmError("ai_down", `domino: no pass (${r.status})`, r.status);
+  return { "x-domino-pass": pass, "x-domino-key": anon };
+}
+
+/** The links in order, or none outside an edge function, and nothing changes. Low effort: this is a short
+ *  JSON answer someone is waiting for. "gpt" follows whatever model the server's plan is on. */
+export function dominoFrom(cfg: LlmConfig): DominoLink[] {
+  if (cfg.domino) return cfg.domino;
+  // deno-lint-ignore no-explicit-any
+  const env = (globalThis as any).Deno?.env;
+  const read = (name: string) => String(env?.get?.(name) ?? "").trim();
+  const base = read("SUPABASE_URL").replace(/\/+$/, "");
+  const service = read("SUPABASE_SERVICE_ROLE_KEY");
+  const anon = read("SUPABASE_ANON_KEY");
+  if (!base || !service || !anon) return [];
+  const access = () => dominoPass(base, service, anon);
+  return [
+    { name: "gpt", url: `${DOMINO_DOOR}?link=gpt`, access, ask: { model: "gpt", reasoning_effort: "low" } },
+    { name: "claude", url: `${DOMINO_DOOR}?link=claude`, access, ask: { model: "claude-sonnet-5-5", effort: "low" } },
+  ];
+}
+
+/** The servers stream keepalive spaces and `REASON{...}` progress lines before the final completion
+ *  JSON, so a plain `res.json()` throws. Returns the model's text. */
+export function serverContent(bodyText: string): string {
+  const lines = (bodyText || "").split("\n").map((l) => l.trim()).filter(Boolean);
+  for (let i = lines.length - 1; i >= 0; i--) {
+    if (!lines[i].startsWith("{")) continue;
+    let candidate: any = null;
+    try { candidate = JSON.parse(lines[i]); } catch { continue; }
+    if (candidate?.error) throw new LlmError(classifyLlmError(0, String(candidate.error)), `server: ${String(candidate.error).slice(0, 200)}`);
+    const content = candidate?.choices?.[0]?.message?.content;
+    if (typeof content === "string" && content.trim()) return content.trim();
+  }
+  throw new LlmError("ai_down", "server: empty or unreadable answer");
+}
+
+/** These servers are agents wrapped as chat endpoints, so the JSON can arrive inside a code fence or
+ *  after a sentence. Returns the object as text, or null when there is no valid one. */
+export function jsonObjectIn(text: string): string | null {
+  const t = (text || "").trim();
+  const start = t.indexOf("{");
+  const end = t.lastIndexOf("}");
+  if (start < 0 || end <= start) return null;
+  const candidate = t.slice(start, end + 1);
+  try {
+    const v = JSON.parse(candidate);
+    return v && typeof v === "object" ? candidate : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Blank, or a JSON object with nothing in it. Not an answer, whoever sent it. */
+export function emptyAnswer(text: string): boolean {
+  const t = (text || "").trim();
+  if (!t) return true;
+  try {
+    const v = JSON.parse(t);
+    return !v || typeof v !== "object" || !Object.values(v).some((x) => x != null && x !== "");
+  } catch {
+    return false;
+  }
+}
+
+async function askLink(req: LlmRequest, link: DominoLink, timeoutMs: number, signal: AbortSignal): Promise<string> {
+  const messages: { role: string; content: string }[] = [];
+  if (req.system) messages.push({ role: "system", content: req.system });
+  messages.push({ role: "user", content: req.user });
+  const ctl = new AbortController();
+  const stop = () => ctl.abort();
+  if (signal.aborted) stop();
+  signal.addEventListener("abort", stop);
+  const timer = setTimeout(stop, timeoutMs);
+  try {
+    const access = await link.access();
+    const r = await fetch(link.url, {
+      method: "POST",
+      headers: { "content-type": "application/json", ...access },
+      body: JSON.stringify({
+        ...link.ask,
+        messages,
+        temperature: req.temperature ?? 0.3,
+        max_tokens: req.maxTokens ?? DEFAULT_MAX_TOKENS,
+      }),
+      signal: ctl.signal,
+    });
+    const body = await r.text();
+    if (!r.ok) throw new LlmError(classifyLlmError(r.status, body), `${link.name} ${r.status}: ${body.slice(0, 200)}`, r.status);
+    const json = jsonObjectIn(serverContent(body));
+    if (!json || emptyAnswer(json)) throw new LlmError("ai_down", `${link.name}: no JSON object in the answer`);
+    return json;
+  } finally {
+    clearTimeout(timer);
+    signal.removeEventListener("abort", stop);
+  }
+}
+
+/** Share of the budget the family's servers have to themselves before DeepSeek starts too. */
+export const DOMINO_HEAD_START = 0.4;
+/** After an answer that says the plan or the door is the problem, leave that server alone this long
+ *  instead of paying its head start on every analysis of a plan that ran out for days. */
+export const DOMINO_REST_MS = 10 * 60000;
+/** Another link answering first this many times running means the server is hanging, not slow: it gets
+ *  the same rest, or every analysis waits out a head start for nothing. */
+export const DOMINO_MISSES = 2;
+const dominoState = new Map<string, { restUntil: number; misses: number }>();
+const stateOf = (name: string) => {
+  let s = dominoState.get(name);
+  if (!s) dominoState.set(name, s = { restUntil: 0, misses: 0 });
+  return s;
+};
+
+/** For tests. */
+export function resetDomino(): void {
+  dominoState.clear();
+}
+
+/** An answer from anyone asked so far, or null: every one of them failed, or their time is up. */
+async function firstAnswer(asked: Promise<string>[], waitMs: number): Promise<string | null> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const clock = new Promise<null>((resolve) => {
+    timer = setTimeout(() => resolve(null), Math.max(0, waitMs));
+  });
+  const first = await Promise.race([Promise.any(asked).catch(() => null), clock]);
+  if (timer !== undefined) clearTimeout(timer);
+  return first;
+}
+
 /**
  * `chatJson` with a HARD ceiling on the WHOLE exchange — provider call, cross-provider fallback and
  * the retry chatJson makes when an answer came back cut off. A per-call timeout is not enough: on
@@ -208,8 +381,70 @@ export async function chatJson(req: LlmRequest, cfg: LlmConfig): Promise<string>
  * timed-out analysis is a shorter answer, never a wrong one.
  */
 export async function chatJsonWithin(req: LlmRequest, cfg: LlmConfig, totalMs: number): Promise<string> {
+  const links = totalMs > 0 ? dominoFrom(cfg).filter((l) => Date.now() >= stateOf(l.name).restUntil) : [];
+  if (!links.length) return await remoteWithin(req, cfg, totalMs);
+
+  const started = Date.now();
+  const hangUp = new AbortController();
+  const stillThinking = new Set<string>();
+  const ask = (link: DominoLink): Promise<string> => {
+    stillThinking.add(link.name);
+    return askLink(req, link, totalMs, hangUp.signal).then((json) => {
+      stillThinking.delete(link.name);
+      stateOf(link.name).misses = 0;
+      console.log(`llm: ${link.name} answered in ${Date.now() - started} ms`);
+      return json;
+    }).catch((e) => {
+      stillThinking.delete(link.name);
+      const kind = llmErrorKind(e);
+      if (kind === "auth" || kind === "out_of_credits" || kind === "rate_limited") {
+        stateOf(link.name).restUntil = Date.now() + DOMINO_REST_MS;
+      }
+      if (!hangUp.signal.aborted) console.warn(`llm: ${link.name} failed (${kind}): ${(e as Error)?.message ?? e}`);
+      throw e;
+    });
+  };
+
+  const asked: Promise<string>[] = [];
+  let answer: string | null = null;
+  try {
+    // Each link: its share of the head start, cut short the moment everyone asked so far has failed.
+    for (let i = 0; i < links.length; i++) {
+      asked.push(ask(links[i]));
+      const nextAt = totalMs * DOMINO_HEAD_START * (i + 1) / links.length;
+      answer = await firstAnswer(asked, nextAt - (Date.now() - started));
+      if (answer) return answer;
+    }
+    // Still nothing: DeepSeek joins in, with what is left of the budget.
+    const left = Math.max(1000, totalMs - (Date.now() - started));
+    // An empty answer is not a win: a server may still be working on a real one.
+    const remote = remoteWithin(req, cfg, left).then((text) => {
+      if (emptyAnswer(text)) throw new LlmError("ai_down", "empty answer");
+      return text;
+    });
+    answer = await Promise.any([...asked, remote]).catch((e) => {
+      const errors = (e as AggregateError)?.errors ?? [];
+      throw errors[errors.length - 1] ?? e; // DeepSeek's error: the one callers know how to word
+    });
+    return answer;
+  } finally {
+    // A server still thinking when someone else answered has missed its turn.
+    if (answer) {
+      for (const name of stillThinking) {
+        const s = stateOf(name);
+        if (++s.misses >= DOMINO_MISSES) {
+          s.restUntil = Date.now() + DOMINO_REST_MS;
+          s.misses = 0;
+        }
+      }
+    }
+    hangUp.abort(); // whichever way it ended, the servers stop working on an answer nobody will read
+  }
+}
+
+async function remoteWithin(req: LlmRequest, cfg: LlmConfig, totalMs: number): Promise<string> {
   if (!(totalMs > 0)) return await chatJson(req, cfg);
-  let timer: number | undefined;
+  let timer: ReturnType<typeof setTimeout> | undefined;
   const clock = new Promise<never>((_resolve, reject) => {
     timer = setTimeout(() => reject(new LlmError("ai_down", `llm_total_timeout_${totalMs}ms`, 408)), totalMs);
   });

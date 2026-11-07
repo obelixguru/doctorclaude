@@ -14,8 +14,8 @@ android {
         // Bumped per build so the phone can SAY which one it is running (shown at the bottom
         // of the Profil tab). It stayed at 1/"1.0" through every rebuild, which is why
         // "I still do not see the new tab" could not be answered without guessing.
-        versionCode = 37
-        versionName = "3.7"
+        versionCode = 40
+        versionName = "4.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }

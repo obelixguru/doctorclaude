@@ -128,11 +128,66 @@ class AnalysisService(private val context: Context) {
         /** True when the server could not persist an auto-logged meal/dose (voice/scan): the user
          *  must be told, because an unrecorded insulin dose breaks IOB tracking. */
         val logFailed: Boolean = false,
-        /** OPEN CONVERSATION only: the rows this answer WOULD have written, held back until the user
-         *  presses stop. Raw server JSON, replayed verbatim to `commitPending` — the app never
-         *  interprets a medical row it did not build. Empty in the ordinary one-shot mode. */
-        val pending: List<org.json.JSONObject> = emptyList(),
+        /** The voice put something on record: the analysis on screen no longer describes the moment. */
+        val logged: Boolean = false,
+        /** What the server decided, in numbers. Null from an older server. */
+        val decision: Decision? = null,
     )
+
+    data class ForecastPoint(val minutes: Int, val mgdl: Int, val low: Int, val high: Int)
+
+    /**
+     * The decision behind the text. [units] is what a "Done" button records, [kind] says which
+     * buttons make sense: "dose" (Done / Not done / Other), "dose_if" (Nothing in 3 h / Already
+     * injected), "ask_done" (answer about [pendingUnits] first). Everything else has no buttons.
+     * [split] = the dose goes in two parts, so Done asks how much rather than recording all of it.
+     */
+    data class Decision(
+        val kind: String,
+        val units: Double,
+        val laterUnits: Double,
+        val sugarGrams: Int,
+        val insulinName: String?,
+        val knowledge: String,
+        val pendingUnits: Double?,
+        val pendingAtMs: Long?,
+        val forecast: List<ForecastPoint>,
+        val anticipation: String?,
+        val split: Boolean = false,
+        /** The dose being asked about went in two parts: "done" has to say how much. */
+        val pendingSplit: Boolean = false,
+        /** How far to trust the range: a new slow insulin, or what the forecasts really scored. */
+        val forecastNote: String? = null,
+    )
+
+    private fun decisionOf(o: JSONObject?): Decision? {
+        if (o == null) return null
+        val pending = o.optJSONObject("pending")
+        val forecast = o.optJSONObject("forecast")
+        val points = mutableListOf<ForecastPoint>()
+        forecast?.optJSONArray("points")?.let { arr ->
+            for (i in 0 until arr.length()) {
+                val p = arr.optJSONObject(i) ?: continue
+                points.add(ForecastPoint(p.optInt("minutes"), p.optInt("mgdl"), p.optInt("low"), p.optInt("high")))
+            }
+        }
+        val ahead = o.optJSONObject("anticipation")
+        return Decision(
+            kind = o.optString("kind"),
+            units = o.optDouble("units", 0.0).takeIf { !it.isNaN() } ?: 0.0,
+            laterUnits = o.optDouble("laterUnits", 0.0).takeIf { !it.isNaN() } ?: 0.0,
+            sugarGrams = o.optInt("sugarGrams", 0),
+            insulinName = if (o.isNull("insulinName")) null else o.optString("insulinName").ifBlank { null },
+            knowledge = o.optString("knowledge"),
+            pendingUnits = pending?.optDouble("units")?.takeIf { !it.isNaN() },
+            pendingAtMs = pending?.optLong("at")?.takeIf { it > 0 },
+            forecast = points,
+            anticipation = ahead?.let { if (it.isNull("line")) null else it.optString("line").ifBlank { null } },
+            split = o.optBoolean("split", false),
+            pendingSplit = pending?.optBoolean("split", false) ?: false,
+            forecastNote = if (o.isNull("forecastNote")) null else o.optString("forecastNote").ifBlank { null },
+        )
+    }
 
     /** Honest message when we can't even reach the backend (network down, timeout, Supabase paused,
      *  non-2xx). The glucose feed + alarms are INDEPENDENT (LibreLinkUp-direct), so we say so. */
@@ -240,7 +295,7 @@ class AnalysisService(private val context: Context) {
             }
         }
 
-    suspend fun coach(history: List<GlucoseReading>, patientId: String?, lang: String = "fr", playVoice: Boolean = true, force: Boolean = false): AnalysisResult =
+    suspend fun coach(history: List<GlucoseReading>, patientId: String?, lang: String = "fr", playVoice: Boolean = true, force: Boolean = false, stillWanted: () -> Boolean = { true }): AnalysisResult =
         withContext(Dispatchers.IO) {
             if (patientId.isNullOrBlank()) return@withContext AnalysisResult("Patient inconnu.", isError = true)
             if (history.size < 3) return@withContext AnalysisResult(
@@ -293,7 +348,9 @@ class AnalysisService(private val context: Context) {
                     // prefetch of the OTHER language (bilingual prefetch / auto-greet) must not overwrite
                     // it — otherwise tapping ▷/ANALYSE reads the current text in the wrong language's
                     // voice (the "French text spoken in Spanish" bug).
-                    if (playVoice) {
+                    // ...and an analysis overtaken by new data, or another person, says nothing: its
+                    // dose is not the dose any more.
+                    if (playVoice && stillWanted()) {
                         lastVoice = voiceLine; lastAudioB64 = audio; lastLang = lang
                         speak(audio, voiceLine, lang)
                     }
@@ -305,7 +362,8 @@ class AnalysisService(private val context: Context) {
                         avg24h = stat("avg_24h"), tir24h = stat("tir_24h"),
                         pctHigh24h = stat("pct_high_24h"), pctLow24h = stat("pct_low_24h"),
                         mealNudge = j.optBoolean("mealNudge", false),
-                        errorKind = ekind
+                        errorKind = ekind,
+                        decision = decisionOf(j.optJSONObject("decision")),
                     )
                 }
             } catch (e: Exception) {
@@ -316,15 +374,14 @@ class AnalysisService(private val context: Context) {
         }
 
     /** Sends a transcribed voice question (plain text, from on-device SpeechRecognizer) to Claude
-     *  (mechabetics-ask). [defer] = an OPEN CONVERSATION: answer and speak, but write nothing yet —
-     *  the rows come back in [AnalysisResult.pending] and are applied by [commitPending] when the
-     *  user presses stop. */
+     *  (mechabetics-ask). [auto] = the app asked by itself when an alarm went off: its wording is a
+     *  template, and nothing in it may be logged as if someone had said it. */
     suspend fun ask(
         question: String,
         history: List<GlucoseReading>,
         patientId: String?,
         lang: String,
-        defer: Boolean = false,
+        auto: Boolean = false,
         /** Turns already spoken in this conversation, oldest first: Pair(isAi, text). Without them
          *  every sentence was answered cold — "et sinon ?" meant nothing and someone who just wanted
          *  to talk got a fresh clinical greeting each time. */
@@ -344,7 +401,8 @@ class AnalysisService(private val context: Context) {
                     put("question", question)
                     put("readings", readings)
                     put("lang", lang)
-                    if (defer) put("defer", true)
+                    put("tzOffsetMin", java.util.TimeZone.getDefault().getOffset(System.currentTimeMillis()) / 60000)
+                    if (auto) put("auto", true)
                     if (conversation.isNotEmpty()) {
                         put("conversation", JSONArray().apply {
                             conversation.takeLast(8).forEach { (isAi, t) ->
@@ -383,49 +441,14 @@ class AnalysisService(private val context: Context) {
                         text, isError = isErr,
                         errorKind = ekind,
                         logFailed = j.optBoolean("logFailed", false),
-                        pending = j.optJSONArray("pending")?.let { arr ->
-                            (0 until arr.length()).mapNotNull { i -> arr.optJSONObject(i) }
-                        } ?: emptyList(),
+                        logged = j.optBoolean("logged", false),
+                        decision = decisionOf(j.optJSONObject("decision")),
                     )
                 }
             } catch (e: Exception) {
                 Log.e(TAG, "ask failed", e)
                 ServiceHealth.reportUnreachable()
                 AnalysisResult(transportMsg(lang), isError = true, errorKind = "transport")
-            }
-        }
-
-    /** End of an open conversation: write everything that was held back, in the order it was said.
-     *  Returns how many rows of each kind landed, or null if the call itself failed — the caller
-     *  must SAY so, because a dictated insulin dose that never reached the table breaks IOB. */
-    suspend fun commitPending(patientId: String?, pending: List<JSONObject>, lang: String): JSONObject? =
-        withContext(Dispatchers.IO) {
-            if (patientId.isNullOrBlank() || pending.isEmpty()) return@withContext null
-            try {
-                val arr = JSONArray()
-                pending.forEach { arr.put(it) }
-                val body = JSONObject().apply {
-                    put("action", "commitPending")
-                    put("subject", sha256Hex(patientId))
-                    put("lang", lang)
-                    put("pending", arr)
-                }
-                val req = Request.Builder()
-                    .url("$FUNCTIONS_BASE/mechabetics-ask")
-                    .addHeader("Authorization", "Bearer $ANON_KEY")
-                    .addHeader("content-type", "application/json")
-                    .post(body.toString().toRequestBody("application/json".toMediaType()))
-                    .build()
-                http.newCall(req).execute().use { res ->
-                    val raw = res.body?.string().orEmpty()
-                    if (!res.isSuccessful) { ServiceHealth.reportUnreachable(); return@withContext null }
-                    ServiceHealth.reportReachable()
-                    JSONObject(raw)
-                }
-            } catch (e: Exception) {
-                Log.e(TAG, "commitPending failed", e)
-                ServiceHealth.reportUnreachable()
-                null
             }
         }
 
@@ -443,6 +466,7 @@ class AnalysisService(private val context: Context) {
                     put("mime", "image/jpeg")
                     put("readings", readings)
                     put("lang", lang)
+                    put("tzOffsetMin", java.util.TimeZone.getDefault().getOffset(System.currentTimeMillis()) / 60000)
                     if (!patientId.isNullOrBlank()) put("subject", sha256Hex(patientId))
                     putAiFlags()
                 }
@@ -528,6 +552,17 @@ class AnalysisService(private val context: Context) {
                             )
                         }
                     }
+                    // What was said aloud, on the same timeline as the analyses, badged VOIX: the spoken
+                    // answers used to exist nowhere once heard.
+                    j.optJSONArray("voice")?.let { arr ->
+                        for (i in 0 until arr.length()) {
+                            val o = arr.getJSONObject(i)
+                            val q = if (o.isNull("question")) "" else o.optString("question")
+                            val a = if (o.isNull("reply")) "" else o.optString("reply")
+                            if (a.isNotBlank()) analyses.add(PastAnalysis(o.optLong("ts"), if (q.isBlank()) a else "« $q »\n\n$a", null, true))
+                        }
+                    }
+                    analyses.sortByDescending { it.ts }
                     val insulin = mutableListOf<InsulinDose>()
                     j.optJSONArray("insulin")?.let { arr ->
                         for (i in 0 until arr.length()) {

@@ -385,7 +385,7 @@ fun FoodScreen(
                         singleLine = true, modifier = Modifier.fillMaxWidth(), colors = fdColors()
                     )
                     OutlinedTextField(
-                        value = carbs, onValueChange = { carbs = it },
+                        value = carbs, onValueChange = { carbs = it; filledSource = null; filledProduct = null },
                         label = { Text(s.foodCarbsHint, color = InkMuted, fontSize = 12.sp) },
                         singleLine = true, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
                         modifier = Modifier.fillMaxWidth(), colors = fdColors()
@@ -507,9 +507,9 @@ fun FoodScreen(
                             // meal's old time, which read as the button doing nothing.
                             val editTs = mealWhen ?: System.currentTimeMillis()
                             val added = if (em != null)
-                                service.update(patientId, em.id, desc.trim(), carbs.toIntOrNull(), tsMs = editTs, quantity = qn, lang = lang.code.lowercase())
+                                service.update(patientId, em.id, desc.trim(), carbs.toIntOrNull(), tsMs = editTs, quantity = qn, lang = lang.code.lowercase(), carbSource = filledSource)
                             else
-                                service.add(patientId, desc.trim(), carbs.toIntOrNull(), false, tsMs = mealWhen, quantity = qn, lang = lang.code.lowercase())
+                                service.add(patientId, desc.trim(), carbs.toIntOrNull(), false, tsMs = mealWhen, quantity = qn, lang = lang.code.lowercase(), carbSource = filledSource)
                             val ok = added.ok
                             if (ok) {
                                 // The dose for what was just logged, carried out of the dialog onto

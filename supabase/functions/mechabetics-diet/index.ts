@@ -85,7 +85,7 @@ Deno.serve(async (req: Request) => {
 
     const [{ data: mealsRaw }, { data: readsRaw }] = await Promise.all([
       db.from("mechabetics_meals").select("ts, description, carbs_g, planned").eq("subject", subject).gte("ts", since).order("ts", { ascending: true }).limit(2000),
-      db.from("mechabetics_readings").select("ts, value_mgdl").eq("subject", subject).gte("ts", since).order("ts", { ascending: true }).limit(6000),
+      db.from("mechabetics_readings").select("ts, value_mgdl").eq("subject", subject).eq("suspect", false).gte("ts", since).order("ts", { ascending: true }).limit(6000),
     ]);
 
     const readings = (readsRaw ?? [])

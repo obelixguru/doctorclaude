@@ -1,0 +1,7 @@
+{
+  "imports": {
+    "jsr:@supabase/supabase-js@2": "./fake_db.ts",
+    "jsr:@supabase/functions-js/edge-runtime.d.ts": "./empty.ts",
+    "https://esm.sh/@resvg/resvg-wasm@2.6.2": "./fake_resvg.ts"
+  }
+}

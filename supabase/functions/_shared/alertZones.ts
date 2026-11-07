@@ -87,12 +87,63 @@ export function zoneAlert(prev: number, cur: number): ZoneAlert | null {
   return null;
 }
 
+/** A low that has not happened yet, for the same channel. The crystal ball is what tells it apart from
+ *  a reading: nobody should have to work out whether this is a value or a guess. */
+export function forecastLowMessage(name: string, cur: number, rightOfTen?: number | null): string {
+  return [
+    `🔮 <b>${name} : ${cur} mg/dL, peut passer sous 70 dans l'heure</b>`,
+    ...(rightOfTen ? [`Sur son historique, cet avertissement se vérifie environ ${rightOfTen} fois sur 10.`] : []),
+    "Garder du sucre à portée.",
+  ].join("\n");
+}
+
+/** A fall this big between what the monitor knew and what it now sees, this fast. With a reading every five
+ *  minutes that is 8 a minute and never happens: it only shows when readings stopped coming and came back
+ *  much lower. On 62 days it comes once a day, and a low follows six times in ten. */
+export const FAST_DROP_MGDL = 40;
+export const FAST_DROP_PER_MIN = 3;
+/** Older than this, the last known value is not where the glucose fell from. */
+const FAST_DROP_MAX_MIN = 45;
+
+export interface FastDrop {
+  from: number;
+  minutes: number;
+}
+
+/** What fell, between the reading known before this run and the newest one. Null when nothing did, and under
+ *  70 or above 180 the zones speak for themselves. */
+export function fastDrop(before: { t: number; v: number } | null | undefined, now: { t: number; v: number }): FastDrop | null {
+  if (!before) return null;
+  const minutes = (now.t - before.t) / 60000;
+  const drop = before.v - now.v;
+  if (!(minutes > 0) || minutes > FAST_DROP_MAX_MIN || now.v < LOW_WARN || now.v > HIGH) return null;
+  return drop >= FAST_DROP_MGDL && drop / minutes >= FAST_DROP_PER_MIN ? { from: before.v, minutes: Math.round(minutes) } : null;
+}
+
+export function fastDropMessage(name: string, cur: number, drop: FastDrop): string {
+  return [
+    `⚠️ <b>${name} : ${cur} mg/dL, ça descend vite</b> (${drop.from} il y a ${drop.minutes} min)`,
+    "Garder du sucre à portée.",
+  ].join("\n");
+}
+
+/** The readings stopped while the glucose was on its way down: nobody can see where it is now. */
+export function blindFallMessage(name: string, cur: number, ageMin: number): string {
+  return [
+    `⚠️ <b>${name} : plus de relevé depuis ${Math.round(ageMin)} min, et ça descendait vite</b> (dernier : ${cur} mg/dL)`,
+    "Vérifier au doigt et garder du sucre à portée.",
+  ].join("\n");
+}
+
 /** The Telegram message for a reading, or null for silence. `name` is the patient's OWN first name
- *  (from LibreLinkUp) so an account following several people never mislabels a value. */
-export function alertMessage(prev: number, cur: number, name: string): string | null {
+ *  (from LibreLinkUp) so an account following several people never mislabels a value. `drop` is what fell
+ *  since the last known reading: "back to normal" is the wrong thing to say on the way through. */
+export function alertMessage(prev: number, cur: number, name: string, drop?: FastDrop | null): string | null {
   const a = zoneAlert(prev, cur);
   if (!a) return null;
-  if (a.reason === "recovery") return `✅ <b>Glycémie de ${name} revenue à la normale</b> : ${cur} mg/dL`;
+  if (a.reason === "recovery") {
+    return drop ? fastDropMessage(name, cur, drop) : `✅ <b>Glycémie de ${name} revenue à la normale</b> : ${cur} mg/dL`;
+  }
   switch (a.zone) {
     case "red_low":
       return a.severe

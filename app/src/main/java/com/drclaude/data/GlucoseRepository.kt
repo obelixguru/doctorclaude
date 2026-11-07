@@ -434,15 +434,25 @@ class GlucoseRepository(
                 }
             }
         }
+        // THE ANSWER BELONGS TO THE PERSON IT WAS ASKED FOR. switchPatient re-points the active id
+        // before it can take the lock, so a fetch already in flight comes back for the previous person.
+        // Merged by the minute into the new person's history, then stored and uploaded, that is how two
+        // bodies ended up interleaved in one record: 138 / 67 / 138 / 67, 845 rows on nine dates.
+        if (store.patientId != patientId) {
+            _state.value = _state.value.copy(isLoading = false)
+            return
+        }
         when (val g = g0) {
             is LibreResult.Error -> handleError(g, reloginTried)
             is LibreResult.Success -> {
                 val snapshot = g.data
+                // Only this person's own points are merged, whatever is on screen at this moment.
+                val own = if (_state.value.patientId == patientId) _state.value.history else emptyList()
                 // Merge cloud graph history + the live measurement + our existing in-memory
                 // history, dedupe per-minute, keep the NEWEST point as "current". Including
                 // snapshot.current makes the fresh live value win over an older graph point
                 // (LibreLinkUp's live glucoseMeasurement updates more often than graphData).
-                val merged = (snapshot.history + listOfNotNull(snapshot.current) + _state.value.history)
+                val merged = (snapshot.history + listOfNotNull(snapshot.current) + own)
                     .associateBy { it.timestampMs / 60000L }.values
                     .sortedBy { it.timestampMs }
                     .takeLast(400)

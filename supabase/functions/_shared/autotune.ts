@@ -134,14 +134,21 @@ export function autotuneLine(r: AutotuneResult, lang: string): string {
   // Data agrees with the current settings — say so instead of proposing a near-identical "change".
   if (r.same) {
     return es
-      ? `Tus ajustes actuales (1 unidad por ~${r.currentCarbRatio} g de carbohidratos, y 1 unidad que baja la glucosa unos ${r.currentCorrectionFactor} mg/dL) parecen coherentes con tus datos: nada que cambiar por ahora. Sigue anotando tus dosis unos días para afinar mejor.`
-      : `Tes réglages actuels (1 unité pour ~${r.currentCarbRatio} g de glucides, et 1 unité qui fait baisser la glycémie d'environ ${r.currentCorrectionFactor} mg/dL) semblent cohérents avec tes données : rien à changer pour l'instant. Continue de noter tes doses quelques jours pour affiner davantage.`;
+      ? `Tus ajustes actuales (1 unidad por ~${r.currentCarbRatio} g de carbohidratos, y 1 unidad que baja la glucosa unos ${r.currentCorrectionFactor} mg/dL) parecen coherentes con ${r.reason === "profile_tdd" ? "la insulina diaria declarada" : "tus datos"}: nada que cambiar por ahora. Sigue anotando tus dosis unos días para afinar mejor.`
+      : `Tes réglages actuels (1 unité pour ~${r.currentCarbRatio} g de glucides, et 1 unité qui fait baisser la glycémie d'environ ${r.currentCorrectionFactor} mg/dL) semblent cohérents avec ${r.reason === "profile_tdd" ? "l'insuline par jour déclarée" : "tes données"} : rien à changer pour l'instant. Continue de noter tes doses quelques jours pour affiner davantage.`;
   }
   const cubes = Math.max(1, Math.round(r.suggestedCarbRatio / 4));
   const conf = es
     ? { low: "aún baja", medium: "correcta", high: "buena" }
     : { low: "encore faible", medium: "correcte", high: "bonne" };
   const c = conf[r.confidence ?? "low"];
+  // Anchored on the DECLARED daily insulin, not on what was logged: saying "after your 9 days and 3
+  // doses" claimed a measurement that was never made.
+  if (r.reason === "profile_tdd") {
+    return es
+      ? `Con la insulina diaria declarada en el perfil (hay muy pocas dosis anotadas para medir nada), Doctor Claude propone: 1 unidad de insulina por unos ${r.suggestedCarbRatio} g de carbohidratos (≈ ${cubes} terrones), y 1 unidad que baja la glucosa unos ${r.suggestedCorrectionFactor} mg/dL. Fiabilidad ${c}. Míralo con tu médico antes de cambiar tus ajustes.`
+      : `À partir de l'insuline par jour déclarée dans le profil (trop peu de doses notées pour mesurer quoi que ce soit), Doctor Claude propose : 1 unité d'insuline pour environ ${r.suggestedCarbRatio} g de glucides (≈ ${cubes} sucres), et 1 unité qui fait baisser la glycémie d'environ ${r.suggestedCorrectionFactor} mg/dL. Fiabilité ${c}. À regarder avec ton médecin avant de changer tes réglages.`;
+  }
   if (es) {
     return `Según tus últimos ${r.days} día(s) y ${r.doses} pinchazos anotados, Doctor Claude propone: 1 unidad de insulina por unos ${r.suggestedCarbRatio} g de carbohidratos (≈ ${cubes} terrones), y 1 unidad que baja la glucosa unos ${r.suggestedCorrectionFactor} mg/dL. Fiabilidad ${c}. Míralo con tu médico antes de cambiar tus ajustes.`;
   }

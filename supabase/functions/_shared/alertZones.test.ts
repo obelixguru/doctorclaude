@@ -3,7 +3,14 @@
 // out of range must stop nagging.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { zoneOf, zoneAlert, alertMessage } from "./alertZones.ts";
+import { alertMessage, blindFallMessage, fastDrop, fastDropMessage, forecastLowMessage, zoneAlert, zoneOf } from "./alertZones.ts";
+
+test("a warning about the future cannot be taken for a reading, and names no dose", () => {
+  const m = forecastLowMessage("Ryan", 96, 5);
+  assert.equal(m, "🔮 <b>Ryan : 96 mg/dL, peut passer sous 70 dans l'heure</b>\nSur son historique, cet avertissement se vérifie environ 5 fois sur 10.\nGarder du sucre à portée.");
+  assert.doesNotMatch(forecastLowMessage("Ryan", 96, null), /fois sur 10/);
+  assert.doesNotMatch(m, /\d\s*u\b/);
+});
 
 test("zones follow the user's thresholds", () => {
   assert.equal(zoneOf(59), "red_low");
@@ -84,4 +91,42 @@ test("an amber zone moving BACK toward range no longer pushes", () => {
   assert.notEqual(alertMessage(66, 57, "Ryan"), null);
   // (52 -> 57 is silent because re-alerting only fires on a further step AWAY from range — the
   // pre-existing rule that keeps a sitting hypo from re-ringing every five minutes.)
+});
+
+test("a fall between two runs: big, fast, recent and still in range, nothing else", () => {
+  const min = 60000;
+  const now = (v: number) => ({ t: 100 * min, v });
+  const was = (v: number, ago: number) => ({ t: (100 - ago) * min, v });
+  assert.deepEqual(fastDrop(was(255, 18), now(143)), { from: 255, minutes: 18 });
+  assert.deepEqual(fastDrop(was(143, 12), now(73)), { from: 143, minutes: 12 });
+  assert.equal(fastDrop(was(130, 10), now(95)), null, "35: not big enough");
+  assert.equal(fastDrop(was(170, 20), now(120)), null, "2.5 a minute: a normal fall");
+  assert.equal(fastDrop(was(250, 60), now(120)), null, "an hour old: not where it fell from");
+  assert.equal(fastDrop(was(143, 12), now(62)), null, "under 70 the zones speak");
+  assert.equal(fastDrop(was(300, 10), now(250)), null, "above 180 it is good news");
+  assert.equal(fastDrop(null, now(100)), null);
+  assert.equal(fastDrop(was(100, 12), now(150)), null, "rising");
+});
+
+test("back in range at full speed is not good news", () => {
+  const drop = { from: 255, minutes: 18 };
+  const m = alertMessage(255, 143, "Ryan", drop) ?? "";
+  assert.match(m, /Ryan : 143 mg\/dL, ça descend vite/);
+  assert.match(m, /255 il y a 18 min/);
+  assert.doesNotMatch(m, /normale|✅/);
+  assert.match(alertMessage(255, 143, "Ryan") ?? "", /revenue à la normale/);
+  assert.match(alertMessage(175, 150, "Ryan", null) ?? "", /revenue à la normale/);
+  // Only that sentence changes: everything the zones say stands.
+  assert.match(alertMessage(100, 55, "Ryan", drop) ?? "", /basse/);
+  assert.equal(alertMessage(120, 100, "Ryan", drop), null);
+});
+
+test("what these messages say: a value, a fall, and never a dose", () => {
+  for (const m of [fastDropMessage("Ryan", 73, { from: 143, minutes: 12 }), blindFallMessage("Ryan", 150, 12.4)]) {
+    assert.match(m, /Ryan/);
+    assert.match(m, /sucre à portée/);
+    assert.doesNotMatch(m, /\bu\b|insuline|Fiasp/);
+  }
+  assert.match(blindFallMessage("Ryan", 150, 12.4), /depuis 12 min/);
+  assert.match(blindFallMessage("Ryan", 150, 12.4), /au doigt/);
 });

@@ -2,7 +2,8 @@ import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "jsr:@supabase/supabase-js@2";
 import { Resvg, initWasm } from "https://esm.sh/@resvg/resvg-wasm@2.6.2";
 import { buildGlucoseSvg } from "../_shared/glucoseChart.ts";
-import { alertMessage } from "../_shared/alertZones.ts";
+import { alertMessage, fastDrop } from "../_shared/alertZones.ts";
+import { lookAhead, recordLookAhead } from "../_shared/engineData.ts";
 
 // ── 24/7 hypo/hyper monitor for Mechabetics ──────────────────────────────
 // Logs into LibreLinkUp (follower creds in secrets), reads the latest value, and alerts the Telegram
@@ -17,6 +18,8 @@ const db = createClient(
   { auth: { persistSession: false } },
 );
 
+const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
+const SERVICE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 const LLU_EMAIL = Deno.env.get("MECHABETICS_LLU_EMAIL") ?? "";
 const LLU_PASSWORD = Deno.env.get("MECHABETICS_LLU_PASSWORD") ?? "";
 const TG_TOKEN = Deno.env.get("MECHABETICS_TELEGRAM_BOT_TOKEN") ?? "";
@@ -30,6 +33,7 @@ const TG_CHAT = Deno.env.get("MECHABETICS_TELEGRAM_CHAT_ID") ?? "";
 // A reading older than this can't be alerted on: it is not the current glucose. Mirrors the app's
 // FRESHNESS_WINDOW_MS and the guard's STALE_MIN.
 const STALE_MIN = 15;
+const LOOK_AHEAD_STALE_MIN = 30;
 
 function H(extra: Record<string, string> = {}) {
   return {
@@ -47,6 +51,11 @@ async function sha256hex(s: string): Promise<string> {
 }
 
 const sleep = (ms: number) => new Promise((res) => setTimeout(res, ms));
+
+/** A Telegram call that hangs must not hold up the rest of the run, and the next patient's alert with it. */
+const TELEGRAM_TIMEOUT_MS = 8000;
+/** The chart is a nicety: a CDN that hangs must not stand between a reading and its alert. */
+const CHART_FETCH_TIMEOUT_MS = 3000;
 
 // Sends the parent's hypo/hyper alert to the Telegram group. Returns true ONLY if
 // Telegram accepted the message; false (after logging status+body) if it was lost to
@@ -67,6 +76,7 @@ async function telegram(text: string): Promise<boolean> {
         method: "POST",
         headers: { "content-type": "application/json" },
         body,
+        signal: AbortSignal.timeout(TELEGRAM_TIMEOUT_MS),
       });
       if (r.ok) return true;
       const detail = (await r.text().catch(() => "")).slice(0, 300);
@@ -108,15 +118,16 @@ let fontBytes: Uint8Array | null = null; // Inter Regular, for axis labels (resv
 function ensureResvg(): Promise<void> {
   if (!resvgReady) {
     resvgReady = (async () => {
+      const signal = AbortSignal.timeout(CHART_FETCH_TIMEOUT_MS);
       const [wasmRes, fontRes] = await Promise.all([
-        fetch("https://unpkg.com/@resvg/resvg-wasm@2.6.2/index_bg.wasm"),
-        fetch("https://cdn.jsdelivr.net/npm/@expo-google-fonts/inter/Inter_400Regular.ttf"),
+        fetch("https://unpkg.com/@resvg/resvg-wasm@2.6.2/index_bg.wasm", { signal }),
+        fetch("https://cdn.jsdelivr.net/npm/@expo-google-fonts/inter/Inter_400Regular.ttf", { signal }).catch(() => null),
       ]);
       if (!wasmRes.ok) throw new Error(`wasm fetch HTTP ${wasmRes.status}`);
       await initWasm(await wasmRes.arrayBuffer());
       // Font is best-effort: without it the chart still renders, just without labels.
-      if (fontRes.ok) fontBytes = new Uint8Array(await fontRes.arrayBuffer());
-      else console.error(`font fetch HTTP ${fontRes.status} — axis labels will be missing`);
+      if (fontRes?.ok) fontBytes = new Uint8Array(await fontRes.arrayBuffer());
+      else console.error(`font fetch failed (${fontRes?.status ?? "no answer"}) — axis labels will be missing`);
     })().catch((e) => { resvgReady = null; throw e; });
   }
   return resvgReady;
@@ -152,7 +163,7 @@ async function telegramPhoto(png: Uint8Array, caption: string): Promise<boolean>
       form.append("caption", caption);
       form.append("parse_mode", "HTML");
       form.append("photo", new Blob([png], { type: "image/png" }), "glucose.png");
-      const r = await fetch(url, { method: "POST", body: form });
+      const r = await fetch(url, { method: "POST", body: form, signal: AbortSignal.timeout(TELEGRAM_TIMEOUT_MS) });
       if (r.ok) return true;
       const detail = (await r.text().catch(() => "")).slice(0, 300);
       console.error(`telegramPhoto: HTTP ${r.status} on attempt ${attempt}/2 — ${detail}`);
@@ -212,11 +223,24 @@ Deno.serve(async (req) => {
     const debug = params.has("preview") || params.has("selftest");
     const list = debug ? patients.slice(0, 1) : patients;
     const out: string[] = [];
+    const later: { at: number; who: string; run: LookLater }[] = [];
     for (const patient of list) {
       if (!patient?.patientId) continue;
-      const res = await processPatient(patient, s, auth, params, patient === patients[0]);
+      const who = patient.firstName || "?";
+      const res = await processPatient(patient, s, auth, params, patient === patients[0], (run) => later.push({ at: out.length, who, run }));
       if (res instanceof Response) return res; // preview/selftest short-circuit (first patient)
-      out.push(`${patient.firstName || "?"}=${res}`);
+      out.push(`${who}=${res}`);
+    }
+    // THE NEXT HOUR, ONLY ONCE EVERYONE'S PRESENT IS DEALT WITH. Everything above is what this function
+    // was built for. Done inside the loop, one person's forecast stood between the next person and
+    // their alert: a warning hanging on Telegram held back a 55, and the child can be second in the list.
+    for (const job of later) {
+      try {
+        const status = await job.run();
+        if (status) out[job.at] = `${job.who}=${status}`;
+      } catch (e) {
+        console.error(`look-ahead failed — ${(e as Error)?.message ?? e}`);
+      }
     }
     return new Response(out.join(" | ") || "no patient");
   } catch (e) {
@@ -230,12 +254,17 @@ Deno.serve(async (req) => {
 // single-patient behaviour; the only change is it runs per patient instead of only conn.data[0], and
 // says the patient's real name instead of a hardcoded "Ryan". Returns a short status string, or a
 // Response when `isFirst` and ?preview/?selftest is set (those render/send for one patient).
+/** The forecast for one patient, run once every patient's present is dealt with. Its status, if any,
+ *  replaces the one from the first pass. */
+type LookLater = () => Promise<string | null>;
+
 async function processPatient(
   patient: any,
   s: { host: string; token: string; uid: string },
   auth: Record<string, string>,
   params: URLSearchParams,
   isFirst: boolean,
+  lookLater: (run: LookLater) => void,
 ): Promise<string | Response> {
   const name = String(patient.firstName || "").trim() || "Patient";
   try {
@@ -316,6 +345,7 @@ async function processPatient(
         .from("mechabetics_readings")
         .select("ts,value_mgdl")
         .eq("subject", subject)
+        .eq("suspect", false)
         .gte("ts", new Date(dayAgo).toISOString())
         .order("ts", { ascending: true });
       stored = (rd ?? []).map((r: any) => ({ t: Date.parse(r.ts), v: Number(r.value_mgdl) }));
@@ -373,13 +403,20 @@ async function processPatient(
       0,
     );
     const staleMin = newestTs ? (nowMs0 - newestTs) / 60000 : Number.POSITIVE_INFINITY;
-    const msg = staleMin > STALE_MIN ? null : alertMessage(prev, cur, name);
+    // What fell since the last reading known before this run. Stored rows only: this run's own graph is the news.
+    const known = stored.filter((p) => p.t < newestTs - 60000 && p.v > 0).pop();
+    const drop = staleMin > STALE_MIN ? null : fastDrop(known, { t: newestTs, v: cur });
+    const msg = staleMin > STALE_MIN ? null : alertMessage(prev, cur, name, drop);
 
-    await db.from("mechabetics_monitor_state").upsert({
+    // AN ALERT NOBODY RECEIVED HAS NOT BEEN GIVEN. With the new value stored first, a 55 that Telegram
+    // refused, or a run cut off before it could send, stayed silent for the whole episode: the next run saw
+    // 55 after 55. The comparison only moves on once the alert is delivered, so the next run tries again.
+    const saveState = (value: number) => db.from("mechabetics_monitor_state").upsert({
       subject,
-      last_value: cur,
+      last_value: value,
       updated_at: new Date().toISOString(),
     });
+    if (!msg) await saveState(cur);
 
     // Persist the fetched readings so the cloud history stays CONTINUOUS even when the app isn't
     // open — the app only saves while running, which left multi-day holes in the advanced view.
@@ -397,12 +434,13 @@ async function processPatient(
       const rows = items
         .map((x) => ({ t: Date.parse(tsOf(x)), v: Number(x.ValueInMgPerDl) }))
         .filter((r) => r.v > 0 && Number.isFinite(r.t) && r.t <= nowMs + 120000)
-        .map((r) => ({ subject, ts: new Date(r.t).toISOString(), value_mgdl: Math.round(r.v) }));
+        .map((r) => ({ subject, ts: new Date(r.t).toISOString(), value_mgdl: Math.round(r.v), source: "monitor" }));
       if (rows.length) {
         await db.from("mechabetics_readings").upsert(rows, { onConflict: "subject,ts", ignoreDuplicates: true });
       }
     } catch (_) { /* persistence is best-effort; never block alerting */ }
 
+    let status = `ok ${cur} (prev ${prev})`;
     if (msg) {
       // Prefer the image (curve + caption); fall back to plain text so a render or
       // sendPhoto failure never costs us the alert. A rare duplicate (photo landed but
@@ -412,9 +450,30 @@ async function processPatient(
       if (!sent) sent = await telegram(msg);
       // Distinguish a delivered alert from a dropped one so a vanished hypo/hyper push
       // shows up in the cron's return string (and logs), not just silently in Telegram.
-      return sent ? `alert ${cur} (prev ${prev})${png ? " +img" : ""}` : `alert-SEND-FAILED ${cur} (prev ${prev})`;
+      status = sent ? `alert ${cur} (prev ${prev})${png ? " +img" : ""}` : `alert-SEND-FAILED ${cur} (prev ${prev})`;
+      await saveState(sent ? cur : prev);
     }
-    return `ok ${cur} (prev ${prev})`;
+
+    // Past STALE_MIN nothing is alerted on, but a fall the readings stopped in is still worth saying.
+    if (staleMin <= LOOK_AHEAD_STALE_MIN) {
+      const alerted = !!msg;
+      lookLater(async () => {
+        const nowMs = Date.now();
+        const look = await lookAhead(db, subject, name, cur, tzMin, nowMs, SUPABASE_URL, SERVICE_KEY, drop);
+        if (!look) return null;
+        const warning = alerted ? null : look.message;
+        if (!warning) {
+          await recordLookAhead(db, subject, look, false, nowMs);
+          return null;
+        }
+        const png = await renderGraphPng(chartPoints, tzMin);
+        let warned = png ? await telegramPhoto(png, warning) : false;
+        if (!warned) warned = await telegram(warning);
+        await recordLookAhead(db, subject, look, warned, nowMs);
+        return warned ? `warn ${cur} (prev ${prev})` : `warn-SEND-FAILED ${cur} (prev ${prev})`;
+      });
+    }
+    return status;
   } catch (e) {
     // One patient's failure must not abort the others — return an error string, keep looping.
     return `err(${name}): ${(e as Error)?.message ?? e}`;

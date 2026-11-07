@@ -55,6 +55,7 @@ Deno.serve(async (req: Request) => {
       .from("mechabetics_readings")
       .select("ts, value_mgdl")
       .eq("subject", subject)
+      .eq("suspect", false)
       .gte("ts", since)
       .order("ts", { ascending: false })
       .limit(4000);

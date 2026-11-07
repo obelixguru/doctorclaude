@@ -25,8 +25,7 @@ import com.drclaude.ai.AnalysisService
 import com.drclaude.ai.MealsService
 import com.drclaude.ai.ProfileService
 import com.drclaude.data.CredentialsStore
-import com.drclaude.data.insulinActionMinutes
-import com.drclaude.data.DEFAULT_INSULIN_ACTION_MIN
+import com.drclaude.data.doseUnitsLeft
 import com.drclaude.data.carbsOnBoard
 import com.drclaude.data.carbsLandingWithin
 import com.drclaude.data.insulinActingWithin
@@ -171,9 +170,7 @@ fun InsulinScreen(
     val iob = remember(doses, nowTick) {
         val now = nowTick
         doses.filter { it.kind != "basal" }.sumOf { d ->
-            val durMin = (insulinActionMinutes(d.name) ?: DEFAULT_INSULIN_ACTION_MIN).toDouble()
-            val mins = (now - d.ts) / 60000.0
-            if (mins in 0.0..durMin) d.units * (1 - mins / durMin) else 0.0
+            doseUnitsLeft(d.units, d.name, d.ts, now, rapidName.ifBlank { null })
         }.coerceAtLeast(0.0)
     }
 

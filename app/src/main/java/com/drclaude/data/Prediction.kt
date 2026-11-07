@@ -1,6 +1,7 @@
 package com.drclaude.data
 
 import kotlin.math.abs
+import kotlin.math.exp
 import kotlin.math.roundToInt
 
 /**
@@ -90,6 +91,7 @@ object Predictor {
     // above 160 (the user's rule — a 120→110 dip is in-range and must stay silent).
     const val FALL_WATCH_BELOW = 90
     const val RISE_WATCH_ABOVE = 160
+    private const val MOMENTUM_FADE_MIN = 15.0
 
     fun of(history: List<GlucoseReading>, horizonMin: Int = 30): Prediction {
         val pts = cleanGlucoseSeries(history)
@@ -104,7 +106,10 @@ object Predictor {
         val mins = (last.timestampMs - first.timestampMs) / 60_000.0
         val slope = if (mins > 0) (last.valueMgDl - first.valueMgDl) / mins else 0.0
         val cur = last.valueMgDl
-        val projected = (cur + slope * horizonMin).coerceIn(20.0, 600.0).toInt()
+        // A trend fades. The old straight line missed by 88 mg/dL at one hour on Ryan's data, worse
+        // than saying nothing changes (63). Same formula as the server's projectGlucose.
+        val projected = (cur + slope.coerceIn(-4.0, 4.0) * MOMENTUM_FADE_MIN * (1 - exp(-horizonMin / MOMENTUM_FADE_MIN)))
+            .coerceIn(20.0, 600.0).toInt()
         fun minsTo(target: Int): Double =
             if (abs(slope) < 1e-6) Double.POSITIVE_INFINITY else (target - cur) / slope
 

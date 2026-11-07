@@ -112,11 +112,12 @@ class MealsService {
         )
     }
 
-    suspend fun add(patientId: String, description: String, carbsG: Int?, planned: Boolean, tsMs: Long? = null, quantity: Int = 1, lang: String = "fr"): AddResult =
+    suspend fun add(patientId: String, description: String, carbsG: Int?, planned: Boolean, tsMs: Long? = null, quantity: Int = 1, lang: String = "fr", carbSource: String? = null): AddResult =
         withContext(Dispatchers.IO) {
             try {
                 val meal = JSONObject().put("description", description).put("planned", planned).put("quantity", quantity)
                 if (carbsG != null) meal.put("carbsG", carbsG) // per-unit; server stores per-unit × quantity
+                if (carbSource != null) meal.put("carbSource", carbSource) // the preview filled the field
                 if (tsMs != null) meal.put("ts", tsMs) // backdate a forgotten meal
                 resultOf(post(JSONObject().put("action", "add").put("subject", subjectOf(patientId)).put("meal", meal).put("lang", lang)))
             } catch (e: Exception) {
@@ -139,14 +140,35 @@ class MealsService {
             }
         }
 
+    /** "No rapid insulin in the last 3 h": what lets a conditional dose become a firm one. */
+    suspend fun confirmNoInsulin(patientId: String): Boolean = withContext(Dispatchers.IO) {
+        try {
+            val j = post(JSONObject().put("action", "confirmNoInsulin").put("subject", subjectOf(patientId)))
+            j != null && !(j.has("error") && !j.isNull("error"))
+        } catch (e: Exception) {
+            Log.e(TAG, "confirmNoInsulin failed", e); false
+        }
+    }
+
+    /** "The dose you named was not done": closes the question, the next analysis decides afresh. */
+    suspend fun doseNotDone(patientId: String): Boolean = withContext(Dispatchers.IO) {
+        try {
+            val j = post(JSONObject().put("action", "doseNotDone").put("subject", subjectOf(patientId)))
+            j != null && !(j.has("error") && !j.isNull("error"))
+        } catch (e: Exception) {
+            Log.e(TAG, "doseNotDone failed", e); false
+        }
+    }
+
     /** Log an insulin dose (the Insulin page). Inserted into mechabetics_insulin → IOB.
      *  kind = "rapid" (counts toward insulin-on-board) or "basal" (slow; excluded from IOB). */
-    suspend fun addInsulin(patientId: String, units: Double, name: String?, kind: String = "rapid", tsMs: Long? = null): Boolean =
+    suspend fun addInsulin(patientId: String, units: Double, name: String?, kind: String = "rapid", tsMs: Long? = null, answersQuestion: Boolean = false): Boolean =
         withContext(Dispatchers.IO) {
             try {
                 val ins = JSONObject().put("units", units).put("kind", if (kind == "basal") "basal" else "rapid")
                 if (!name.isNullOrBlank()) ins.put("name", name)
                 if (tsMs != null) ins.put("ts", tsMs) // backdate a forgotten dose
+                if (answersQuestion) ins.put("answersQuestion", true) // from the card asking "was it done?"
                 val j = post(JSONObject().put("action", "addInsulin").put("subject", subjectOf(patientId)).put("insulin", ins))
                 j != null && !(j.has("error") && !j.isNull("error"))
             } catch (e: Exception) {
@@ -157,11 +179,12 @@ class MealsService {
     /** Edit a meal already in the list (description / carbs / time). Returns the same result as
      *  [add] — an edit changes the carbs, the quantity or the hour, so it changes the dose too, and
      *  returning a bare Boolean is why an edited meal never showed where its carb figure came from. */
-    suspend fun update(patientId: String, id: Long, description: String, carbsG: Int?, tsMs: Long? = null, quantity: Int = 1, lang: String = "fr"): AddResult =
+    suspend fun update(patientId: String, id: Long, description: String, carbsG: Int?, tsMs: Long? = null, quantity: Int = 1, lang: String = "fr", carbSource: String? = null): AddResult =
         withContext(Dispatchers.IO) {
             try {
                 val meal = JSONObject().put("description", description).put("quantity", quantity)
                 if (carbsG != null) meal.put("carbsG", carbsG) // per-unit; server stores per-unit × quantity
+                if (carbSource != null) meal.put("carbSource", carbSource)
                 if (tsMs != null) meal.put("ts", tsMs)
                 resultOf(post(JSONObject().put("action", "update").put("subject", subjectOf(patientId)).put("id", id).put("meal", meal).put("lang", lang)))
             } catch (e: Exception) {

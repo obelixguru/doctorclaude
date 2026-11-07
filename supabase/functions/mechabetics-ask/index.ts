@@ -2,23 +2,10 @@ import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "jsr:@supabase/supabase-js@2";
 import { accessSubject } from "../_shared/access.ts";
 import {
-  computeGuard,
-  STALE_MIN,
-  trendFromReadings,
-  recentHypoFrom,
-  minutesSinceLastRescue,
-  activeIob,
+  eatenAsTreatment,
   insulinActionMinutes,
   iobSystemLine,
-  glucoseBalance,
-  balanceRates,
-  balanceSystemLine,
   mealBolusUnits,
-  mealBolusHeldByIob,
-  mealBolusHeldLine,
-  carbsOnBoard,
-  combinedActionLine,
-  situationHint,
   stripInsulinNumbers,
   enforceInsulinCeiling,
   carbsCubesPhrase,
@@ -26,18 +13,40 @@ import {
   mealCarbSpeed,
   carbSpeedAdvice,
   sugarTimingFact,
-  hypoIobWarning,
-  activityBolusCut,
-  activityNote,
-  preSportCarbsLine,
   starchyCarbNote,
   speakable,
-  plannedMealNote,
-  planMealDose,
-  mealPlanLine,
-  toGuardProfile,
-  type GuardProfile,
 } from "../_shared/doseGuard.ts";
+import { isBasalInsulin } from "../_shared/insulins.ts";
+import {
+  decisionHint,
+  anticipate,
+  buildState,
+  clock,
+  decideAction,
+  decisionPayload,
+  engineFacts,
+  forecastLine,
+  sideNotes,
+  timedSeries,
+} from "../_shared/decide.ts";
+import type { Decision, EngineState } from "../_shared/decide.ts";
+import {
+  clearNamedDose,
+  confirmNoRecentInsulin,
+  dosePutForward,
+  doseSaidAgain,
+  loadConversationMemory,
+  loadEngineData,
+  mealSaidAgain,
+  mergeReadings,
+  saidBasalDose,
+  saysAnotherDose,
+  saysAnotherPlate,
+  rememberNamedDose,
+  storePhoneReadings,
+  tzOffsetOf,
+} from "../_shared/engineData.ts";
+import type { ConversationMemory, EngineData } from "../_shared/engineData.ts";
 import { chatJsonWithin, llmErrorKind, llmErrorMessage } from "../_shared/llm.ts";
 
 // A person just spoke and is waiting on an answer; the app gives up at 80 s. Past this the
@@ -131,17 +140,19 @@ function extractStr(raw: string, key: string): string | null {
 // working / finished) and the line closes with the SYSTEM total (iobSystemLine) — the model used
 // to see only "4 u il y a 290 min" and estimated the decay ITSELF, saying insulin was still ending
 // while the computed IOB (and the Insuline tab) said 0.
-function insulinContext(doses: any[], iob: number, defaultDur: number, nowMs: number, lang: string): string {
-  const rapid = (doses || []).filter((d: any) => d.kind !== "basal");
+function insulinContext(doses: any[], iob: number, nowMs: number, lang: string): string {
+  const rapid = (doses || []).filter((d: any) => d.kind !== "basal" && !isBasalInsulin(d.insulin_name));
   if (!rapid.length) return "";
   const es = lang === "es";
   const parts = rapid.map((d: any) => {
     const mins = Math.round((nowMs - new Date(d.ts).getTime()) / 60000);
     const what = `${d.units} u${d.insulin_name ? ` ${d.insulin_name}` : ""}`;
     if (mins < -1) return es ? `${what} PREVISTA en ${-mins} min (aún no activa)` : `${what} PRÉVUE dans ${-mins} min (pas encore active)`;
-    const done = mins >= (insulinActionMinutes(d.insulin_name) ?? defaultDur);
+    const done = mins >= (insulinActionMinutes(d.insulin_name) ?? 300);
     const state = done ? (es ? "ya terminó de actuar" : "a fini d'agir") : (es ? "sigue actuando" : "agit encore");
-    return es ? `${what} hace ${Math.max(0, mins)} min (${state})` : `${what} il y a ${Math.max(0, mins)} min (${state})`;
+    const m = Math.max(0, mins);
+    const ago = m < 60 ? (es ? `hace ${m} min` : `il y a ${m} min`) : (es ? `hace ${Math.floor(m / 60)} h ${String(m % 60).padStart(2, "0")}` : `il y a ${Math.floor(m / 60)} h ${String(m % 60).padStart(2, "0")}`);
+    return `${what} ${ago} (${state})`;
   });
   return es
     ? `INSULINA RÁPIDA RECIENTE: ${parts.join("; ")}. ${iobSystemLine(iob, lang)}`
@@ -164,8 +175,58 @@ function activityContext(acts: any[], lang: string): string {
     : `ACTIVITÉ PHYSIQUE RÉCENTE : ${parts.join(" ; ")} — le sport FAIT BAISSER la glycémie.`;
 }
 
-function buildSystem(lang: string, p: any, cur: number | null, series: string, meals: any[], pr: Record<string, string>, insCtx: string, actCtx: string, hint: string, signalLost: boolean, staleMin: number, sensorExpired: boolean): string {
-  const nick = p?.nickname || (lang === "es" ? "la persona" : "la personne");
+/**
+ * What has been said, what has been done, and what is to be done, kept apart in so many words.
+ *
+ * 6 November, 21:58: the app had proposed "3 u de Fiasp". Asked "c'est ce qu'il a fait ou ce qu'il doit
+ * faire ?", the voice answered from the dose log (3 u, two hours earlier), then said there was nothing
+ * to do, then that there was. It had never seen the analysis, and each question met it cold.
+ */
+function factsForTheVoice(s: EngineState, d: Decision, memory: ConversationMemory, lang: string): string {
+  const es = lang === "es";
+  const tz = s.tzOffsetMin;
+  const parts: string[] = [];
+  parts.push(es
+    ? `ACCIÓN DECIDIDA POR EL SISTEMA AHORA MISMO (se añadirá TAL CUAL debajo de tu respuesta): «${d.line}». Es la misma que en el análisis: NUNCA la contradigas, NUNCA digas otra cosa de una respuesta a la siguiente. Si pregunta qué hacer, es esto.`
+    : `ACTION DÉCIDÉE PAR LE SYSTÈME EN CE MOMENT (elle sera ajoutée TELLE QUELLE sous ta réponse) : «${d.line}». C'est la même que dans l'analyse : ne la contredis JAMAIS, ne dis JAMAIS autre chose d'une réponse à l'autre. Si on te demande quoi faire, c'est ça.`);
+  const doses = (s.insulin || []).filter((x: any) => x.kind !== "basal" && !isBasalInsulin(x.insulin_name) && new Date(x.ts).getTime() <= s.nowMs && s.nowMs - new Date(x.ts).getTime() <= 8 * 3600000);
+  const logged = doses.length
+    ? doses.map((x: any) => `${x.units} u ${x.insulin_name ?? ""} (${clock(new Date(x.ts).getTime(), tz)})`.replace("  ", " ")).join(" ; ")
+    : (es ? "ninguna" : "aucune");
+  parts.push(es
+    ? `HECHO (dosis anotadas, ya inyectadas): ${logged}. A HACER (lo que propone la acción de arriba): no está hecho mientras no se anote. No confundas NUNCA las dos cosas: si te preguntan si una dosis «la ha hecho o la tiene que hacer», responde con estas dos listas.`
+    : `FAIT (doses notées, déjà injectées) : ${logged}. À FAIRE (ce que propose l'action ci-dessus) : pas fait tant que ce n'est pas noté. Ne confonds JAMAIS les deux : si on te demande si une dose « a été faite ou reste à faire », réponds avec ces deux listes.`);
+  const eaten = (s.meals || []).filter((m: any) => {
+    const t = new Date(m.ts).getTime();
+    return t <= s.nowMs && s.nowMs - t <= 3 * 3600000;
+  }).map((m: any) => `${String(m.description ?? "").slice(0, 60)} (${clock(new Date(m.ts).getTime(), tz)})`);
+  parts.push(es
+    ? `COMIDAS YA ANOTADAS: ${eaten.length ? eaten.join(" ; ") : "ninguna"}. Rellena "meal" e "insulin" SOLO con lo NUEVO, nunca con lo que ya está anotado aquí.`
+    : `REPAS DÉJÀ NOTÉS : ${eaten.length ? eaten.join(" ; ") : "aucun"}. Remplis "meal" et "insulin" UNIQUEMENT pour ce qui est NOUVEAU, jamais pour ce qui est déjà noté ici.`);
+  if (memory.lastAction) {
+    parts.push(es
+      ? `ÚLTIMO ANÁLISIS (${clock(memory.lastAction.at, tz)}): «${memory.lastAction.line}». Eso es lo que se le ha enseñado.`
+      : `DERNIÈRE ANALYSE (${clock(memory.lastAction.at, tz)}) : «${memory.lastAction.line}». C'est ce qui lui a été montré.`);
+  }
+  if (s.pending) {
+    const at = clock(s.pending.at, tz);
+    parts.push(s.pending.split
+      ? (es
+        ? `DOSIS PROPUESTA SIN RESPUESTA: ${s.pending.units} u a las ${at}, EN DOS VECES. Si dice que se la ha puesto sin decir cuánto, NO rellenes "insulin": pregunta cuántas unidades se puso. Si da una cifra, rellena "insulin" con esa cifra. Si dice que no, pon "pendingAnswer":"not_done".`
+        : `DOSE PROPOSÉE SANS RÉPONSE : ${s.pending.units} u à ${at}, EN DEUX FOIS. S'il dit qu'elle a été faite sans dire combien, ne remplis PAS "insulin" : demande combien d'unités ont été faites. S'il donne un chiffre, remplis "insulin" avec ce chiffre. S'il dit que non, mets "pendingAnswer":"not_done".`)
+      : (es
+        ? `DOSIS PROPUESTA SIN RESPUESTA: ${s.pending.units} u a las ${at}. Si dice que se la ha puesto, rellena "insulin" con esas unidades y el tiempo pasado. Si dice que no, pon "pendingAnswer":"not_done".`
+        : `DOSE PROPOSÉE SANS RÉPONSE : ${s.pending.units} u à ${at}. S'il dit qu'elle a été faite, remplis "insulin" avec ces unités et le temps écoulé. S'il dit que non, mets "pendingAnswer":"not_done".`));
+  }
+  parts.push(es
+    ? `Si dice que NO se ha puesto insulina rápida en las últimas 3 h, pon "noRecentInsulin":true.`
+    : `S'il dit qu'aucune insuline rapide n'a été faite depuis 3 h, mets "noRecentInsulin":true.`);
+  return parts.join(" ");
+}
+
+function buildSystem(lang: string, p: any, cur: number | null, series: string, meals: any[], pr: Record<string, string>, insCtx: string, actCtx: string, hint: string, signalLost: boolean, staleMin: number, sensorExpired: boolean, facts: string): string {
+  // No name here, on purpose: the history is pseudonymous and the model does not need it.
+  const nick = lang === "es" ? "la persona" : "la personne";
   const curTxt = cur != null ? `${cur} mg/dL` : (lang === "es" ? "desconocida" : "inconnue");
   const mealsTxt = (meals && meals.length)
     ? meals.map((m) => `${m.planned ? (lang === "es" ? "previsto" : "prévu") : (lang === "es" ? "comido" : "mangé")} ${m.description}${m.carbs_g ? ` (~${m.carbs_g} g)` : ""}`).join(" ; ")
@@ -203,13 +264,15 @@ function buildSystem(lang: string, p: any, cur: number | null, series: string, m
       `PERFIL: ${profileLine}.`,
       signalLost
         ? (sensorExpired
-          ? `GLUCOSA: SENSOR CADUCADO (los 14 días se cumplieron) — sin medición desde hace ${staleMin} min, la actual es DESCONOCIDA; última conocida ${curTxt}; recientes (mg/dL): ${series || "n/d"}. Esa es la CAUSA de la falta de señal: aconseja poner un sensor NUEVO (y una punción capilar mientras tanto) — NADA de «acercar el teléfono» ni «volver a escanear», un sensor terminado no vuelve.`
-          : `GLUCOSA: SEÑAL PERDIDA (sin medición desde hace ${staleMin} min) — la actual es DESCONOCIDA; última conocida ${curTxt}; recientes (mg/dL): ${series || "n/d"}. NUNCA digas «estás en X» como si fuera ahora — di «tu última glucosa conocida»; aconseja reconectar el sensor primero (acercar el teléfono que lo escanea, volver a escanear), y una punción capilar si la señal no vuelve.`)
-        : `GLUCOSA: actual ${curTxt}; recientes (mg/dL): ${series || "n/d"}.`,
+          ? `GLUCOSA: SENSOR CADUCADO (los 14 días se cumplieron) — sin medición desde hace ${staleMin} min, la actual es DESCONOCIDA; última conocida ${curTxt}. Esa es la CAUSA de la falta de señal: aconseja poner un sensor NUEVO (y una punción capilar mientras tanto) — NADA de «acercar el teléfono» ni «volver a escanear», un sensor terminado no vuelve.`
+          : `GLUCOSA: SEÑAL PERDIDA (sin medición desde hace ${staleMin} min) — la actual es DESCONOCIDA; última conocida ${curTxt}. NUNCA digas «estás en X» como si fuera ahora — di «tu última glucosa conocida»; aconseja reconectar el sensor primero (acercar el teléfono que lo escanea, volver a escanear), y una punción capilar si la señal no vuelve.`)
+        : `GLUCOSA: actual ${curTxt}.`,
+      series,
       `COMIDAS RECIENTES: ${mealsTxt}.`,
       insCtx,
       actCtx,
       hint ? `SITUACIÓN (la calcula el sistema): ${hint}.` : "",
+      facts,
       `REGLAS (preguntas de diabetes): responde a su pregunta, español sencillo y breve, glucosa en mg/dL. Si menciona algo que comió o va a comer, estima los carbohidratos y rellena "meal". Si dice que se puso X unidades de insulina, rellena "insulin".`,
       `COMIDA FUTURA: si dice que VA a comer algo («voy a comer un McDonald's», «esta noche pasta»), rellena "meal" con "planned":true y tu mejor estimación de carbohidratos — el sistema añadirá la consigna de ponerse la insulina al comer.`,
       `SENSOR: si dice que su sensor está caducado / terminado o que acaba de cambiarlo, tenlo en cuenta (un sensor nuevo tarda ~1 h en arrancar) y aconseja punción capilar mientras tanto — no le digas que «vuelva a escanear» un sensor terminado.`,
@@ -225,7 +288,7 @@ function buildSystem(lang: string, p: any, cur: number | null, series: string, m
       sugarTiming,
       sugarTimingFact(lang),
       `Es un consejo, no un dispositivo médico.`,
-      `Responde SOLO en JSON: {"scope":"diabetes|general","reply":"<respuesta mostrada en mg/dL — 2-3 frases para diabetes, completa y libre para una pregunta general — SIN número de dosis>","voice":"<lo que se lee en voz alta: para una pregunta general, la respuesta completa; para diabetes, una frase. SIN número de dosis; di la glucosa SIN unidad, solo el número (ej 78, 218)>","meal":{"description":"<comida>","carbsG":<numero>,"planned":<true si futura, false si ya comida>,"basis":"stated|estimated","minutesAgo":<minutos desde que comió, 0 si ahora, NEGATIVO si es futuro (dentro de 10 min → -10)>}|null,"insulin":{"units":<numero>,"name":"<insulina>","minutesAgo":<minutos desde la inyección, 0 si ahora>}|null,"activity":{"kind":"<tipo>","description":"<texto>","intensity":"low|moderate|high","planned":<true|false>,"minutesAgo":<minutos, 0 si ahora>}|null}`,
+      `Responde SOLO en JSON: {"scope":"diabetes|general","reply":"<respuesta mostrada en mg/dL — 2-3 frases para diabetes, completa y libre para una pregunta general — SIN número de dosis>","voice":"<lo que se lee en voz alta: para una pregunta general, la respuesta completa; para diabetes, una frase. SIN número de dosis; di la glucosa SIN unidad, solo el número (ej 78, 218)>","meal":{"description":"<comida>","carbsG":<numero>,"planned":<true si futura, false si ya comida>,"basis":"stated|estimated","minutesAgo":<minutos desde que comió, 0 si ahora, NEGATIVO si es futuro (dentro de 10 min → -10)>}|null,"insulin":{"units":<numero>,"name":"<insulina>","minutesAgo":<minutos desde la inyección, 0 si ahora>}|null,"activity":{"kind":"<tipo>","description":"<texto>","intensity":"low|moderate|high","planned":<true|false>,"minutesAgo":<minutos, 0 si ahora>}|null,"noRecentInsulin":<true|false>,"pendingAnswer":"not_done"|null}`,
     ].filter(Boolean).join(" ");
   }
   return [
@@ -234,13 +297,15 @@ function buildSystem(lang: string, p: any, cur: number | null, series: string, m
     `PROFIL : ${profileLine}.`,
     signalLost
       ? (sensorExpired
-        ? `GLYCÉMIE : CAPTEUR EXPIRÉ (les 14 jours sont atteints) — plus aucune mesure depuis ${staleMin} min, l'actuelle est INCONNUE ; dernière connue ${curTxt} ; récentes (mg/dL) : ${series || "n/d"}. C'est la CAUSE de l'absence de signal : conseille de poser un NOUVEAU capteur (et un test au doigt en attendant) — PAS de « rapprocher le téléphone » ni de « re-scanner », un capteur fini ne revient pas.`
-        : `GLYCÉMIE : SIGNAL PERDU (aucune mesure depuis ${staleMin} min) — l'actuelle est INCONNUE ; dernière connue ${curTxt} ; récentes (mg/dL) : ${series || "n/d"}. Ne dis JAMAIS « tu es à X » comme si c'était maintenant — dis « ta dernière glycémie connue » ; conseille de reconnecter le capteur d'abord (rapprocher le téléphone qui le scanne, re-scanner), et un test au doigt si le signal ne revient pas.`)
-      : `GLYCÉMIE : actuelle ${curTxt} ; récentes (mg/dL) : ${series || "n/d"}.`,
+        ? `GLYCÉMIE : CAPTEUR EXPIRÉ (les 14 jours sont atteints) — plus aucune mesure depuis ${staleMin} min, l'actuelle est INCONNUE ; dernière connue ${curTxt}. C'est la CAUSE de l'absence de signal : conseille de poser un NOUVEAU capteur (et un test au doigt en attendant) — PAS de « rapprocher le téléphone » ni de « re-scanner », un capteur fini ne revient pas.`
+        : `GLYCÉMIE : SIGNAL PERDU (aucune mesure depuis ${staleMin} min) — l'actuelle est INCONNUE ; dernière connue ${curTxt}. Ne dis JAMAIS « tu es à X » comme si c'était maintenant — dis « ta dernière glycémie connue » ; conseille de reconnecter le capteur d'abord (rapprocher le téléphone qui le scanne, re-scanner), et un test au doigt si le signal ne revient pas.`)
+      : `GLYCÉMIE : actuelle ${curTxt}.`,
+    series,
     `REPAS RÉCENTS : ${mealsTxt}.`,
     insCtx,
     actCtx,
     hint ? `SITUATION (calculée par le système) : ${hint}.` : "",
+    facts,
     `RÈGLES (questions diabète) : réponds à sa question, français simple et court, glycémie en mg/dL. S'il mentionne un aliment mangé ou à venir, estime les glucides et remplis "meal". S'il dit avoir fait X unités d'insuline, remplis "insulin".`,
     `REPAS À VENIR : s'il dit qu'il VA manger quelque chose (« je vais manger un McDo », « ce soir je mange des pâtes »), remplis "meal" avec "planned":true et ta meilleure estimation de glucides — le système ajoutera la consigne de faire l'insuline au moment de manger.`,
     `CAPTEUR : s'il dit que son capteur est expiré / fini ou qu'il vient d'en changer, prends-le en compte (un capteur neuf met ~1 h à démarrer) et conseille un test au doigt en attendant — ne lui dis pas de « re-scanner » un capteur fini.`,
@@ -256,7 +321,7 @@ function buildSystem(lang: string, p: any, cur: number | null, series: string, m
     sugarTiming,
     sugarTimingFact(lang),
     `C'est un conseil, pas un dispositif médical.`,
-    `Réponds UNIQUEMENT en JSON : {"scope":"diabetes|general","reply":"<réponse affichée en mg/dL — 2-3 phrases pour le diabète, complète et libre pour une question générale — SANS chiffre de dose>","voice":"<ce qui est lu à voix haute : pour une question générale, la réponse complète ; pour le diabète, une phrase. SANS chiffre de dose ; dis la glycémie SANS unité, juste le nombre (ex 78, 218)>","meal":{"description":"<aliment>","carbsG":<nombre>,"planned":<true si à venir, false si déjà mangé>,"basis":"stated|estimated","minutesAgo":<minutes depuis qu'il a mangé, 0 si maintenant, NÉGATIF si c'est à venir (dans 10 min → -10)>}|null,"insulin":{"units":<nombre>,"name":"<insuline>","minutesAgo":<minutes depuis l'injection, 0 si maintenant>}|null,"activity":{"kind":"<type>","description":"<texte>","intensity":"low|moderate|high","planned":<true|false>,"minutesAgo":<minutes, 0 si maintenant>}|null}`,
+    `Réponds UNIQUEMENT en JSON : {"scope":"diabetes|general","reply":"<réponse affichée en mg/dL — 2-3 phrases pour le diabète, complète et libre pour une question générale — SANS chiffre de dose>","voice":"<ce qui est lu à voix haute : pour une question générale, la réponse complète ; pour le diabète, une phrase. SANS chiffre de dose ; dis la glycémie SANS unité, juste le nombre (ex 78, 218)>","meal":{"description":"<aliment>","carbsG":<nombre>,"planned":<true si à venir, false si déjà mangé>,"basis":"stated|estimated","minutesAgo":<minutes depuis qu'il a mangé, 0 si maintenant, NÉGATIF si c'est à venir (dans 10 min → -10)>}|null,"insulin":{"units":<nombre>,"name":"<insuline>","minutesAgo":<minutes depuis l'injection, 0 si maintenant>}|null,"activity":{"kind":"<type>","description":"<texte>","intensity":"low|moderate|high","planned":<true|false>,"minutesAgo":<minutes, 0 si maintenant>}|null,"noRecentInsulin":<true|false>,"pendingAnswer":"not_done"|null}`,
   ].filter(Boolean).join(" ");
 }
 
@@ -299,57 +364,13 @@ Deno.serve(async (req: Request) => {
     const readings = Array.isArray(body.readings) ? body.readings : [];
     const byokGeminiKey = typeof body.geminiKey === "string" ? body.geminiKey.trim() : "";
 
-    // ---- END OF A CONVERSATION: apply everything that was held back -----------------------------
-    // The client replays the rows it collected during the session, in the order they were said. Only
-    // the LAST of each kind survives a self-correction: saying "je vais manger des frites" and then
-    // "non finalement du riz" must log one dinner, not two. Insulin is the exception — two doses in
-    // one conversation are two real injections, and dropping one would corrupt IOB.
-    if (body.action === "commitPending") {
-      if (!subject) return json({ isError: true, text: "subject invalide" }, 400);
-      const items = Array.isArray(body.pending) ? body.pending : [];
-      const saved = { meals: 0, insulin: 0, activity: 0 };
-      const failed: string[] = [];
-      const TABLES: Record<string, string> = {
-        meals: "mechabetics_meals",
-        insulin: "mechabetics_insulin",
-        activity: "mechabetics_activity",
-      };
-      const lastOf = (kind: string) => {
-        const all = items.filter((i: any) => i?.table === kind && i?.row);
-        return kind === "insulin" ? all : all.slice(-1);
-      };
-      for (const kind of ["meals", "insulin", "activity"]) {
-        for (const it of lastOf(kind)) {
-          // The subject is taken from the AUTHENTICATED request, never from the replayed row: a
-          // client must not be able to write into someone else's record by editing what it sends back.
-          const row = { ...(it.row as Record<string, unknown>), subject };
-          const { error } = await db.from(TABLES[kind]).insert(row);
-          if (error) failed.push(kind);
-          else saved[kind as keyof typeof saved]++;
-        }
-      }
-      return json({ isError: false, saved, failed });
-    }
     const premiumVoice = body.premiumVoice !== false; // absent => premium (older installs keep voice)
-    // OPEN CONVERSATION: the mic stays on and the user keeps talking, so nothing is committed yet.
-    // The answer is still computed and spoken — only the WRITES are held, and handed back as
-    // `pending` for the client to replay through `commitPending` when the user presses stop. Someone
-    // thinking out loud corrects themselves ("finalement pas des frites, du riz"), and a row already
-    // inserted cannot be un-said. Absent => the old one-shot behaviour, writes included.
-    const deferWrites = body.defer === true;
-    // The turns already spoken in this conversation, oldest first, so a follow-up ("et sinon ?",
-    // "non, plutôt du riz") lands in context instead of being answered cold. Capped and trimmed:
-    // this is a spoken exchange, not a transcript archive.
-    const convo = (Array.isArray(body.conversation) ? body.conversation : [])
-      .slice(-8)
-      .map((t: any) => {
-        const who = t?.role === "ai"
-          ? (lang === "es" ? "Dr Claude" : "Dr Claude")
-          : (lang === "es" ? "Él" : "Lui");
-        return `${who} : ${String(t?.text ?? "").slice(0, 400)}`;
-      })
-      .filter((l: string) => l.length > 8)
-      .join("\n");
+    // A TRIAL RUN: the whole answer, and nothing written anywhere. What checks a deployment against a
+    // real record without touching it. The app never sends it.
+    const dryRun = body.defer === true;
+    // A question the app asked by itself when an alarm went off. Its wording ("je viens de prendre du
+    // sucre") is a template, not news: filed as a meal it would turn "Prends 12 g" into "laisse agir".
+    const automatic = body.auto === true;
     // The CLIENT knows the sensor's expiry (LibreLinkUp activation + 14 d) — when it says the sensor
     // is expired, a lost signal has a known cause: advise a NEW sensor, not "re-scan / move closer".
     const sensorExpired = body.sensorExpired === true;
@@ -364,84 +385,42 @@ Deno.serve(async (req: Request) => {
     }
 
     const nowMs = Date.now();
-    const rds = readings
-      .map((r: any) => ({ ts: Number(r.ts), value: Number(r.value) }))
-      .filter((r: any) => r.value > 0)
-      .sort((a: any, b: any) => (a.ts || 0) - (b.ts || 0));
-    const lastR = rds.length ? rds[rds.length - 1] : null;
-    const cur = lastR ? Math.round(lastR.value) : null;
-    const series = rds.slice(-12).map((r) => Math.round(r.value)).join(", ");
-    const hasTs = !!(lastR && Number.isFinite(lastR.ts) && lastR.ts > 0);
-    // No usable timestamp → treat as STALE (forces WAIT), never as fresh: a reading of unknown age
-    // must not yield a dose (mirrors the coach's safe default).
-    const staleMin = hasTs ? Math.round((nowMs - (lastR as any).ts) / 60000) : 999;
-    const trend = hasTs ? trendFromReadings(rds, nowMs) : "unknown";
-
-    let profile: any = null;
-    let meals: any[] = [];
-    if (subject) {
-      const { data: p } = await db.from("mechabetics_profiles").select("*").eq("subject", subject).maybeSingle();
-      profile = p;
-      // WINDOWED like the coach's: these rows are handed to the model under the heading "REPAS
-      // RÉCENTS". Without a time bound, a meal logged weeks ago is presented as something just
-      // eaten, and the model repeats that food back at the user for ever.
-      const mealsSinceIso = new Date(nowMs - 26 * 60 * 60 * 1000).toISOString();
-      const { data: m } = await db.from("mechabetics_meals")
-        .select("ts, description, carbs_g, planned").eq("subject", subject)
-        .gte("ts", mealsSinceIso)
-        // 24, not 6: every scan inserts a meal row, so a handful of scans pushed the real meal
-        // out of the window and carbs-on-board silently read 0 — the food vanished from the very
-        // balance that decides whether a fall is coming.
-        .order("ts", { ascending: false }).limit(24);
-      meals = m ?? [];
-    }
-
-    let insulinDoses: any[] = [];
-    if (subject) {
-      const { data: ins } = await db.from("mechabetics_insulin")
-        .select("ts, units, insulin_name, kind").eq("subject", subject)
-        .gte("ts", new Date(nowMs - 6 * 3600 * 1000).toISOString())
-        .order("ts", { ascending: false }).limit(8);
-      insulinDoses = ins ?? [];
-    }
-
-    let activity: any[] = [];
-    if (subject) {
-      // 14 h + duration_min: a session's after-effect runs ~12 h (ACTIVITY_TAIL_MIN), and that tail
-      // is what makes the evening hypo after an afternoon match.
-      const { data: act } = await db.from("mechabetics_activity")
-        .select("ts, kind, description, intensity, duration_min, planned").eq("subject", subject)
-        .gte("ts", new Date(nowMs - 14 * 3600 * 1000).toISOString())
-        .order("ts", { ascending: false }).limit(6);
-      activity = act ?? [];
-    }
-    // Sport reaches the DOSE here, not just the model's prose. See doseGuard's activity section.
-    const activityCut = activityBolusCut(activity, nowMs);
-
-    const gp = toGuardProfile(profile);
-    const dia = insulinActionMinutes(gp?.rapidInsulin) ?? 240; // insulin-type-aware decay (Fiasp≈4h, regular≈6h)
-    const iob = activeIob(insulinDoses, nowMs, dia);
-    const recentHypo = hasTs ? recentHypoFrom(rds, nowMs) : rds.some((r) => r.value > 0 && r.value < 70);
-    // Sugar already taken recently? Don't re-recommend sugar for a low that's already being treated.
-    const minSinceRescue = minutesSinceLastRescue(meals, nowMs);
-    // Sugar still on board — the counterweight to `iob` when asking whether a fall is coming. Not
-    // fed to computeGuard: carbs on board say where the glucose is heading, never how much insulin.
-    const cob = carbsOnBoard(meals ?? [], nowMs);
-    const guard = computeGuard({ glucoseMgdl: cur, trend, staleMin, iobUnits: iob, recentHypo, minSinceRescue, profile: gp });
-    const hint = situationHint(guard, lang);
-
-    const rates = balanceRates(meals ?? [], insulinDoses ?? [], nowMs, dia);
-    const balance = glucoseBalance(cur, iob, cob, gp, rates);
-    // The sugar side of insCtx, which never had one. Appended to it so the model reads the two
-    // forces together instead of hearing about the insulin and guessing about the food.
-    const balCtx = balanceSystemLine(balance, lang);
-    const insCtx = [insulinContext(insulinDoses, iob, dia, nowMs, lang), balCtx].filter(Boolean).join(" ");
-    const actCtx = activityContext(activity, lang);
-    // Match the client's NO SIGNAL window (5 min): a stale last reading means the LIVE value is
-    // unknown — the spoken reply must not assert "tu es à X", only the LAST KNOWN value.
-    const signalLost = cur != null && (!hasTs || (nowMs - (lastR as any).ts) > STALE_MIN * 60000);
+    const empty: EngineData = {
+      profile: null, stored: [], ...mergeReadings([], readings, nowMs), insulin: [], meals: [], activity: [],
+      model: null, modelFittedAt: null,
+    };
+    // Same data as the analysis, including the stored history: the voice used to judge the trend from
+    // the twelve readings the phone happened to send.
+    const data = subject ? await loadEngineData(db, subject, nowMs, readings, 6) : empty;
+    if (subject && !dryRun) await storePhoneReadings(db, subject, data.accepted);
+    const profile = data.profile;
+    const tzOffsetMin = tzOffsetOf(body, profile);
+    const memory = subject ? await loadConversationMemory(db, subject, nowMs) : { turns: [], lastAction: null };
+    const engine = (meals: any[], insulin: any[], prof: any) => buildState({
+      nowMs, lang, tzOffsetMin, profile: prof, readings: data.series, insulin, meals, activity: data.activity,
+      sensorExpired, model: data.model,
+    });
+    // THE SAME DECISION AS THE ANALYSIS, known before the model writes a word.
+    const state0 = engine(data.meals, data.insulin, profile);
+    const decision0 = decideAction(state0);
+    const ahead0 = anticipate(state0, decision0);
+    const { cur, guard, iob, signalLost, staleMin } = state0;
+    const hint = decisionHint(state0, decision0);
+    const recentInsulin = data.insulin.filter((d: any) => new Date(d.ts).getTime() > nowMs - 8 * 3600000);
+    const insCtx = insulinContext(recentInsulin, iob, nowMs, lang);
+    const actCtx = activityContext(data.activity, lang);
     const pr = await loadPrompts(lang);
-    const sys = buildSystem(lang, profile, cur, series, meals, pr, insCtx, actCtx, hint, signalLost, staleMin, sensorExpired);
+    const facts = [factsForTheVoice(state0, decision0, memory, lang), signalLost ? "" : engineFacts(state0, decision0, ahead0)].filter(Boolean).join(" ");
+    const sys = buildSystem(lang, profile, cur, signalLost ? "" : timedSeries(state0), data.meals, pr, insCtx, actCtx, hint, signalLost, staleMin, sensorExpired, facts);
+    // The turns spoken in the last minutes, oldest first, so "et sinon ?" or "non, plutôt du riz" lands
+    // in context instead of being answered cold. From the phone if it sent them, otherwise from the
+    // log: the app was sending none, and every question met a stranger.
+    const sentTurns = (Array.isArray(body.conversation) ? body.conversation : [])
+      .slice(-8)
+      .map((t: any) => `${t?.role === "ai" ? "Dr Claude" : (lang === "es" ? "Él" : "Lui")} : ${String(t?.text ?? "").slice(0, 400)}`)
+      .filter((l: string) => l.length > 8);
+    const convo = (sentTurns.length ? sentTurns : memory.turns.map((t) =>
+      `${lang === "es" ? "Él" : "Lui"} : ${t.question.slice(0, 300)}\nDr Claude : ${t.reply.slice(0, 400)}`)).join("\n");
 
     let raw = "";
     try {
@@ -467,14 +446,17 @@ ${lang === "es" ? "AHORA dice:" : "MAINTENANT il dit :"} ${question}`
       // whether to wait, recharge, or fix a key — instead of one opaque "AI not responding".
       const kind = llmErrorKind(e);
       const head = llmErrorMessage(kind, lang, false) /* text runs on the service key only */;
-      const show = !(guard.reason === "in_range" || guard.reason === "no_reading");
-      const out = show
-        ? `${head}\n\n${lang === "es" ? "Acción" : "Action"} : ${combinedActionLine(guard, 0, lang, gp)}`
-        : head;
-      return json({ text: out, isError: true, errorKind: kind });
+      const show = guard.reason !== "no_reading";
+      const out = show ? `${head}\n\n${lang === "es" ? "Acción" : "Action"} : ${decision0.line}` : head;
+      if (show && !dryRun && dosePutForward(decision0)) await rememberNamedDose(db, subject as string, state0, decision0);
+      return json({
+        text: out, isError: true, errorKind: kind, actionLine: show ? decision0.line : "",
+        decision: decisionPayload(state0, decision0, ahead0),
+      });
     }
     let parsed: any = {};
     try { parsed = JSON.parse(raw); } catch { parsed = {}; }
+    if (automatic) parsed = { ...parsed, meal: null, insulin: null, activity: null, noRecentInsulin: false, pendingAnswer: null };
     const replyRaw = (typeof parsed.reply === "string" && parsed.reply.trim()) ? parsed.reply.trim() : extractStr(raw, "reply");
     let reply: string = replyRaw || (raw && !raw.trim().startsWith("{") ? raw : didntCatch);
     const voiceRaw = (typeof parsed.voice === "string" && parsed.voice.trim()) ? parsed.voice.trim() : extractStr(raw, "voice");
@@ -489,150 +471,125 @@ ${lang === "es" ? "AHORA dice:" : "MAINTENANT il dit :"} ${question}`
     // ----- CODE OWNS THE DOSE -----
     const mealCarbs = (parsed.meal && typeof parsed.meal === "object" && Number.isFinite(Number(parsed.meal.carbsG)))
       ? Math.min(300, Math.max(0, Math.round(Number(parsed.meal.carbsG)))) : null; // clamp a hallucinated/injected carb count
-    // Food fallback: only bolus carbs the user actually STATED. A vague/guessed carb count gets a
-    // "log it for a precise dose" nudge instead of a firm number (safety > convenience).
     const mealStated = !!(parsed.meal && typeof parsed.meal === "object" && parsed.meal.basis === "stated");
-    // NO MEAL BOLUS INTO A FALL ALREADY OWED. The dashboard got this guard; the voice and the photo
-    // did not, and they name doses too — so "3 u pour ce repas" at 85 mg/dL with 3.4 u still working
-    // was reachable from here exactly as it was from the home screen. The insulin already in keeps
-    // going whatever the number on screen says.
-    const mealUnitsRaw = mealStated ? mealBolusUnits(mealCarbs, gp) : 0;
-    // Weighed against the FOOD too: judged on the insulin alone this refused the bolus for a whole
-    // menu because a dose from three hours earlier was still tailing off (the McDo report).
-    const mealHeld = mealUnitsRaw > 0 && mealBolusHeldByIob(cur, iob, gp, cob, rates);
-    const mealUnits = mealHeld ? 0 : mealUnitsRaw;
     const mealEstimated = !!mealCarbs && !mealStated;
-    // An ANNOUNCED future meal ("je vais manger un McDo"): its bolus happens AT EATING TIME, never
-    // now — combinedActionLine words it accordingly, and the estimated case gets plannedMealNote.
+    const hasMeal = !!(parsed.meal && typeof parsed.meal === "object" && parsed.meal.description);
     const mealPlanned = !!(parsed.meal && typeof parsed.meal === "object" && parsed.meal.planned === true);
-
-    // SAFETY (overdose guard): if the user just told us they injected a dose, count it toward
-    // insulin-on-board NOW and re-run the guard, so we NEVER stack a correction on top of a dose
-    // already taken. If the reported dose is clearly more than (meal + the correction we'd advise),
-    // treat it as an over-dose: no more insulin + an explicit hypo-watch, overriding everything.
     const reportedUnits = (parsed.insulin && typeof parsed.insulin === "object" && Number.isFinite(Number(parsed.insulin.units)))
       ? Math.min(50, Math.max(0, Number(parsed.insulin.units))) : 0; // clamp so a garbage value can't poison IOB or show an absurd dose
-    let guardForAction = guard;
-    if (reportedUnits > 0) {
-      // Backdate the reported dose if the user said when ("il y a 3h") so its IOB contribution is
-      // computed from the real injection time, not "now" (which would overstate it).
-      const repTs = backdatedIso(parsed.insulin?.minutesAgo, nowMs);
-      const repMs = repTs ? new Date(repTs).getTime() : nowMs;
-      const iob2 = activeIob([...insulinDoses, { ts: repMs, units: reportedUnits, kind: "rapid", insulin_name: gp?.rapidInsulin }], nowMs, dia);
-      guardForAction = computeGuard({ glucoseMgdl: cur, trend, staleMin, iobUnits: iob2, recentHypo, minSinceRescue, profile: gp });
-    }
-    const expectedUnits = mealUnits + (guard.kind === "correction" ? guard.insulinUnits : 0);
-    const overReported = reportedUnits > 0 && reportedUnits > expectedUnits + 1;
 
-    const insulinForbidden = overReported || (guardForAction.maxInsulinUnits === 0 && mealUnits === 0);
-    if (insulinForbidden) { reply = stripInsulinNumbers(reply) || reply; voice = stripInsulinNumbers(voice) || voice; }
-    // Insulin allowed: the answer still may not name MORE units than the system decided (correction
-    // plus the meal bolus, which is the legitimate total here). Previously unchecked.
-    // Must clear the doses the question and the context legitimately contain — the user says "j'ai
-    // fait 6 unités", the prompt states the active insulin, and the honest answer echoes both.
-    // Judged against the bolus alone, "tes 6 unités couvrent bien les 60 g" came out as "tes
-    // couvrent bien les 60 g". Reporting a dose is not proposing one.
+    // Announced meals keep their stated TIME, not just a "planned" flag: "dans 10 minutes" is stored
+    // 10 minutes ahead, so the whole app can anticipate it and it becomes an ordinary eaten meal on its
+    // own once that moment passes (isEatenBy). An announced meal with no stated time gets a short lead
+    // so flag and clock can never disagree.
+    const statedTs = offsetIso(parsed.meal?.minutesAgo, nowMs);
+    const announced = !statedTs && mealPlanned;
+    const mealTs = announced ? new Date(nowMs + ANNOUNCED_MEAL_LEAD_MIN * 60000).toISOString() : statedTs;
+    // Planned means it has not happened yet. "Dans 3 minutes" stored as eaten, with a time still ahead,
+    // was neither eaten nor announced: invisible to the decision until that time came.
+    const plannedFromTs = mealTs ? Date.parse(mealTs) > nowMs : false;
+    const insTs = offsetIso(parsed.insulin?.minutesAgo, nowMs);
+
+    // Said again, it is not a second meal or a second dose. Nothing new is written or counted.
+    const mealDesc = hasMeal ? String(parsed.meal.description).slice(0, 240) : "";
+    // A background insulin said out loud is a background insulin: stored as rapid, 14 u of Lantus read
+    // as a dose that covers the next meal. With no name from the model, the word beside the figure decides.
+    const saidName = parsed.insulin?.name ? String(parsed.insulin.name).slice(0, 80) : null;
+    const saidBasal = saidName
+      ? isBasalInsulin(saidName) || /\b(lente|lenta|basale?)\b/i.test(saidName)
+      : saidBasalDose(question, reportedUnits);
+    const mealAgain = hasMeal && !saysAnotherPlate(question, mealDesc) &&
+      mealSaidAgain(data.meals, mealDesc, mealCarbs, mealTs ? Date.parse(mealTs) : nowMs, mealStated);
+    const doseAgain = reportedUnits > 0 && !saysAnotherDose(question) &&
+      doseSaidAgain(data.insulin, reportedUnits, insTs ? Date.parse(insTs) : nowMs, saidBasal);
+    const doseName = saidBasal
+      ? (isBasalInsulin(saidName) ? saidName : (profile?.basal_insulin ?? saidName))
+      : (saidName ?? profile?.rapid_insulin ?? null);
+    const doseKind = saidBasal ? "basal" : "rapid";
+
+    // WHAT WAS JUST SAID COUNTS EXACTLY LIKE WHAT IS LOGGED. A meal or a dose stated in this sentence
+    // joins the rows and the very same decision runs again: the voice can no longer reach an answer
+    // the analysis would not give a second later, once the row is in the table.
+    const saidMeal = hasMeal && !mealAgain
+      ? [{ ts: mealTs ?? new Date(nowMs).toISOString(), description: mealDesc, carbs_g: mealCarbs, planned: plannedFromTs, carbs_estimated: mealEstimated }]
+      : [];
+    const saidDose = reportedUnits > 0 && !doseAgain
+      ? [{ ts: insTs ?? new Date(nowMs).toISOString(), units: reportedUnits, kind: doseKind, insulin_name: doseName }]
+      : [];
+    // What turns a conditional dose into a firm one: it has to have been said, in words, about this.
+    // The model's flag alone is not enough, and a general question has nothing to do with insulin.
+    const saidNoInsulin = scope !== "general" && parsed.noRecentInsulin === true && reportedUnits <= 0 &&
+      /\b(non|pas|rien|aucune?|jamais|no|nada|ninguna?|sin)\b/i.test(question);
+    const saidNotDone = scope !== "general" && parsed.pendingAnswer === "not_done";
+    const profileNow = profile
+      ? {
+        ...profile,
+        ...(saidNoInsulin ? { no_insulin_confirmed_at: new Date(nowMs).toISOString(), pending_action: null } : {}),
+        ...(saidNotDone ? { pending_action: null } : {}),
+      }
+      : profile;
+    const state = engine([...saidMeal, ...data.meals], [...saidDose, ...data.insulin], profileNow);
+    let decision = decideAction(state);
+
+    // They already took more than this moment calls for: no more insulin, and a hypo watch. Only for a
+    // dose taken about now; one from three hours ago has nothing to say about this moment's need. What
+    // this moment calls for includes what the engine was about to name: "il a fait 3 u" with 120 g in
+    // the log is a dose short of the meal, not one too many.
+    const justTaken = reportedUnits > 0 && !saidBasal && !doseAgain && Math.abs(Number(parsed.insulin?.minutesAgo) || 0) <= 60;
+    const expectedUnits = mealBolusUnits(mealCarbs, state0.gp)
+      + Math.max(decision0.units, decision0.laterUnits, state0.pending?.units ?? 0, guard.kind === "correction" && !decision0.capped ? guard.insulinUnits : 0);
+    const overReported = justTaken && reportedUnits > expectedUnits + 1;
+    // It replaces the decision itself, so sentence, buttons and memory all say the same thing. Never a
+    // low: 60 mg/dL with 3 u just given is the worst moment to say "watch for a hypo" instead of grams.
+    if (overReported && decision.kind !== "sugar" && decision.kind !== "signal") {
+      decision = {
+        ...decision, kind: "hold", units: 0, laterUnits: 0, split: false, nothingDue: true, insulinForbidden: true,
+        line: lang === "es"
+          ? "Ninguna insulina más ahora; vigila una posible hipo y ten azúcar rápido a mano, recontrola en 15 min."
+          : "Aucune insuline en plus pour l'instant ; surveille une possible hypo et garde du sucre rapide à portée, recontrôle dans 15 min.",
+      };
+    }
+    const ahead = anticipate(state, decision);
+    const payload = decisionPayload(state, decision, ahead);
+
+    if (decision.insulinForbidden) { reply = stripInsulinNumbers(reply) || reply; voice = stripInsulinNumbers(voice) || voice; }
     else {
-      const ctxUnits = Math.max(iob || 0, ...((insulinDoses ?? []) as any[]).map((d) => Number(d?.units) || 0), 0);
-      const ceiling = { ...guardForAction, maxInsulinUnits: guardForAction.maxInsulinUnits + Math.max(0, mealUnits || 0) + ctxUnits };
+      const ceiling = { ...state.guard, maxInsulinUnits: decision.proseCeiling };
       reply = enforceInsulinCeiling(reply, ceiling) || reply;
       voice = enforceInsulinCeiling(voice, ceiling) || voice;
     }
 
     let text = reply;
     let voiceText = voice;
+    const label = lang === "es" ? "Acción" : "Action";
+    let actionLine = "";
     if (scope === "general") {
-      // A general answer stays a PURE answer — no diabetic Action appended, nothing logged. The one
-      // exception is a LIVE hypo (the kid may be asking about homework while at 55): the code-owned
-      // sugar action always wins. Everything else (alarms, banners) is the rest of the app's job.
-      if (!signalLost && guard.kind === "sugar") {
-        const label = lang === "es" ? "Acción" : "Action";
-        const line = combinedActionLine(guard, 0, lang, gp);
-        text = `${text}\n\n${label} : ${line}`;
-        voiceText = `${voiceText} ${line}`.trim();
+      // A general answer stays a PURE answer. The one exception is a LIVE hypo (the kid may be asking
+      // about homework while at 55): the code-owned sugar action always wins.
+      if (decision.kind === "sugar") {
+        actionLine = decision.line;
+        text = `${text}\n\n${label} : ${decision.line}`;
+        voiceText = `${voiceText} ${speakable(decision.line, lang)}`.trim();
       }
-    } else if (signalLost) {
-      // Reading is older than the 5-min NO SIGNAL window → the LIVE value is unknown, so NEVER append a
-      // dose/sugar action off it (mirrors coach + the screen's own NO SIGNAL state). Tell them to
-      // reconnect / fingerstick instead — or to REPLACE the sensor when we know it's expired — and
-      // strip any dose the model may have stated in its prose.
-      const safeReply = stripInsulinNumbers(reply) || reply;
-      const safeVoice = stripInsulinNumbers(voice) || voice;
-      const label = lang === "es" ? "Acción" : "Action";
-      const line = sensorExpired
-        ? (lang === "es"
-          ? "Sensor caducado: pon un sensor NUEVO lo antes posible (cuenta ~1 h de arranque); mientras tanto, decide solo con una punción capilar."
-          : "Capteur expiré : pose un NOUVEAU capteur dès que possible (compte ~1 h de démarrage) ; en attendant, décide uniquement avec un test au doigt.")
-        : (lang === "es"
-          ? "Señal perdida: reconecta el sensor (acerca el teléfono que lo escanea, vuelve a escanear); si no vuelve, hazte una punción capilar antes de cualquier decisión."
-          : "Signal perdu : reconnecte le capteur (rapproche le téléphone qui le scanne, re-scanne) ; s'il ne revient pas, fais un test au doigt avant toute décision.");
-      text = `${safeReply}\n\n${label} : ${line}`;
-      voiceText = `${safeVoice} ${line}`.trim();
-    } else if (overReported) {
-      // They already took more than enough — never suggest more insulin; warn about a coming hypo.
-      const label = lang === "es" ? "Acción" : "Action";
-      const noMore = lang === "es"
-        ? "ninguna insulina más ahora; vigila una posible hipo y ten azúcar rápido a mano, recontrola en 15 min."
-        : "aucune insuline en plus pour l'instant ; surveille une possible hypo et garde du sucre rapide à portée, recontrôle dans 15 min.";
-      text = `${reply}\n\n${label} : ${noMore}`;
-      voiceText = `${voice} ${noMore}`.trim();
     } else {
-      // Show the code action line for every dose-relevant situation (incl. blocked highs:
-      // falling/post-hypo/covered/stale -> explicit "aucune insuline"). Stay silent only for a
-      // plain in-range reading or when there's no glucose data at all.
-      const showAction = mealUnits > 0 || mealPlanned ||
-        !(guardForAction.reason === "in_range" || guardForAction.reason === "no_reading");
-      if (showAction) {
-        // A meal ANNOUNCED for later is the forward-looking case the whole app exists for ("si je
-        // mange 30 sucres dans 10 minutes, combien d'insuline ?"): answer it BEFORE the meal, with
-        // the dose, what the carbs would do uncovered and when to inject — instead of waiting for
-        // the glucose to rise and reacting to it. planMealDose delegates the correction half to
-        // computeGuard, so every no-insulin invariant still holds.
-        const line = mealPlanned && (mealCarbs ?? 0) > 0
-          ? mealPlanLine(planMealDose({
-              glucoseMgdl: cur, trend, staleMin, iobUnits: iob,
-              carbsG: mealCarbs, description: parsed.meal?.description, cobGrams: cob, rates,
-              minutesUntilMeal: minutesUntil(parsed.meal?.minutesAgo),
-              minSinceRescue, recentHypo, activityCut, profile: gp,
-            }), lang, gp)
-          : mealHeld
-            ? mealBolusHeldLine(cur as number, iob, gp, lang, cob)
-            : combinedActionLine(guardForAction, mealUnits, lang, gp, mealPlanned, null,
-              { glucoseMgdl: cur, trend, activityCut, iobUnits: iob, cobGrams: cob });
-        const label = lang === "es" ? "Acción" : "Action";
-        text = `${reply}\n\n${label} : ${line}`;
-        voiceText = `${voice} ${speakable(line, lang)}`.trim();
+      // ALWAYS AN ACTION, on every diabetes question, and the same sentence as the analysis.
+      actionLine = decision.line;
+      text = `${text}\n\n${label} : ${decision.line}`;
+      voiceText = `${voiceText} ${speakable(decision.line, lang)}`.trim();
+      if (ahead) {
+        text = `${text}\n\n${lang === "es" ? "A prever" : "À prévoir"} : ${ahead.line}`;
+        voiceText = `${voiceText} ${speakable(ahead.line, lang)}`.trim();
       }
-      // Hypo while rapid insulin is still active → it'll keep falling, one rescue may not hold; warn
-      // (the grams are already bumped for IOB by the guard) so the parent rechecks sooner + re-treats.
-      if (guardForAction.kind === "sugar") {
-        const warn = hypoIobWarning(iob, lang);
-        if (warn) { text = `${text}\n\n${warn}`; voiceText = `${voiceText} ${warn.replace("⚠️", "").trim()}`.trim(); }
+      const likely = signalLost ? "" : forecastLine(state.forecast, lang);
+      if (likely) text = `${text}\n\n${lang === "es" ? "Previsión" : "Prévision"} : ${likely}`;
+      for (const n of sideNotes(state, decision)) {
+        text = `${text}\n\n${n.display}`;
+        voiceText = `${voiceText} ${n.voice}`.trim();
       }
-      // Sport, stated next to the number it changed — same contract as the analysis card.
-      const pre = preSportCarbsLine(activity, nowMs, cur, lang);
-      if (pre) { text = `${text}\n\n${pre}`; voiceText = `${voiceText} ${speakable(pre, lang)}`.trim(); }
-      // The reduction is only CLAIMED when a dose was actually named — "réduite de 30 %" under
-      // "aucune insuline" is the kind of contradiction this codebase keeps hunting down.
-      const act = activityNote(activity, nowMs, activityCut, lang,
-        guardForAction.kind === "correction" || mealUnits > 0);
-      if (act) { text = `${text}\n\n${act}`; voiceText = `${voiceText} ${speakable(act.replace("🏃", ""), lang)}`.trim(); }
-      // Estimated (not user-stated) carbs -> no firm number. For an ANNOUNCED future meal, the note
-      // still says PLAINLY that insulin will be needed at eating time and whether any dose is on
-      // record (the McDo case); otherwise, the usual "log it for a precise dose" nudge.
-      if (mealEstimated && guardForAction.kind !== "sugar" && mealPlanned && mealCarbs <= 0) {
-        const recentRapid = (insulinDoses || []).some((d: any) => {
-          if (!d || d.kind === "basal") return false;
-          const t = new Date(d.ts).getTime();
-          return Number.isFinite(t) && t <= nowMs + 60000 && nowMs - t <= 45 * 60000;
-        });
-        const note = plannedMealNote(mealCarbs, recentRapid, lang);
-        text = `${text}\n\n${note}`;
-        voiceText = `${voiceText} ${note}`.trim();
-      } else if (mealEstimated) {
+      if (mealEstimated && decision.kind !== "sugar" && !signalLost) {
         const nudge = lang === "es"
-          ? "Para una dosis de comida precisa, registra los carbohidratos (pestaña Comidas o escanea el producto)."
-          : "Pour une dose de repas précise, logge les glucides (onglet Repas ou scanne le produit).";
+          ? "Son carbohidratos estimados: para una dosis más precisa, anótalos en la pestaña Comidas o escanea el producto."
+          : "Ces glucides sont estimés : pour une dose plus précise, note-les dans l'onglet Repas ou scanne le produit.";
         text = `${text}\n\n${nudge}`;
       }
     }
@@ -642,7 +599,7 @@ ${lang === "es" ? "AHORA dice:" : "MAINTENANT il dit :"} ${question}`
     // For sugar-to-treat-a-low (guard "sugar") or a food merely mentioned in passing (no firm dose),
     // tacking "X g = N sucres" onto the end is noise and can even contradict the user (they said
     // "3 sucres", we'd round 15 g back to "4 sucres") — so we skip it there.
-    if (mealUnits > 0 && guardForAction.kind !== "sugar") {
+    if ((decision.units > 0 || decision.laterUnits > 0) && mealCarbs && decision.kind !== "sugar" && scope !== "general") {
       const cn = lang === "es"
         ? `${mealCarbs} g de carbohidratos (${carbsCubesPhrase(mealCarbs, "es")}).`
         : `${mealCarbs} g de glucides (${carbsCubesPhrase(mealCarbs, "fr")}).`;
@@ -660,7 +617,9 @@ ${lang === "es" ? "AHORA dice:" : "MAINTENANT il dit :"} ${question}`
     // Carb SPEED → timing advice: fast sugar (pre-bolus, quick spike normal) vs slow/fatty (late
     // rise, recheck later — fatty also gets the split-bolus note). Skip during a hypo rescue
     // (guard "sugar"): telling someone treating a low to "pre-bolus next time" is contradictory.
-    if (parsed.meal && typeof parsed.meal === "object" && guardForAction.kind !== "sugar") {
+    const eatenForALow = hasMeal && eatenAsTreatment(mealTs ? Date.parse(mealTs) : nowMs, state.readings, mealCarbs, mealDesc);
+    const doseStands = (decision.units > 0 || decision.laterUnits > 0) && !decision.capped;
+    if (parsed.meal && typeof parsed.meal === "object" && decision.kind !== "sugar" && !eatenForALow && doseStands) {
       const speed = mealCarbSpeed(parsed.meal.description);
       const adv = carbSpeedAdvice(speed, lang, mealPlanned);
       if (adv) {
@@ -671,78 +630,79 @@ ${lang === "es" ? "AHORA dice:" : "MAINTENANT il dit :"} ${question}`
       }
     }
 
+    // Treated as already known: said, so the mistake can be seen and put right. Taken for a repeat, a
+    // real dose would otherwise vanish behind the model's "c'est noté".
+    if (doseAgain) {
+      const known = lang === "es"
+        ? "Esta dosis ya está anotada: no la cuento dos veces. Si es otra, di «me he puesto otra»."
+        : "Cette dose est déjà notée : je ne la compte pas deux fois. Si c'en est une autre, dis « j'en ai refait une ».";
+      text = `${text}\n\n${known}`;
+      voiceText = `${voiceText} ${known}`.trim();
+    }
+    if (mealAgain) {
+      const known = lang === "es"
+        ? "Esta comida ya está anotada: no la cuento dos veces. Si es otra, di «otra ración»."
+        : "Ce repas est déjà noté : je ne le compte pas deux fois. Si c'en est un autre, dis « encore un ».";
+      text = `${text}\n\n${known}`;
+      voiceText = `${voiceText} ${known}`.trim();
+    }
+
     // Auto-log the meal/dose the AI extracted. A FAILED write used to be SILENT — the reply still
     // said "noted" — so the user could believe a meal/dose was tracked when it wasn't. That's
     // dangerous for insulin (a missing dose breaks IOB → a later correction could stack on it).
     // We now check every write, warn explicitly, and flag `logFailed` for the client.
     let logFailed = false;
     let loggedMeal: any = null;
-    // Rows the answer WOULD have written, held back while the conversation is open (see `defer`).
-    const pending: { table: string; row: Record<string, unknown> }[] = [];
-    if (subject && parsed.meal && typeof parsed.meal === "object" && parsed.meal.description) {
-      // Announced meals keep their stated TIME, not just a "planned" flag: "dans 10 minutes" is
-      // stored 10 minutes ahead, so the whole app can anticipate it and so it becomes an ordinary
-      // eaten meal on its own once that moment passes (isEatenBy).
-      // ONE source of truth for "planned": the timestamp. The model's own flag used to be stored
-      // ALONGSIDE a `ts` of now whenever it said "planned" without saying when — and that row is a
-      // contradiction the rest of the app cannot resolve. It happened on "je vais manger œuf,
-      // burrata, tomates et frites": the meal was stamped now AND flagged prévu, so forty-five
-      // minutes later carbsOnBoard counted it as digesting while the analysis still announced it as
-      // upcoming and asked the user to log the meal they had just logged. An announced meal with no
-      // stated time is therefore stamped a short lead AHEAD, so flag and clock agree — and the clock
-      // turns it into an ordinary eaten meal on its own once that moment passes (isEatenBy).
-      const statedTs = offsetIso(parsed.meal.minutesAgo, nowMs);
-      const announced = !statedTs && parsed.meal.planned === true;
-      const mealTs = announced
-        ? new Date(nowMs + ANNOUNCED_MEAL_LEAD_MIN * 60000).toISOString()
-        : statedTs;
-      const plannedFromTs = mealTs ? Date.parse(mealTs) > nowMs + 5 * 60000 : false;
+    let wroteSomething = false;
+    const writing = !!subject && !dryRun;
+    if (writing && saidMeal.length) {
       loggedMeal = {
         subject,
-        description: String(parsed.meal.description).slice(0, 240),
+        description: mealDesc,
         carbs_g: mealCarbs,
         planned: plannedFromTs,
+        carbs_estimated: mealEstimated,
         ...(mealTs ? { ts: mealTs } : {}),
       };
-      // DEFERRED (open conversation): nothing is written while the user is still talking. They may
-      // correct themselves three sentences later — "non, pas des frites, du riz" — and a row already
-      // in the table cannot be taken back. Everything is applied at once when they press stop.
-      const { error: mErr } = deferWrites
-        ? (pending.push({ table: "meals", row: loggedMeal }), { error: null } as any)
-        : await db.from("mechabetics_meals").insert(loggedMeal);
+      const { error: mErr } = await db.from("mechabetics_meals").insert(loggedMeal);
+      wroteSomething = wroteSomething || !mErr;
       if (mErr) {
         loggedMeal = null;
         logFailed = true;
-        text += `\n\n${lang === "es"
+        const warning = lang === "es"
           ? "⚠️ No pude registrar esta comida — vuelve a anotarla en la pestaña Comidas."
-          : "⚠️ Je n'ai pas pu enregistrer ce repas — re-note-le dans l'onglet Repas."}`;
+          : "⚠️ Je n'ai pas pu enregistrer ce repas — re-note-le dans l'onglet Repas.";
+        text += `\n\n${warning}`;
+        voiceText = `${voiceText} ${warning.replace("⚠️ ", "")}`.trim();
       }
     }
 
     // Log an insulin dose if the user reported one ("j'ai fait X u de NovoRapid").
-    if (subject && reportedUnits > 0) {
-      const insTs = offsetIso(parsed.insulin?.minutesAgo, nowMs);
+    if (writing && saidDose.length) {
       const insulinRow = {
         subject,
         units: reportedUnits, // the CLAMPED value — never store a garbage dose that would corrupt future IOB
-        insulin_name: parsed.insulin.name ? String(parsed.insulin.name).slice(0, 80) : (profile?.rapid_insulin ?? null),
-        kind: "rapid",
-        ...(insTs ? { ts: insTs } : {}),
+        insulin_name: doseName,
+        kind: doseKind,
+        // The time the sum used. Left to the database it comes after the model's answer, later than
+        // the knownDoseAt stored with it, and this dose then reads as the answer to its own question.
+        ts: saidDose[0].ts,
       };
-      const { error: iErr } = deferWrites
-        ? (pending.push({ table: "insulin", row: insulinRow }), { error: null } as any)
-        : await db.from("mechabetics_insulin").insert(insulinRow);
+      const { error: iErr } = await db.from("mechabetics_insulin").insert(insulinRow);
+      wroteSomething = wroteSomething || !iErr;
       if (iErr) {
         logFailed = true;
         // Safety-critical: an unrecorded dose breaks future IOB → a later correction could stack on it.
-        text += `\n\n${lang === "es"
+        const warning = lang === "es"
           ? "⚠️ NO pude registrar esta dosis de insulina. Anótala a mano en la pestaña Insulina, o el cálculo de insulina activa será erróneo."
-          : "⚠️ Je n'ai PAS pu enregistrer cette dose d'insuline. Note-la à la main dans l'onglet Insuline, sinon le calcul d'insuline active sera faux."}`;
+          : "⚠️ Je n'ai PAS pu enregistrer cette dose d'insuline. Note-la à la main dans l'onglet Insuline, sinon le calcul d'insuline active sera faux.";
+        text += `\n\n${warning}`;
+        voiceText = `${voiceText} ${warning.replace("⚠️ ", "")}`.trim();
       }
     }
 
     // Log a physical activity if mentioned ("je vais courir", "j'ai fait du foot").
-    if (subject && parsed.activity && typeof parsed.activity === "object" && (parsed.activity.kind || parsed.activity.description)) {
+    if (writing && parsed.activity && typeof parsed.activity === "object" && (parsed.activity.kind || parsed.activity.description)) {
       const actTs = offsetIso(parsed.activity.minutesAgo, nowMs);
       const activityRow = {
         subject,
@@ -752,10 +712,30 @@ ${lang === "es" ? "AHORA dice:" : "MAINTENANT il dit :"} ${question}`
         planned: !!parsed.activity.planned,
         ...(actTs ? { ts: actTs } : {}),
       };
-      const { error: aErr } = deferWrites
-        ? (pending.push({ table: "activity", row: activityRow }), { error: null } as any)
-        : await db.from("mechabetics_activity").insert(activityRow);
-      if (aErr) logFailed = true;
+      const { error: aErr } = await db.from("mechabetics_activity").insert(activityRow);
+      wroteSomething = wroteSomething || !aErr;
+      if (aErr) {
+        logFailed = true;
+        const warning = lang === "es"
+          ? "⚠️ No pude registrar esta actividad — vuelve a anotarla en la pestaña Deporte."
+          : "⚠️ Je n'ai pas pu enregistrer cette activité — re-note-la dans l'onglet Sport.";
+        text += `\n\n${warning}`;
+        voiceText = `${voiceText} ${warning.replace("⚠️ ", "")}`.trim();
+      }
+    }
+
+    if (writing) {
+      if (saidNoInsulin) await confirmNoRecentInsulin(db, subject as string, nowMs);
+      else if (saidNotDone) await clearNamedDose(db, subject as string);
+      if (dosePutForward(decision) && scope !== "general") await rememberNamedDose(db, subject as string, state, decision);
+      // Written down, so the next question has a memory and the family has a record. Off-topic
+      // answers are answered well but not kept: the rule since the start.
+      if (scope !== "general") {
+        const { error: vErr } = await db.from("mechabetics_voice_log").insert({
+          subject, question: question.slice(0, 500), reply: text.slice(0, 2000), action: actionLine || null, scope,
+        });
+        if (vErr) console.error("ask: voice log not written:", vErr.message);
+      }
     }
 
     let audioBase64: string | null = null;
@@ -772,7 +752,12 @@ ${lang === "es" ? "AHORA dice:" : "MAINTENANT il dit :"} ${question}`
 
     // `scope` lets the client treat a general answer as transient (spoken/shown, never persisted
     // as an analysis) — the user's rule: off-topic answers are answered well but not kept.
-    return json({ text, voice: voiceText, audioBase64, mime: "audio/mpeg", isError: false, meal: deferWrites ? null : loggedMeal, logFailed, scope, pending: deferWrites ? pending : undefined });
+    return json({
+      text, voice: voiceText, audioBase64, mime: "audio/mpeg", isError: false, meal: loggedMeal,
+      logFailed, scope, actionLine, decision: scope === "general" ? null : payload,
+      // Something went on record: an analysis on screen no longer describes the moment.
+      logged: wroteSomething || (writing && (saidNoInsulin || saidNotDone)),
+    });
   } catch (e) {
     return json({ text: `Erreur serveur: ${(e as Error)?.message ?? e}`, isError: true });
   }
