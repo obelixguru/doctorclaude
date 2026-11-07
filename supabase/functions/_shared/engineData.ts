@@ -121,8 +121,9 @@ export async function loadEngineData(
     db.from("mechabetics_profiles").select("*").eq("subject", subject).maybeSingle(),
     loadStoredReadings(db, subject, nowMs - hours * 3600000),
     // Eight hours: a dose is only spent after six, and regular insulin runs longer still. A cap of
-    // six rows hid doses on the days a family logs properly.
-    db.from("mechabetics_insulin").select("ts, units, insulin_name, kind").eq("subject", subject)
+    // six rows hid doses on the days a family logs properly. `created_at` is when it was told, which
+    // can be hours after it was injected: see insulinKnowledge.
+    db.from("mechabetics_insulin").select("ts, units, insulin_name, kind, created_at").eq("subject", subject)
       .gte("ts", since(36)).order("ts", { ascending: false }).limit(40),
     db.from("mechabetics_meals").select("id, ts, description, carbs_g, planned, carbs_estimated").eq("subject", subject)
       .gte("ts", since(26)).order("ts", { ascending: false }).limit(24),
@@ -181,7 +182,10 @@ export async function rememberNamedDose(db: any, subject: string, s: EngineState
     namedAt: s.nowMs,
     insulin: d.insulinName,
     knownDoseAt: repeat ? (open!.knownDoseAt ?? null) : lastCountedDoseMs(s),
-    conditional: d.kind === "dose_if",
+    // Named on a late telling, it is still "if nothing since" in all but the words: those hours hold no dose
+    // on record. Stored firm, ignored, it held every other dose back for four hours, and a dose told just
+    // after it stayed unanswered.
+    conditional: d.kind === "dose_if" || (d.kind === "dose" && s.knowledge === "told"),
     split: d.split,
   };
   const { error } = await db.from("mechabetics_profiles").update({ pending_action: action }).eq("subject", subject);

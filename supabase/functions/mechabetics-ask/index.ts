@@ -514,7 +514,7 @@ ${lang === "es" ? "AHORA dice:" : "MAINTENANT il dit :"} ${question}`
       ? [{ ts: mealTs ?? new Date(nowMs).toISOString(), description: mealDesc, carbs_g: mealCarbs, planned: plannedFromTs, carbs_estimated: mealEstimated }]
       : [];
     const saidDose = reportedUnits > 0 && !doseAgain
-      ? [{ ts: insTs ?? new Date(nowMs).toISOString(), units: reportedUnits, kind: doseKind, insulin_name: doseName }]
+      ? [{ ts: insTs ?? new Date(nowMs).toISOString(), created_at: new Date(nowMs).toISOString(), units: reportedUnits, kind: doseKind, insulin_name: doseName }]
       : [];
     // What turns a conditional dose into a firm one: it has to have been said, in words, about this.
     // The model's flag alone is not enough, and a general question has nothing to do with insulin.

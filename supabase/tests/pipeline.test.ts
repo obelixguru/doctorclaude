@@ -49,7 +49,14 @@ const monitorHandler = captured!;
 const monitorRun = async () => await (await monitorHandler(new Request("https://x.test/mechabetics-monitor", { method: "POST" }))).text();
 
 // ---- Model APIs -----------------------------------------------------------------------------------
-const llm = { reply: {} as any, down: false, prompts: [] as string[], learnCalls: 0, visionCarbs: null as number | null, visionDesc: "riz" };
+const llm = {
+  reply: {} as any, down: false, prompts: [] as string[], learnCalls: 0, visionCarbs: null as number | null, visionDesc: "riz",
+  /** Google refuses the key, as it did on 7 November. */
+  visionRefused: false,
+  /** What each of the family's servers answers to a photo, and what they were sent. */
+  door: {} as Record<string, () => Response>,
+  doorAsks: [] as { link: string; body: any }[],
+};
 /** LibreLinkUp and Telegram, as the monitor sees them. */
 const libre = {
   value: 120, at: 0, telegram: [] as string[], telegramDown: false, cdnHangs: false,
@@ -64,7 +71,16 @@ globalThis.fetch = (async (input: any, init?: any) => {
     if (llm.down) return new Response("boom", { status: 500 });
     return new Response(JSON.stringify({ choices: [{ message: { content: JSON.stringify(llm.reply) }, finish_reason: "stop" }] }));
   }
+  if (url.includes("mechabetics_domino_passes")) return new Response("", { status: 201 });
+  if (url.includes("mechabetics-domino")) {
+    const link = new URL(url).searchParams.get("link") ?? "";
+    llm.doorAsks.push({ link, body: JSON.parse(String(init?.body ?? "{}")) });
+    return llm.door[link]?.() ?? new Response("down", { status: 503 });
+  }
   if (url.includes("generativelanguage")) {
+    if (llm.visionRefused) {
+      return new Response(JSON.stringify({ error: { code: 401, message: "API key not valid. Please pass a valid API key.", status: "UNAUTHENTICATED" } }), { status: 401 });
+    }
     const text = JSON.stringify({ reply: "Un riz.", voice: "Un riz.", meal: { description: llm.visionDesc, carbsG: llm.visionCarbs } });
     return new Response(JSON.stringify({ candidates: [{ content: { parts: [{ text }] }, finishReason: "STOP" }] }));
   }
@@ -116,6 +132,9 @@ function seed(value: number, slope = 0, extra: Partial<typeof RYAN> & Record<str
   llm.down = false;
   llm.prompts = [];
   llm.visionDesc = "riz";
+  llm.visionRefused = false;
+  llm.door = {};
+  llm.doorAsks = [];
 }
 const phone = (values: number[]) => values.map((v, i) => ({ ts: ago((values.length - 1 - i) * 5), value: v }));
 const base = { subject: SUBJECT, lang: "fr", tzOffsetMin: 60, speak: false, premiumVoice: false };
@@ -137,6 +156,136 @@ Deno.test({
     // Conditional or not, it was put in front of someone: the next look asks what happened.
     assertEquals(world.tables.mechabetics_profiles[0].pending_action.units, 1.5);
   },
+});
+
+Deno.test({
+  name: "a dose told late reaches the decision on every surface: no question about hours already told", ...opts, fn: async () => {
+    seed(240);
+    world.tables.mechabetics_insulin = [{ id: 1, subject: SUBJECT, ts: iso(ago(212)), units: 1, kind: "rapid", insulin_name: "Fiasp", created_at: iso(ago(91)) }];
+    const c = await coach({ ...base, readings: phone([239, 240]), force: true });
+    assertEquals(c.decision.knowledge, "told");
+    assertEquals(c.decision.kind, "dose");
+    assert(!c.text.includes("depuis 3 h"), c.text);
+    llm.reply = said({});
+    const v = await ask({ ...base, question: "je fais quoi ?", readings: phone([239, 240]) });
+    assertEquals(v.decision.knowledge, "told");
+    assert(!v.text.includes("Si aucune insuline rapide"), v.text);
+    const m = await meals({ action: "plan", subject: SUBJECT, lang: "fr", tzOffsetMin: 60, meal: { description: "riz", carbsG: 60 } });
+    assertEquals(m.decision.knowledge, "told");
+    assert(!m.actionLine.includes("depuis 3 h"), m.actionLine);
+    llm.visionCarbs = 60;
+    const s = await scan({ ...base, imageBase64: "AAAA", mime: "image/jpeg", readings: phone([239, 240]) });
+    assert(!s.text.includes("depuis 3 h"), s.text);
+    // Three hours after the telling, the question is back.
+    world.tables.mechabetics_meals = [];
+    world.tables.mechabetics_insulin[0].ts = iso(ago(300));
+    world.tables.mechabetics_insulin[0].created_at = iso(ago(181));
+    world.tables.mechabetics_profiles[0].pending_action = null;
+    const later = await coach({ ...base, readings: phone([239, 240]), force: true });
+    assertEquals(later.decision.knowledge, "unknown");
+    assertEquals(later.decision.kind, "dose_if");
+  },
+});
+
+Deno.test({
+  name: "a dose named on a late telling stays as open as a conditional one", ...opts, fn: async () => {
+    seed(240);
+    world.tables.mechabetics_insulin = [{ id: 1, subject: SUBJECT, ts: iso(ago(212)), units: 1, kind: "rapid", insulin_name: "Fiasp", created_at: iso(ago(91)) }];
+    const c = await coach({ ...base, readings: phone([239, 240]), force: true });
+    assertEquals(c.decision.kind, "dose");
+    // Ignored, it does not hold every other dose back for four hours.
+    assertEquals(world.tables.mechabetics_profiles[0].pending_action.conditional, true);
+    // And a dose told just after it answers it, even from before it was named.
+    await meals({ action: "addInsulin", subject: SUBJECT, insulin: { units: 1, name: "Fiasp", ts: ago(27) } });
+    const next = await coach({ ...base, readings: phone([239, 240]), force: true });
+    assertEquals(next.decision.pending, null);
+  },
+});
+
+Deno.test({
+  name: "a dose on record in the window is named firm, and stays firm", ...opts, fn: async () => {
+    seed(240);
+    world.tables.mechabetics_insulin = [{ id: 1, subject: SUBJECT, ts: iso(ago(170)), units: 1, kind: "rapid", insulin_name: "Fiasp", created_at: iso(ago(170)) }];
+    const c = await coach({ ...base, readings: phone([239, 240]), force: true });
+    assertEquals(c.decision.knowledge, "logged");
+    assertEquals(c.decision.kind, "dose");
+    assertEquals(world.tables.mechabetics_profiles[0].pending_action.conditional, false);
+  },
+});
+
+Deno.test({
+  name: "a dose dictated a shade over 3 h ago gets the same answer from the voice and the analysis", ...opts, fn: async () => {
+    seed(240);
+    llm.reply = said({ insulin: { units: 1, name: "Fiasp", minutesAgo: 183 } });
+    const v = await ask({ ...base, question: "il a fait 1 u il y a 3 h", readings: phone([239, 240]) });
+    assertEquals(v.decision.knowledge, "told");
+    assertEquals(v.decision.kind, "dose");
+    const c = await coach({ ...base, readings: phone([239, 240]), force: true });
+    assertEquals(c.decision.knowledge, "told");
+    assertEquals(c.decision.kind, "dose");
+  },
+});
+
+/** The servers open their answer with keepalives and progress, then the completion on its own line. */
+const serverAnswer = (o: Record<string, unknown>) => () => new Response(
+  ` REASON{"kind":"progress","text":"..."}\n${JSON.stringify({ choices: [{ message: { content: "```json\n" + JSON.stringify(o) + "\n```" } }] })}`,
+);
+const plate = { reply: "Des pâtes au poulet.", voice: "Des pâtes au poulet.", meal: { description: "pâtes au poulet", carbsG: 70, planned: false } };
+/** The door opens only where the keys are, as in an edge function. Everything else here runs without it. */
+const withDoor = async (run: () => Promise<void>) => {
+  Deno.env.set("SUPABASE_ANON_KEY", "anon");
+  try { await run(); } finally { Deno.env.delete("SUPABASE_ANON_KEY"); }
+};
+
+Deno.test({
+  name: "a photo survives a refused key: the family's servers read it and the plate is logged", ...opts, fn: () => withDoor(async () => {
+    seed(150);
+    llm.visionRefused = true;
+    llm.door = { gpt: serverAnswer(plate) };
+    const s = await scan({ ...base, imageBase64: "AAAA", mime: "image/jpeg", readings: phone([149, 150]) });
+    assertEquals(s.isError, false);
+    assertEquals(world.tables.mechabetics_meals.length, 1);
+    assertEquals(world.tables.mechabetics_meals[0].carbs_g, 70);
+    assertEquals(world.tables.mechabetics_meals[0].carbs_estimated, true);
+    assertStringIncludes(s.text, "Des pâtes au poulet.");
+    // The picture itself went through, in the form both servers read.
+    const content = llm.doorAsks[0].body.messages[1].content;
+    assertEquals(content[1], { type: "image", source: { type: "base64", media_type: "image/jpeg", data: "AAAA" } });
+  }),
+});
+
+Deno.test({
+  name: "one server down is not a lost photo", ...opts, fn: () => withDoor(async () => {
+    seed(150);
+    llm.visionRefused = true;
+    llm.door = { claude: serverAnswer(plate) };
+    const s = await scan({ ...base, imageBase64: "AAAA", mime: "image/jpeg", readings: phone([149, 150]) });
+    assertEquals(s.isError, false);
+    assertEquals(world.tables.mechabetics_meals.length, 1);
+  }),
+});
+
+Deno.test({
+  name: "a key that works keeps the photos on it, and the family's servers are left alone", ...opts, fn: () => withDoor(async () => {
+    seed(150);
+    llm.visionCarbs = 60;
+    await scan({ ...base, imageBase64: "AAAA", mime: "image/jpeg", readings: phone([149, 150]) });
+    assertEquals(llm.doorAsks.length, 0);
+    assertEquals(world.tables.mechabetics_meals[0].carbs_g, 60);
+  }),
+});
+
+Deno.test({
+  name: "when nobody can read the photo it says so, says why, and logs nothing", ...opts, fn: () => withDoor(async () => {
+    seed(150);
+    llm.visionRefused = true;
+    llm.door = { gpt: serverAnswer({}), claude: () => new Response("plan out of credits", { status: 402 }) };
+    const s = await scan({ ...base, imageBase64: "AAAA", mime: "image/jpeg", readings: phone([149, 150]) });
+    assertEquals(s.isError, true);
+    assertEquals(s.errorKind, "auth");
+    assertStringIncludes(s.text, "Problème de configuration de l'IA");
+    assertEquals(world.tables.mechabetics_meals?.length ?? 0, 0);
+  }),
 });
 
 Deno.test({

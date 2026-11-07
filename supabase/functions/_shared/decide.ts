@@ -37,6 +37,9 @@ import type { InsulinCurve } from "./insulins.ts";
 /** How far back the app must know the rapid insulin before it may name a firm dose. Fiasp has done
  *  about 86 % of its work by then, and this is the window ISPAD names for stacking. */
 export const INSULIN_MEMORY_MIN = 180;
+/** How much later than the moment it names a dose gets written: "il y a 3 heures" goes through the model
+ *  first, and the app's -3 h button through the network. Neither should put it outside the window. */
+const TOLD_MARGIN_MIN = 5;
 /** "Nothing injected" stays true for this long after someone says so. */
 export const CONFIRM_VALID_MIN = 60;
 /** A dose just named is left alone this long before asking whether it was done. */
@@ -80,7 +83,8 @@ const REST_FROM_MGDL = 130;
 const REST_AFTER_DOSE_MIN = 45;
 const REST_MAX_MIN = 180;
 
-export type InsulinKnowledge = "logged" | "confirmed_none" | "unknown";
+/** "told": nothing injected in the window is on record, but a dose was told during it. See insulinKnowledge. */
+export type InsulinKnowledge = "logged" | "told" | "confirmed_none" | "unknown";
 
 export interface PendingDose {
   units: number;
@@ -90,7 +94,8 @@ export interface PendingDose {
   /** The newest dose already on record at that moment. Only a dose after it can be the answer: the one
    *  that was already counted when this dose was worked out says nothing about this dose. */
   knownDoseAt?: number | null;
-  /** It was "if nothing in 3 h". Any dose that sum did not know about means the condition failed. */
+  /** It was "if nothing in 3 h", in words or not (see rememberNamedDose). Any dose that sum did not know
+   *  about means the condition failed. */
   conditional?: boolean;
   /** It goes in two parts: "done" means a part, so the answer has to say how much. */
   split?: boolean;
@@ -182,18 +187,27 @@ export function clock(ms: number, tzOffsetMin: number): string {
   return `${String(Math.floor(m / 60)).padStart(2, "0")}:${String(m % 60).padStart(2, "0")}`;
 }
 
-/** Was any rapid dose logged in the window, or did someone just say there was none? */
+/**
+ * Was any rapid dose logged in the window, or did someone just say there was none?
+ *
+ * A dose told late counts from when it was told, provided it was inside the window at that moment: that
+ * is the family bringing the last 3 h up to date. 8 u dictated at 11:15 as "il y a 2 heures" left the
+ * window at 12:15, and at 12:46 the app was asking about hours it had been told about. Told with more
+ * than 3 h behind it, a dose is a note in the diary: "3 u hier soir" says nothing about this morning.
+ * The window itself still holds no dose, which is why this has its own name.
+ */
 export function insulinKnowledge(doses: any[], nowMs: number, confirmedAtMs: number | null | undefined): InsulinKnowledge {
   const since = nowMs - INSULIN_MEMORY_MIN * 60000;
-  const logged = (doses || []).some((d) => {
-    if (!d || d.kind === "basal" || isBasalInsulin(d.name ?? d.insulin_name)) return false;
-    const t = tsOf(d.ts);
-    return Number.isFinite(t) && t >= since && t <= nowMs + 60000;
-  });
-  if (logged) return "logged";
+  const rapid = (doses || [])
+    .filter((d) => d && d.kind !== "basal" && !isBasalInsulin(d.name ?? d.insulin_name))
+    .map((d) => ({ t: tsOf(d.ts), told: tsOf(d.created_at) }))
+    .filter(({ t }) => Number.isFinite(t) && t <= nowMs + 60000);
+  if (rapid.some(({ t }) => t >= since)) return "logged";
   const c = Number(confirmedAtMs);
   if (Number.isFinite(c) && c > 0 && nowMs - c >= 0 && nowMs - c <= CONFIRM_VALID_MIN * 60000) return "confirmed_none";
-  return "unknown";
+  const toldLate = rapid.some(({ t, told }) =>
+    told >= since && told <= nowMs + 60000 && told - t <= (INSULIN_MEMORY_MIN + TOLD_MARGIN_MIN) * 60000);
+  return toldLate ? "told" : "unknown";
 }
 
 /** The dose named earlier and never answered, or null. A dose given after the one already known at
@@ -1477,6 +1491,11 @@ export function engineFacts(s: EngineState, d: Decision, a: Anticipation | null)
     parts.push(es(lang)
       ? "INSULINA DE LAS ÚLTIMAS 3 H: DESCONOCIDA (nada anotado, y casi nunca se anota todo). NO digas que no hay insulina activa: di que no se sabe."
       : "INSULINE DES 3 DERNIÈRES HEURES : INCONNUE (rien de noté, et presque personne ne note tout). NE dis PAS qu'il n'y a pas d'insuline active : dis qu'on ne sait pas.");
+  }
+  if (d.knowledge === "told") {
+    parts.push(es(lang)
+      ? "INSULINA DE LAS ÚLTIMAS 3 H: la última dosis anotada es más antigua y no hay nada anotado después (casi nadie lo anota todo). NO digas que no hay insulina activa."
+      : "INSULINE DES 3 DERNIÈRES HEURES : la dernière dose notée est plus ancienne et rien n'est noté depuis (presque personne ne note tout). NE dis PAS qu'il n'y a pas d'insuline active.");
   }
   if (s.forecast) {
     const line = forecastLine(s.forecast, lang);

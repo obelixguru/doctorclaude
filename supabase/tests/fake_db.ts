@@ -39,10 +39,16 @@ class Query {
   private payload: any = null;
   private opts: any = {};
   private wantRows = false;
+  private cols: string[] | null = null;
   constructor(private table: string) {
     world.tables[table] ??= [];
   }
-  select(_cols?: string) { if (this.op !== "select") this.wantRows = true; return this; }
+  select(cols?: string) {
+    if (this.op !== "select") this.wantRows = true;
+    // A column left out of the list is not there, as in PostgREST: code reading it gets undefined.
+    else if (cols && /^[\w\s,]+$/.test(cols)) this.cols = cols.split(",").map((c) => c.trim());
+    return this;
+  }
   eq(c: string, v: any) { this.filters.push((r) => norm(r[c]) === norm(v)); return this; }
   gte(c: string, v: any) { this.filters.push((r) => norm(r[c]) >= norm(v)); return this; }
   gt(c: string, v: any) { this.filters.push((r) => norm(r[c]) > norm(v)); return this; }
@@ -95,6 +101,8 @@ class Query {
     }
     if (this.slice) out = out.slice(this.slice[0], this.slice[1] + 1);
     out = out.slice(0, 1000); // max_rows
+    const cols = this.cols;
+    if (cols) out = out.map((r) => Object.fromEntries(cols.filter((c) => c in r).map((c) => [c, r[c]])));
     if (this.one) return { data: out[0] ?? null, error: null };
     return { data: out, error: null };
   }

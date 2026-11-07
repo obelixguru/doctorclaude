@@ -51,6 +51,57 @@ test("knowing nothing about the last 3 h is not knowing there was nothing", () =
   assert.equal(insulinKnowledge([], NOW, min(-CONFIRM_VALID_MIN - 1)), "unknown");
 });
 
+test("a dose told late keeps the last 3 h known from the moment it was told", () => {
+  const told = (injected: number, at: number, o: any = {}) => [{ ts: min(injected), created_at: min(at), units: 8, kind: "rapid", ...o }];
+  // 7 November: injected at 09:14, dictated at 11:15 as "il y a 2 heures", analysis at 12:46.
+  assert.equal(insulinKnowledge(told(-212, -91), NOW, null), "told");
+  // Injected inside the window, however late it was told, it is simply on record.
+  assert.equal(insulinKnowledge(told(-120, -5), NOW, null), "logged");
+  // Saying that nothing was done since is more than a telling.
+  assert.equal(insulinKnowledge(told(-212, -91), NOW, min(-10)), "confirmed_none");
+  // It lasts three hours from the telling, like a dose logged on the spot.
+  assert.equal(insulinKnowledge(told(-299, -INSULIN_MEMORY_MIN + 1), NOW, null), "told");
+  assert.equal(insulinKnowledge(told(-301, -INSULIN_MEMORY_MIN - 1), NOW, null), "unknown");
+  // "Il y a 3 heures": the model took 12 seconds before the row was written.
+  assert.equal(insulinKnowledge(told(-240.2, -60), NOW, null), "told");
+  assert.equal(insulinKnowledge(told(-244.5, -60), NOW, null), "told");
+  // Told with more than 3 h behind it, a dose is a note in the diary.
+  assert.equal(insulinKnowledge(told(-245.5, -60), NOW, null), "unknown");
+  assert.equal(insulinKnowledge(told(-900, -30), NOW, null), "unknown");
+  // A basal dose still says nothing about the rapid insulin, told late or not.
+  assert.equal(insulinKnowledge(told(-212, -91, { kind: "basal" }), NOW, null), "unknown");
+  assert.equal(insulinKnowledge(told(-212, -91, { kind: "rapid", insulin_name: "Tresiba" }), NOW, null), "unknown");
+  // Looking back at a moment before it was told, nobody knew yet.
+  assert.equal(insulinKnowledge(told(-181, 2), NOW, null), "unknown");
+  // Told now for later: not injected, it answers nothing.
+  assert.equal(insulinKnowledge(told(30, -5), NOW, null), "unknown");
+  // A row without the telling keeps the old answer.
+  assert.equal(insulinKnowledge([{ ts: min(-212), created_at: null, units: 8, kind: "rapid" }], NOW, null), "unknown");
+});
+
+test("told late, the model still hears that nothing is on record for those hours", () => {
+  const s = state({ readings: flat(150), insulin: [{ ts: min(-299), created_at: min(-179), units: 8, kind: "rapid" }] });
+  assert.equal(s.knowledge, "told");
+  const facts = engineFacts(s, decideAction(s), null);
+  assert.match(facts, /NE dis PAS qu'il n'y a pas d'insuline active/);
+  assert.doesNotMatch(facts, /INCONNUE/);
+});
+
+test("a dose told late changes the question, never the figure", () => {
+  const readings = rising(155, 1.5);
+  const meals = [{ ts: min(-86), description: "tartines", carbs_g: 40, planned: false, carbs_estimated: true }];
+  const dose = { ts: min(-212), units: 8, kind: "rapid", insulin_name: "Fiasp" };
+  const told = decideAction(state({ readings, meals, insulin: [{ ...dose, created_at: min(-91) }] }), { concise: true });
+  const blind = decideAction(state({ readings, meals, insulin: [{ ...dose, created_at: min(-200) }] }), { concise: true });
+  assert.equal(blind.kind, "dose_if");
+  assert.match(blind.line, /^Si aucune insuline rapide depuis 3 h/);
+  assert.equal(told.kind, "dose");
+  assert.doesNotMatch(told.line, /depuis 3 h|note-la d'abord/);
+  assert.ok(told.units > 0);
+  assert.equal(told.units, blind.units);
+  assert.match(told.line, /^Si c'est bien ~40 g de glucides : fais /);
+});
+
 test("a correction with the last 3 h unknown is conditional, and says what to do otherwise", () => {
   const s = state({ readings: flat(240) });
   const d = decideAction(s);

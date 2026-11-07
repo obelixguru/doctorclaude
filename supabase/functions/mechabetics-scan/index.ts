@@ -24,7 +24,10 @@ import {
   tzOffsetOf,
 } from "../_shared/engineData.ts";
 import type { EngineData } from "../_shared/engineData.ts";
-import { classifyLlmError, llmErrorMessage, type LlmErrorKind } from "../_shared/llm.ts";
+import {
+  classifyLlmError, dominoFrom, emptyAnswer, jsonObjectIn, LlmError, llmErrorMessage, serverContent,
+  type DominoLink, type LlmErrorKind,
+} from "../_shared/llm.ts";
 
 // Doctor Claude product scanner (FR/ES). The phone sends a PHOTO of a food product + subject
 // hash + recent readings ({ts, value}). A vision model identifies the product and ESTIMATES the
@@ -32,7 +35,7 @@ import { classifyLlmError, llmErrorMessage, type LlmErrorKind } from "../_shared
 // DOSE IS COMPUTED IN CODE by the deterministic guard (_shared/doseGuard.ts): meal bolus
 // (carbs / ratio) + correction (minus IOB, blocked when hypo/in-range/falling/stale). The model
 // never writes a dose number. api.deepseek.com is text-only, so vision uses Anthropic if its key
-// is set, otherwise Gemini. Voice via ElevenLabs.
+// is set, otherwise Gemini, and the family's own servers when those refuse. Voice via ElevenLabs.
 
 const db = createClient(
   Deno.env.get("SUPABASE_URL")!,
@@ -228,7 +231,70 @@ async function geminiVision(sys: string, userText: string, imageBase64: string, 
  *  use the good key. Flip to false to hand vision back to the user's own quota. */
 const IGNORE_BYOK_FOR_VISION = true;
 
+/** How long the family's servers get with a photo. A short ask takes 8 s at the median and 22 s for one in
+ *  ten, a picture comes on top of that, and the phone stops waiting at 60 s. */
+const DOMINO_VISION_MS = 45_000;
+
+/**
+ * The family's own servers read pictures too, through the same door as the text, and need no key here. On
+ * 7 November Google refused the service's Gemini key: every photo answered « Problème de configuration de
+ * l'IA » and the plate was lost, with those servers running. Both are asked at once: photos are rare, someone
+ * is holding their plate, and the first valid answer hangs up on the other.
+ */
+async function dominoVision(sys: string, userText: string, imageBase64: string, mime: string): Promise<VisionResult> {
+  const links = dominoFrom({});
+  if (!links.length) return { error: "domino: no link", kind: "ai_down" };
+  const started = Date.now();
+  const hangUp = new AbortController();
+  const timer = setTimeout(() => hangUp.abort(), DOMINO_VISION_MS);
+  const messages = [
+    { role: "system", content: sys },
+    {
+      role: "user",
+      content: [
+        { type: "text", text: userText },
+        { type: "image", source: { type: "base64", media_type: mime, data: imageBase64 } },
+      ],
+    },
+  ];
+  const ask = async (link: DominoLink): Promise<string> => {
+    const r = await fetch(link.url, {
+      method: "POST",
+      headers: { "content-type": "application/json", ...(await link.access()) },
+      body: JSON.stringify({ ...link.ask, messages, temperature: 0.3, max_tokens: 1600 }),
+      signal: hangUp.signal,
+    });
+    const body = await r.text();
+    if (!r.ok) throw new LlmError(classifyLlmError(r.status, body), `${link.name} ${r.status}: ${body.slice(0, 200)}`, r.status);
+    const json = jsonObjectIn(serverContent(body));
+    if (!json || emptyAnswer(json)) throw new LlmError("ai_down", `${link.name}: no JSON object in the answer`);
+    console.log(`scan: ${link.name} read the photo in ${Date.now() - started} ms`);
+    return json;
+  };
+  try {
+    return { raw: await Promise.any(links.map(ask)) };
+  } catch (e) {
+    const errors = (e as AggregateError)?.errors ?? [e];
+    return { error: `domino: ${errors.map((x: Error) => x?.message ?? x).join(" / ")}`, kind: "ai_down" };
+  } finally {
+    clearTimeout(timer);
+    hangUp.abort();
+  }
+}
+
+/** Whoever can read the picture. The error that comes back is the provider's: it says what is really wrong. */
 async function visionComplete(sys: string, userText: string, imageBase64: string, mime: string, byokKey: string): Promise<VisionResult> {
+  const first = await providerVision(sys, userText, imageBase64, mime, byokKey);
+  if (!first.error) return first;
+  // The family only sees a kind: on 7 November nothing said which key or model had refused.
+  console.error(`scan: vision failed: ${first.error}`);
+  const second = await dominoVision(sys, userText, imageBase64, mime);
+  if (!second.error) return second;
+  console.error(`scan: ${second.error}`);
+  return first;
+}
+
+async function providerVision(sys: string, userText: string, imageBase64: string, mime: string, byokKey: string): Promise<VisionResult> {
   // BYOK: a client Gemini key routes vision to the user's own free quota (cost ~0 to us).
   if (byokKey && !IGNORE_BYOK_FOR_VISION) return geminiVision(sys, userText, imageBase64, mime, byokKey);
   // Hosted: Anthropic vision first, with a quick retry + a Gemini fallback on a TRANSIENT failure
@@ -276,7 +342,7 @@ Deno.serve(async (req: Request) => {
     // as coach and ask now do for text. Kept as a lesson — this gate survived the first pass of the
     // change and a phone with "Mode Hosted" off, key cleared, got « active le mode Hosted » on the
     // camera while its analyses worked fine. Removing a dependency means removing ALL its gates.
-    if (!ANTHROPIC_API_KEY && !GEMINI_API_KEY && !byokGeminiKey) {
+    if (!ANTHROPIC_API_KEY && !GEMINI_API_KEY && !byokGeminiKey && !dominoFrom({}).length) {
       // NOT the user's problem when they ARE in hosted mode: the scan is the only feature that needs
       // a VISION key (the others run on DeepSeek), so it can be unconfigured server-side while
       // everything else works. Telling a hosted user to "activate hosted mode" — which they already
